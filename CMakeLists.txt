@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.22)
+get_filename_component(FRAMEWORK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+set(EXTRA_COMPONENT_DIRS "${FRAMEWORK_ROOT}/framework/core/esp32libfun_wifi_sta")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(pixels_network_session)
