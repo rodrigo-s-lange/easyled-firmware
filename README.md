@@ -1,9 +1,10 @@
 # Pixel firmware network session
 
-Application-layer Wi-Fi + MQTT over secure WebSocket (WSS), prepared independently
-of the pixel effects work. This is a buildable connection example and reusable
-application component, **not the completed EasyLED device integration**. It does
-not render pixels or execute received commands. No EasyLED files are dependencies.
+Application-layer Wi-Fi + MQTT over secure WebSocket (WSS), compiled together
+with the pixel transport, effects, Composer and two-output adapter. This is a
+buildable integration boundary, **not the completed EasyLED device firmware**.
+It does not yet download or activate remote configuration. No EasyLED repository
+files are dependencies.
 
 `components/pixels_network` owns the session and bounded message queue. It reuses
 the existing `esp32libfun_wifi_sta` HAL for initialization and connection state;
@@ -40,6 +41,31 @@ connection exclusively; do not run another Wi-Fi lifecycle owner alongside it.
 Stopping the session clears queued incoming messages, not the SDK's pending QoS1
 outbox. Use `end()` before changing device identity or credentials.
 
+## Provisional firmware contract boundary
+
+`components/pixels_firmware_contract` implements the offline portion of
+`FW-CONTRACT-ALIGN-2026-09-22` without assuming a broker, credentials or storage
+layout:
+
+- bounded parsing of the closed command envelope for `apply_config`,
+  `activate_preset`, `reboot` and `ota`; unknown JSON fields are accepted, while
+  consumed duplicate fields and invalid types/ranges are rejected;
+- exact-byte SHA-256 verification using the ESP-IDF PSA crypto API;
+- compact serialization of `command_received`, `command_accepted`,
+  `command_rejected`, `command_applied` and `command_failed`;
+- `TerminalJournal`, an application-owned durable interface that permits a
+  duplicate `command_id` to replay its original terminal event without executing
+  the command again;
+- `DurableStaging`, an application-owned transaction interface that separates
+  append, checksum/commit, frame-boundary activation and rollback. Its contract
+  permits `command_applied` only after recoverable commit and successful atomic
+  activation.
+
+The component deliberately does not select NVS keys, journal capacity, cache
+eviction or a partition layout. It also does not parse the downloaded config or
+preset payload into a Composer scene yet. Those are the next application-layer
+steps after the EasyLED schema fields and canonical byte rules are closed.
+
 ## Build and local profile
 
 From an ESP-IDF 6.0.2 shell in this directory:
@@ -72,49 +98,58 @@ These are placeholders, not an EasyLED provisioning contract. Supply credentials
 only for an authorized development device. The example does not print payloads or
 credentials. It does not erase NVS automatically on initialization failure.
 
-**Do not flash this standalone example onto the current preset bench board.** Its
-standard large-app partition table differs from the application's preset layout.
-Integration must retain the application's partitions and backups and recheck
-combined image size before any flash. No flash or serial action was performed for
-this delivery.
+The example's large-app partition table differs from the preset application's
+layout. Back up the complete flash before a bench run and restore that image
+afterward; flashing only the previous application binary is insufficient to
+restore its partition table and NVS data.
+
+For USB links that fail during a single 4 MiB read, `validation/backup_flash.py`
+reads 256 KiB chunks, retries each failed chunk at a lower baud rate, validates
+every chunk length and assembles one SHA-256-labelled image. It refuses to
+overwrite an existing output:
+
+```powershell
+python validation/backup_flash.py --port COM6 --output build/flash-before.bin
+```
 
 ## Focused local validation
 
-`validation/` runs the actual fragment assembler in an ESP32 QEMU target with no
-network adapter or serial-port access. It checks fragmented/empty/binary messages,
-capacity limits, invalid offsets, interrupted messages and replacement by a new
-message. It does **not** validate radio, TLS, broker permissions or reconnection.
+`validation/` runs the fragment assembler, firmware-contract component and a real
+50-pixel Composer render in an ESP32 QEMU target with no network adapter. It checks
+the two exact provisional fixture hashes, command parsing, event serialization,
+terminal replay, pixel-stack linking and all previous message assembly cases. It
+does **not** validate radio, TLS, broker permissions, storage durability or HTTPS.
 
 ```powershell
 cd validation
-idf.py -B ../../../../build/network-validation -D IDF_TARGET=esp32 build
+idf.py -B ../../../../build/network-contract-validation -D IDF_TARGET=esp32 build
 python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe"
 ```
 
 The script merges only a local emulated flash file, captures the result in
-the root `build/network-validation/qemu-validation.log`, and terminates QEMU after
-15 seconds. This shorter build path avoids Windows compiler path limits. The expected
-marker is `NETWORK_VALIDATION checks=25 failures=0 RESULT=ALL_PASS`.
+`build/network-contract-validation/qemu-validation.log`, and terminates QEMU after
+15 seconds. The expected marker is
+`NETWORK_CONTRACT_VALIDATION checks=52 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
 shell's `PATH` before invoking the script (no machine-wide configuration change).
 
-Build verified on 2026-09-22 with ESP-IDF 6.0.2: standalone network image 966160 B,
-static DRAM 42271 B (23.39%), IRAM 87891 B (67.06%). These figures exclude runtime
-Wi-Fi/TLS heap use and do not represent the combined pixel application.
-The validation target also built and ran on Espressif QEMU 9.2.2: all 25 checks
-passed, with no assertion or panic. No physical board or broker was accessed.
+Build verified with ESP-IDF 6.0.2: combined image 971968 B, static DRAM 43207 B
+(23.91%) and IRAM 87891 B (67.06%). The 1.5 MiB app partition retains 564032 B
+(37%) after the build. These figures exclude runtime Wi-Fi/TLS heap use.
+The focused image is 198080 B and ran on Espressif QEMU 9.2.2: all 52 checks
+passed, with no assertion or panic. No broker was accessed.
 
 ## Next integration step
 
-Connect this component to the agreed device identity/topic configuration and
-command dispatcher in the product firmware. That step includes command IDs and
-expiry, application acknowledgements, HTTPS payload retrieval, state publication
-and provisioning. Validate Wi-Fi loss, broker loss/restart, subscription rejection
-and queue pressure against a development broker, then measure heap/stack and
-render continuity with the combined firmware. These remain pending; a successful
-standalone build does not establish product readiness.
+Implement the bounded config/preset payload adapter into a durable candidate,
+then provide concrete NVS-backed `TerminalJournal` and `DurableStaging`
+implementations in the product application. HTTPS retrieval, state publication,
+provisioning and broker-loss tests remain dependent on the EasyLED delivery flows.
+Runtime heap, stack and render continuity must be measured with the combined
+firmware and an authorized development broker before product release.
 
 Official references: [ESP-IDF 6.0.2 MQTT component migration](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32/api-reference/protocols/mqtt.html),
-[ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme).
+[ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme),
+[cJSON 1.7.19](https://components.espressif.com/components/espressif/cjson/versions/1.7.19/readme).

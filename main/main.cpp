@@ -1,4 +1,9 @@
 #include "network_session.hpp"
+#include "firmware_contract.hpp"
+#include "esp_pixels.hpp"
+#include "esp_pixels_fx.hpp"
+#include "esp_pixels_composer.hpp"
+#include "esp_pixels_composer_adapter_esp_pixels.hpp"
 #include "esp_netif_sntp.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -14,6 +19,13 @@ static pixels_network::NetworkSession::Config networkConfig() { return {}; }
 
 extern "C" void app_main()
 {
+    static_assert(esp_pixels_composer_adapter_esp_pixels::EspPixelsSink::kMaxOutputs == 2);
+    ESP_LOGI("PIXELS_NET", "combined build Pixels=%s FX=%s Composer=%s",
+             ESP_PIXELS_VERSION, ESP_PIXELS_FX_VERSION, ESP_PIXELS_COMPOSER_VERSION);
+    if (esp_pixels_fx::describe(0) == nullptr) {
+        ESP_LOGE("PIXELS_NET", "effect catalog unavailable");
+        return;
+    }
     static pixels_network::NetworkSession session;
     const auto config = networkConfig();
     if (config.ssid == nullptr) {

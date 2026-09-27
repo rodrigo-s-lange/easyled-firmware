@@ -34,7 +34,8 @@ def main():
     transcript = output.decode("utf-8", errors="replace")
     (build / "qemu-validation.log").write_text(transcript, encoding="utf-8")
     print(transcript[-2000:])
-    success = re.search(r"NETWORK_VALIDATION checks=\d+ failures=0 RESULT=ALL_PASS", transcript)
+    success = re.search(r"NETWORK(?:_CONTRACT)?_VALIDATION checks=\d+ failures=0 RESULT=ALL_PASS",
+                        transcript)
     fault = re.search(r"Guru Meditation|assert failed|FAILED check|RESULT=FAIL", transcript)
     return 0 if success and not fault else 1
 
