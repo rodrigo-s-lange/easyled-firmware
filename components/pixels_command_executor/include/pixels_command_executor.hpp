@@ -127,7 +127,7 @@ public:
     /// 6. `staging.begin()` -> ordered `staging.append()` -> `staging.verifyAndCommit()`.
     /// 7. `staging.activateAtFrameBoundary()`.
     /// 8. Serialize and durably store the terminal `command_applied` record,
-    ///    then publish those exact bytes.
+    ///    publish those exact bytes, then finalize retained rollback metadata.
     ///
     /// Invalid/checksum/unsupported input at step 4 is `command_rejected`
     /// and never calls `rollback()` (nothing was staged yet); a resource

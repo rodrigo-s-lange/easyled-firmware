@@ -7,6 +7,7 @@ set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/../components/pixels_firmware_contract"
     "${CMAKE_CURRENT_SOURCE_DIR}/../components/pixels_payload_adapter"
     "${CMAKE_CURRENT_SOURCE_DIR}/../components/pixels_command_executor"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../components/pixels_durable_storage"
     "${FRAMEWORK_ROOT}/framework/core/esp32libfun_at"
     "${FRAMEWORK_ROOT}/framework/core/esp32libfun_rmt"
     "${FRAMEWORK_ROOT}/framework/core/esp32libfun_serial"

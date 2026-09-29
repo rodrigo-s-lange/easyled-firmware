@@ -3,6 +3,7 @@
 #include "firmware_contract.hpp"
 #include "pixels_payload_adapter.hpp"
 #include "pixels_command_executor.hpp"
+#include "pixels_durable_storage.hpp"
 #include "esp_pixels_composer.hpp"
 #include "esp_pixels_composer_adapter_esp_pixels.hpp"
 #include "esp_pixels_fx.hpp"
@@ -13,6 +14,7 @@
 #include <cstring>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
 
 // --- Versioned fixtures (validation/fixtures/*.provisional.json), embedded
 // via EMBED_TXTFILES so the on-disk files stay inspectable/diffable while
@@ -355,6 +357,7 @@ public:
     void failNextActivate() { fail_activate_ = true; }
     void failNextRollback() { fail_rollback_ = true; }
     int activateCalls() const { return activate_calls_; }
+    int finalizeCalls() const { return finalize_calls_; }
     int rollbackCalls() const { return rollback_calls_; }
 
     esp_err_t begin(const pixels_firmware::Command &command, size_t total_size) override
@@ -416,6 +419,14 @@ public:
         for (uint8_t i = 0; i < live_count_; ++i) { live_segments_[i] = scratch_candidate_.scene.segments[i]; }
         return ESP_OK;
     }
+    esp_err_t finalize() override
+    {
+        ++finalize_calls_;
+        committed_ = false;
+        staged_size_ = 0;
+        activation_applied_this_txn_ = false;
+        return ESP_OK;
+    }
     esp_err_t rollback() override
     {
         ++rollback_calls_;
@@ -450,10 +461,228 @@ private:
     uint8_t prior_count_ = 0;
     bool fail_begin_ = false, fail_append_ = false, fail_commit_ = false, fail_activate_ = false;
     int activate_calls_ = 0;
+    int finalize_calls_ = 0;
     bool fail_rollback_ = false;
     int rollback_calls_ = 0;
     pixels_payload::Candidate scratch_candidate_{};
 };
+
+class RecordingActivationTarget final : public pixels_storage::ActivationTarget {
+public:
+    esp_err_t activateAtFrameBoundary(pixels_firmware::CommandType type,
+                                      const char *payload, size_t size) override
+    {
+        ++activate_calls_;
+        if (payload == nullptr || size == 0 || size > pixels_payload::kMaxPayloadBytes) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        type_ = type;
+        size_ = size;
+        fingerprint_ = fingerprint(payload, size);
+        active_ = true;
+        return ESP_OK;
+    }
+
+    esp_err_t clearAtFrameBoundary() override
+    {
+        ++clear_calls_;
+        active_ = false;
+        size_ = 0;
+        return ESP_OK;
+    }
+
+    void resetObservation() { activate_calls_ = 0; clear_calls_ = 0; }
+    bool matches(pixels_firmware::CommandType type, const char *payload, size_t size) const
+    {
+        return active_ && type_ == type && size_ == size && fingerprint_ == fingerprint(payload, size);
+    }
+    int activateCalls() const { return activate_calls_; }
+
+private:
+    static uint32_t fingerprint(const char *bytes, size_t size)
+    {
+        uint32_t value = 2166136261u;
+        for (size_t i = 0; i < size; ++i) {
+            value ^= static_cast<uint8_t>(bytes[i]);
+            value *= 16777619u;
+        }
+        return value;
+    }
+
+    bool active_ = false;
+    pixels_firmware::CommandType type_ = pixels_firmware::CommandType::ApplyConfig;
+    size_t size_ = 0;
+    uint32_t fingerprint_ = 0;
+    int activate_calls_ = 0;
+    int clear_calls_ = 0;
+};
+
+void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t preset_digest[32])
+{
+    using namespace pixels_firmware;
+
+    // This erases only the QEMU validation image's dedicated test partition.
+    // Production classes never erase or auto-format storage.
+    CHECK(nvs_flash_erase_partition(pixels_storage::kPartitionLabel) == ESP_OK);
+
+    static pixels_storage::NvsTerminalJournal journal;
+    CHECK(journal.init() == ESP_OK);
+    static TerminalRecord record{};
+    std::memcpy(record.command_id, kApplyCommandId, sizeof(kApplyCommandId));
+    static constexpr char kTerminalJson[] =
+        "{\"event_type\":\"command_applied\",\"command_id\":\"22222222-2222-4222-8222-222222222222\"}";
+    record.event_size = sizeof(kTerminalJson) - 1;
+    std::memcpy(record.event_json, kTerminalJson, sizeof(kTerminalJson));
+    CHECK(journal.store(record) == ESP_OK);
+    static TerminalRecord recovered{};
+    CHECK(journal.find(kApplyCommandId, recovered) == ESP_OK &&
+          recovered.event_size == record.event_size &&
+          std::memcmp(recovered.event_json, record.event_json, record.event_size + 1) == 0);
+    journal.end();
+    CHECK(journal.init() == ESP_OK);
+    CHECK(journal.find(kApplyCommandId, recovered) == ESP_OK); // survives a new boot scan
+
+    static TerminalRecord conflicting{};
+    conflicting = record;
+    conflicting.event_json[15] = 'X';
+    CHECK(journal.store(conflicting) == ESP_ERR_INVALID_STATE); // terminal IDs are immutable
+
+    // Fill one complete ring after the original entry: the ninth new ID
+    // evicts the oldest record, while every retained record survives scan.
+    static TerminalRecord ring_record{};
+    for (unsigned i = 0; i < pixels_storage::kTerminalCapacity; ++i) {
+        std::snprintf(ring_record.command_id, sizeof(ring_record.command_id),
+                      "10000000-0000-4000-8000-%012u", i);
+        std::snprintf(ring_record.event_json, sizeof(ring_record.event_json), "{\"terminal\":%u}", i);
+        ring_record.event_size = static_cast<uint16_t>(std::strlen(ring_record.event_json));
+        CHECK(journal.store(ring_record) == ESP_OK);
+    }
+    CHECK(journal.find(kApplyCommandId, recovered) == ESP_ERR_NOT_FOUND);
+    journal.end();
+    CHECK(journal.init() == ESP_OK);
+    CHECK(journal.find("10000000-0000-4000-8000-000000000007", recovered) == ESP_OK);
+
+    static RecordingActivationTarget target;
+    static pixels_storage::NvsDurableStaging staging;
+    CHECK(staging.init(target, journal) == ESP_ERR_NOT_FOUND); // blank partition is usable
+
+    static Command apply_command{};
+    ParseError parse_error = ParseError::None;
+    CHECK(parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
+                       FIXTURE_SIZE(apply_config_command_provisional_json), apply_command, parse_error) == ESP_OK);
+    const char *config = FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json);
+    const size_t config_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
+    CHECK(staging.begin(apply_command, config_size) == ESP_OK);
+    CHECK(staging.append(config, config_size / 2) == ESP_OK);
+    CHECK(staging.append(config + config_size / 2, config_size - config_size / 2) == ESP_OK);
+    CHECK(staging.verifyAndCommit(config_digest) == ESP_OK);
+    CHECK(staging.activateAtFrameBoundary() == ESP_OK);
+    CHECK(staging.hasActive() && target.matches(CommandType::ApplyConfig, config, config_size));
+    CHECK(journal.store(record) == ESP_OK);
+
+    // A reboot after terminal success but before finalize() reconciles through
+    // the journal, keeps the new active bytes and safely cleans rollback data.
+    staging.end();
+    target.resetObservation();
+    CHECK(staging.init(target, journal) == ESP_OK);
+    CHECK(target.activateCalls() == 1 && target.matches(CommandType::ApplyConfig, config, config_size));
+
+    static Command preset_command{};
+    parse_error = ParseError::None;
+    CHECK(parseCommand(FIXTURE_BYTES(activate_preset_command_provisional_json),
+                       FIXTURE_SIZE(activate_preset_command_provisional_json), preset_command, parse_error) == ESP_OK);
+    const char *preset = FIXTURE_BYTES(preset_payload_provisional_json);
+    const size_t preset_size = FIXTURE_SIZE(preset_payload_provisional_json);
+    CHECK(staging.begin(preset_command, preset_size) == ESP_OK);
+    CHECK(staging.append(preset, preset_size) == ESP_OK);
+    CHECK(staging.verifyAndCommit(preset_digest) == ESP_OK);
+    CHECK(staging.activateAtFrameBoundary() == ESP_OK);
+    CHECK(staging.activePresetMatches(kPresetId, preset_digest));
+    CHECK(target.matches(CommandType::ActivatePreset, preset, preset_size));
+
+    // A post-activation failure can still restore the previous durable/live
+    // config because the older A/B slot has not been discarded yet.
+    CHECK(staging.rollback() == ESP_OK);
+    CHECK(target.matches(CommandType::ApplyConfig, config, config_size));
+    CHECK(!staging.activePresetMatches(kPresetId, preset_digest));
+
+    // A reboot after activation but before terminal success must restore the
+    // prior active config; the duplicate command remains safe to retry.
+    CHECK(staging.begin(preset_command, preset_size) == ESP_OK);
+    CHECK(staging.append(preset, preset_size) == ESP_OK);
+    CHECK(staging.verifyAndCommit(preset_digest) == ESP_OK);
+    CHECK(staging.activateAtFrameBoundary() == ESP_OK);
+    staging.end();
+    target.resetObservation();
+    CHECK(staging.init(target, journal) == ESP_OK);
+    CHECK(target.activateCalls() == 1 && target.matches(CommandType::ApplyConfig, config, config_size));
+
+    // A reboot between candidate commit and activation restores the prior
+    // active state and discards the unactivated pending candidate.
+    CHECK(staging.begin(preset_command, preset_size) == ESP_OK);
+    CHECK(staging.append(preset, preset_size) == ESP_OK);
+    CHECK(staging.verifyAndCommit(preset_digest) == ESP_OK);
+    staging.end();
+    target.resetObservation();
+    CHECK(staging.init(target, journal) == ESP_OK);
+    CHECK(target.activateCalls() == 1 && target.matches(CommandType::ApplyConfig, config, config_size));
+
+    // Complete the preset transaction, then prove preset identity/checksum
+    // and exact bytes survive another boot.
+    CHECK(staging.begin(preset_command, preset_size) == ESP_OK);
+    CHECK(staging.append(preset, preset_size) == ESP_OK);
+    CHECK(staging.verifyAndCommit(preset_digest) == ESP_OK);
+    CHECK(staging.activateAtFrameBoundary() == ESP_OK);
+    static TerminalRecord preset_terminal{};
+    std::memcpy(preset_terminal.command_id, preset_command.command_id,
+                sizeof(preset_terminal.command_id));
+    static constexpr char kPresetTerminalJson[] =
+        "{\"event_type\":\"command_applied\",\"command_id\":\"55555555-5555-4555-8555-555555555555\"}";
+    preset_terminal.event_size = sizeof(kPresetTerminalJson) - 1;
+    std::memcpy(preset_terminal.event_json, kPresetTerminalJson, sizeof(kPresetTerminalJson));
+    CHECK(journal.store(preset_terminal) == ESP_OK);
+    CHECK(staging.finalize() == ESP_OK);
+    staging.end();
+    target.resetObservation();
+    CHECK(staging.init(target, journal) == ESP_OK);
+    CHECK(target.activateCalls() == 1 && target.matches(CommandType::ActivatePreset, preset, preset_size));
+    CHECK(staging.activePresetMatches(kPresetId, preset_digest));
+
+    // The declared 8192-byte limit is exercised against real NVS rather
+    // than inferred from the smaller contract fixtures.
+    static constexpr char kMaxPayloadHash[] =
+        "f8ca02c69621dd84cd1212ebfd7d6cdc9ba6ad658854f29567723531912d1a35";
+    static uint8_t max_payload_digest[32]{};
+    static char max_chunk[256]{};
+    std::memset(max_chunk, 'A', sizeof(max_chunk));
+    CHECK(parseSha256(kMaxPayloadHash, max_payload_digest) == ESP_OK);
+    CHECK(staging.begin(apply_command, pixels_payload::kMaxPayloadBytes) == ESP_OK);
+    for (size_t offset = 0; offset < pixels_payload::kMaxPayloadBytes; offset += sizeof(max_chunk)) {
+        CHECK(staging.append(max_chunk, sizeof(max_chunk)) == ESP_OK);
+    }
+    CHECK(staging.verifyAndCommit(max_payload_digest) == ESP_OK);
+    CHECK(staging.rollback() == ESP_OK); // pending-only rollback keeps the active preset
+    CHECK(staging.activePresetMatches(kPresetId, preset_digest));
+
+    staging.end();
+    nvs_handle_t corrupt_handle = 0;
+    CHECK(nvs_open_from_partition(pixels_storage::kPartitionLabel, "easyled_stage",
+                                  NVS_READWRITE, &corrupt_handle) == ESP_OK);
+    static constexpr uint8_t kCorruptRecord[] = {0xde, 0xad, 0xbe, 0xef};
+    CHECK(nvs_set_blob(corrupt_handle, "active_a", kCorruptRecord, sizeof(kCorruptRecord)) == ESP_OK);
+    CHECK(nvs_set_blob(corrupt_handle, "active_b", kCorruptRecord, sizeof(kCorruptRecord)) == ESP_OK);
+    CHECK(nvs_commit(corrupt_handle) == ESP_OK);
+    nvs_close(corrupt_handle);
+    CHECK(staging.init(target, journal) == ESP_ERR_INVALID_RESPONSE); // corrupt is not reported as blank
+
+    journal.end();
+    CHECK(nvs_open_from_partition(pixels_storage::kPartitionLabel, "easyled_journal",
+                                  NVS_READWRITE, &corrupt_handle) == ESP_OK);
+    CHECK(nvs_set_blob(corrupt_handle, "j0", kCorruptRecord, sizeof(kCorruptRecord)) == ESP_OK);
+    CHECK(nvs_commit(corrupt_handle) == ESP_OK);
+    nvs_close(corrupt_handle);
+    CHECK(journal.init() == ESP_ERR_INVALID_RESPONSE); // never risk replay after journal corruption
+}
 
 } // namespace
 
@@ -500,6 +729,7 @@ extern "C" void app_main()
     static uint8_t preset_digest[kSha256Bytes]{};
     CHECK(parseSha256(kConfigHash, config_digest) == ESP_OK);
     CHECK(parseSha256(kPresetHash, preset_digest) == ESP_OK);
+    runDurableStorageChecks(config_digest, preset_digest);
     CHECK(verifySha256(FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
                        FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json), config_digest) == ESP_OK);
     CHECK(verifySha256(FIXTURE_BYTES(preset_payload_provisional_json),
@@ -725,6 +955,7 @@ extern "C" void app_main()
         CHECK(std::strstr(event_sink.record(0), "command_received") != nullptr);
         CHECK(std::strstr(event_sink.record(1), "command_accepted") != nullptr);
         CHECK(std::strstr(event_sink.record(2), "command_applied") != nullptr);
+        CHECK(staging.finalizeCalls() == 1);
         CHECK(composer.renderFrame(2000) == ESP_OK); // Rainbow is time-driven; any frame proves it is live
         CHECK(staging.activateCalls() == 1);
 

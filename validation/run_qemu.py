@@ -12,6 +12,8 @@ def main():
     parser.add_argument("--qemu", required=True, help="Path to qemu-system-xtensa")
     parser.add_argument("--build", type=Path,
                         default=Path(__file__).resolve().parents[4] / "build" / "network-validation")
+    parser.add_argument("--timeout", type=int, default=45,
+                        help="Maximum QEMU runtime in seconds (default: 45)")
     args = parser.parse_args()
     build = args.build.resolve()
     manifest = json.loads((build / "flasher_args.json").read_text(encoding="utf-8"))
@@ -24,7 +26,7 @@ def main():
     command = [args.qemu, "-nographic", "-machine", "esp32", "-nic", "none",
                "-drive", f"file={flash.as_posix()},if=mtd,format=raw", "-no-reboot"]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=15)
+        result = subprocess.run(command, capture_output=True, timeout=args.timeout)
         output = result.stdout + result.stderr
         if result.returncode != 0:
             print(f"QEMU exited with code {result.returncode}; check runtime dependencies.", file=sys.stderr)
@@ -36,7 +38,10 @@ def main():
     print(transcript[-2000:])
     success = re.search(r"NETWORK(?:_CONTRACT)?_VALIDATION checks=\d+ failures=0 RESULT=ALL_PASS",
                         transcript)
-    fault = re.search(r"Guru Meditation|assert failed|FAILED check|RESULT=FAIL", transcript)
+    fault = re.search(
+        r"Guru Meditation|assert failed|FAILED check|RESULT=FAIL|task_wdt: Task watchdog",
+        transcript,
+    )
     return 0 if success and not fault else 1
 
 

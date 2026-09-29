@@ -61,8 +61,9 @@ layout:
   permits `command_applied` only after recoverable commit and successful atomic
   activation.
 
-The component deliberately does not select NVS keys, journal capacity, cache
-eviction or a partition layout.
+The contract component deliberately does not select NVS keys, journal capacity,
+cache eviction or a partition layout. The application-level storage component
+below supplies that policy without moving it into the framework core.
 
 ## Offline command executor
 
@@ -118,9 +119,37 @@ never task-stack
 locals or function-local statics, so it is safe to place on a small FreeRTOS
 task and never aliases across a second instance.
 
+## Durable command storage
+
+`components/pixels_durable_storage` provides the concrete NVS policy for the
+executor. It uses the dedicated `easyled` partition from
+`partitions_network.csv`, never erases or formats it automatically, and is
+intended for a single application control task.
+
+- `NvsTerminalJournal` retains eight immutable terminal results. A duplicate
+  `command_id` returns the original bytes; a conflicting rewrite is rejected.
+  Once full, a successfully committed and read-back record replaces the oldest.
+  Corrupt journal data fails initialization to prevent accidental re-execution.
+- `NvsDurableStaging` accepts at most 8192 exact payload bytes and uses a pending
+  record plus A/B active records. Every record has schema, bounds, CRC32 and NVS
+  commit/readback checks; payload activation additionally requires exact SHA-256.
+- On boot, the newest valid active record is reapplied at a render-frame boundary.
+  A pending candidate is reconciled against its command's terminal journal
+  entry: durable success keeps it; a missing result restores the prior A/B slot.
+  Normal success calls `finalize()` after journaling `command_applied`; failure
+  leaves the same recovery metadata for the next boot.
+- A corrupt active set fails initialization instead of silently starting blank.
+  `init()` returns `ESP_ERR_NOT_FOUND` on a legitimately empty partition while
+  leaving the instance ready for its first transaction.
+
+The storage implementation is compiled by the combined application but is not
+yet instantiated by `main.cpp`; the network callback still does not execute
+remote commands.
+
 Not implemented by this delivery: real HTTPS retrieval, MQTT topic policy,
-capability publication, NVS-backed `TerminalJournal`/`DurableStaging`, OTA
-execution, and reconfiguring a `PixelFrameSink`'s physical outputs at runtime
+capability publication, OTA execution, wiring the executor/storage into the
+combined application's control task, and reconfiguring a `PixelFrameSink`'s
+physical outputs at runtime
 (`Composer::build()` runs once per boot in this cut; a config payload's own
 `outputs[]` are validated but not yet re-applied to a live sink).
 
@@ -156,10 +185,11 @@ These are placeholders, not an EasyLED provisioning contract. Supply credentials
 only for an authorized development device. The example does not print payloads or
 credentials. It does not erase NVS automatically on initialization failure.
 
-The example's large-app partition table differs from the preset application's
-layout. Back up the complete flash before a bench run and restore that image
-afterward; flashing only the previous application binary is insufficient to
-restore its partition table and NVS data.
+The example uses a 4 MiB partition table with a 1.5 MiB factory application,
+128 KiB dedicated `easyled` NVS and 64 KiB coredump partition. It differs from
+the preset application's layout. Back up the complete flash before a bench run
+and restore that image afterward; flashing only the previous application binary
+is insufficient to restore its partition table and NVS data.
 
 For USB links that fail during a single 4 MiB read, `validation/backup_flash.py`
 reads 256 KiB chunks, retries each failed chunk at a lower baud rate, validates
@@ -173,8 +203,8 @@ python validation/backup_flash.py --port COM6 --output build/flash-before.bin
 ## Focused local validation
 
 `validation/` runs the fragment assembler, firmware-contract component, the
-payload adapter, the command executor and a real Composer render in an ESP32
-QEMU target with no network adapter. The seven fixture strings the tests use
+payload adapter, command executor, real NVS storage and a Composer render in an
+ESP32 QEMU target with no network adapter. The seven fixture strings the tests use
 (two payloads, two command envelopes, three events) live as inspectable files
 under `validation/fixtures/*.provisional.json`, embedded into the binary via
 `EMBED_TXTFILES` rather than duplicated as string literals. It checks the two
@@ -185,9 +215,12 @@ scenario table (happy-path apply_config, duplicate replay, preset cache-miss/
 already-active no-op, checksum-mismatch rejection, staging/activation-failure
 rollback, terminal-store-failure rollback, terminal-publish-failure survival,
 reboot/ota rejection, and 20 repeated commands with no leak) through a real
-`Composer`/`FakeSink` pair, proving a fixture's own bytes reach rendered
-pixels. It does **not** validate radio, TLS, broker permissions, storage
-durability or HTTPS.
+`Composer`/`FakeSink` pair, proving a fixture's own bytes reach rendered pixels.
+It also executes the concrete eight-entry journal, immutable duplicates and
+oldest eviction; A/B recovery and rollback across simulated reboot; an actual
+8192-byte transaction; preset identity recovery; and corrupt-active rejection.
+It does **not** validate radio, TLS, broker permissions, physical flash failure
+or HTTPS.
 
 ```powershell
 cd validation
@@ -196,9 +229,9 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe"
 ```
 
 The script merges only a local emulated flash file, captures the result in
-`build/network-contract-validation/qemu-validation.log`, and terminates QEMU after
-15 seconds. The expected marker is
-`NETWORK_CONTRACT_VALIDATION checks=153 failures=0 RESULT=ALL_PASS`.
+`build/network-contract-validation/qemu-validation.log`, and terminates QEMU
+after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
+marker is `NETWORK_CONTRACT_VALIDATION checks=259 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
@@ -209,23 +242,22 @@ fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
 Build verified with ESP-IDF 6.0.2: combined image 971880 B, static DRAM 43207 B
-(23.91%) and IRAM 87891 B (67.06%). The 1.5 MiB app partition retains 564000 B
-(37%) after the build. These figures exclude runtime Wi-Fi/TLS heap use.
-The focused image is 261725 B and ran on Espressif QEMU 9.2.2: all 153 checks
-passed, with no assertion or panic. Its own static DRAM is 148284 B (82.04%,
-dominated by `.bss` -- the test harness's fixed-capacity fakes, including a
-second `Composer`/`FakeSink` pair and several `ComposerBackedDurableStaging`/
-event-recording instances, are deliberately `static`, not stack-resident) and
-IRAM 44899 B (34.26%). No broker was accessed.
+(23.91%) and IRAM 87891 B (67.06%). The 1.5 MiB app partition retains 600864 B
+(38%) after the build. These figures exclude runtime Wi-Fi/TLS heap use and do
+not include a live instance of the new storage/executor objects.
+The focused image is 301885 B and ran on Espressif QEMU 9.2.2: all 259 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 163692 B (90.57%, 17044 B
+free, dominated by `.bss` test fixtures and real-NVS transaction buffers) and
+IRAM 47003 B (35.86%). No broker was accessed.
 
 ## Next integration step
 
-Wire `pixels_command_executor` into the combined application's own MQTT
-callback/control task, backed by concrete (not `static`-test-fake) `PayloadSource`
-(HTTPS), `EventSink` (MQTT publish), `TimestampSource` (SNTP-derived) and
-`ActiveTargetProbe` implementations, plus NVS-backed `TerminalJournal` and
-`DurableStaging`. Reconfiguring a `PixelFrameSink`'s physical outputs at
-runtime from a config payload's own `outputs[]` is still open. HTTPS
+Wire `pixels_command_executor` and `pixels_durable_storage` into the combined
+application's own control task, outside the MQTT callback. Add concrete
+`PayloadSource` (HTTPS), `EventSink` (MQTT publish), `TimestampSource`
+(SNTP-derived), `ActiveTargetProbe` and `ActivationTarget` adapters.
+Reconfiguring a `PixelFrameSink`'s physical outputs at runtime from a config
+payload's own `outputs[]` is still open. HTTPS
 retrieval, state publication, provisioning and broker-loss tests remain
 dependent on the EasyLED delivery flows. Runtime heap, stack and render
 continuity must be measured with the combined firmware and an authorized

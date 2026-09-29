@@ -174,6 +174,10 @@ public:
     /// Activates the committed candidate atomically at a render frame boundary.
     /// @return ESP_OK only when active state matches the durable candidate.
     virtual esp_err_t activateAtFrameBoundary() = 0;
+    /// Finalizes an activated transaction after its applied terminal result is durable.
+    /// A failure leaves recovery metadata intact for boot-time reconciliation.
+    /// @return ESP_OK when obsolete rollback data is removed, or a storage error.
+    virtual esp_err_t finalize() = 0;
     /// Restores/preserves the previous durable active state after any failure.
     /// @return ESP_OK when recovery is complete, or a storage/runtime error.
     virtual esp_err_t rollback() = 0;

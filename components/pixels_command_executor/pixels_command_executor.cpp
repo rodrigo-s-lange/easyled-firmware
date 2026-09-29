@@ -153,7 +153,13 @@ esp_err_t Executor::execute(const char *json, size_t size)
     // terminal store after a successful activation rolls the durable/live
     // state back and reports failure instead.
     const esp_err_t stored = storeAndPublishTerminal(EventType::CommandApplied, command_id, nullptr, nullptr);
-    if (stored == ESP_OK) { return ESP_OK; }
+    if (stored == ESP_OK) {
+        // Terminal success is already durable. Finalization only removes the
+        // retained rollback slot/pending marker; if it fails, boot recovery
+        // reconciles them against that terminal journal record.
+        (void)staging_.finalize();
+        return ESP_OK;
+    }
     return rollbackAndFail(command_id, ReasonCode::kTerminalStoreFailed,
                            "activated but the terminal record could not be stored durably");
 }
