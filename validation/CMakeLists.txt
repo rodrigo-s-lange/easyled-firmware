@@ -5,6 +5,8 @@ set(ESP_PIXELS_FX_DIR "${FRAMEWORK_ROOT}/../esp_pixels_fx")
 set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/../components/pixels_network"
     "${CMAKE_CURRENT_SOURCE_DIR}/../components/pixels_firmware_contract"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../components/pixels_payload_adapter"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../components/pixels_command_executor"
     "${FRAMEWORK_ROOT}/framework/core/esp32libfun_at"
     "${FRAMEWORK_ROOT}/framework/core/esp32libfun_rmt"
     "${FRAMEWORK_ROOT}/framework/core/esp32libfun_serial"

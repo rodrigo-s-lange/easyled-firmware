@@ -1,3 +1,11 @@
 idf_component_register(SRCS "main.cpp"
-    REQUIRES pixels_network pixels_firmware_contract esp_pixels esp_pixels_fx
-             esp_pixels_composer adapter_esp_pixels freertos)
+    REQUIRES pixels_network pixels_firmware_contract pixels_payload_adapter pixels_command_executor
+             esp_pixels esp_pixels_fx esp_pixels_composer adapter_esp_pixels freertos
+    EMBED_TXTFILES
+        "../fixtures/apply-config-command.provisional.json"
+        "../fixtures/config-payload-bench-gpio16-50.provisional.json"
+        "../fixtures/activate-preset-command.provisional.json"
+        "../fixtures/preset-payload.provisional.json"
+        "../fixtures/event-command-applied.provisional.json"
+        "../fixtures/event-checksum-mismatch-rejected.provisional.json"
+        "../fixtures/event-command-failed.provisional.json")

@@ -185,6 +185,26 @@ bool boundedText(const char *value, size_t maximum)
 
 } // namespace
 
+esp_err_t extractCommandId(const char *json, size_t size, char command_id[kUuidBytes + 1])
+{
+    if (json == nullptr || size == 0 || command_id == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (size > kMaxCommandBytes) { return ESP_ERR_INVALID_SIZE; }
+    const char *end = nullptr;
+    cJSON *root = cJSON_ParseWithLengthOpts(json, size, &end, false);
+    if (root == nullptr || end != json + size) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    char extracted[kUuidBytes + 1]{};
+    const bool ok = copyString(member(root, "command_id"), extracted, sizeof(extracted)) && uuid(extracted);
+    cJSON_Delete(root);
+    if (!ok) { return ESP_ERR_INVALID_ARG; }
+    std::memcpy(command_id, extracted, sizeof(extracted));
+    return ESP_OK;
+}
+
 esp_err_t parseCommand(const char *json, size_t size, Command &command, ParseError &error)
 {
     error = ParseError::InvalidJson;
@@ -257,12 +277,19 @@ esp_err_t parseSha256(const char *text, uint8_t digest[kSha256Bytes])
 esp_err_t verifySha256(const void *bytes, size_t size, const uint8_t expected[kSha256Bytes])
 {
     if ((bytes == nullptr && size != 0) || expected == nullptr) { return ESP_ERR_INVALID_ARG; }
+    // PSA's own contract allows calling psa_crypto_init() repeatedly, but
+    // this backend's RNG (re-)seeding on every call is expensive enough
+    // under QEMU's slower instruction emulation to blow through the
+    // interrupt watchdog's short window when called many times in a row
+    // (observed directly: repeated calls tripped CONFIG_ESP_INT_WDT_TIMEOUT_MS).
+    // Function-local static initialization is synchronized by C++, so two
+    // callers can never race the one-time crypto initialization.
+    static const psa_status_t crypto_init_status = psa_crypto_init();
+    if (crypto_init_status != PSA_SUCCESS) { return ESP_FAIL; }
     uint8_t actual[kSha256Bytes]{};
     size_t actual_size = 0;
     static const uint8_t empty = 0;
-    if (psa_crypto_init() != PSA_SUCCESS ||
-        psa_hash_compute(PSA_ALG_SHA_256,
-                         bytes == nullptr ? &empty : static_cast<const uint8_t *>(bytes), size,
+    if (psa_hash_compute(PSA_ALG_SHA_256, bytes == nullptr ? &empty : static_cast<const uint8_t *>(bytes), size,
                          actual, sizeof(actual), &actual_size) != PSA_SUCCESS ||
         actual_size != sizeof(actual)) {
         return ESP_FAIL;

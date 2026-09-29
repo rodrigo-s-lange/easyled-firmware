@@ -62,9 +62,67 @@ layout:
   activation.
 
 The component deliberately does not select NVS keys, journal capacity, cache
-eviction or a partition layout. It also does not parse the downloaded config or
-preset payload into a Composer scene yet. Those are the next application-layer
-steps after the EasyLED schema fields and canonical byte rules are closed.
+eviction or a partition layout.
+
+## Offline command executor
+
+`components/pixels_payload_adapter` turns exact, checksum-verified
+`apply_config`/`activate_preset` payload bytes into a validated pixel
+candidate. It reuses `esp_pixels_fx::describe()` as the one effect catalog and
+`esp_pixels_composer::AtScene`/`SegmentSpec` as the one scene representation --
+never a second metadata or scene system. Supported subset: 1D segments only,
+`ledmap:null`/absent (a preset may omit `ledmap` entirely; a config payload
+must carry it), an empty `inputs`, one or two `digital_out` WS2812B outputs with
+`reversed:false`, output-capable non-reserved ESP32 GPIOs (unique across slots),
+strict `#RRGGBB` segment colors, `replace`/`add`/`alpha`
+blend names, and segments addressed by `segment_index` (0..31, mapped to
+Composer id `segment_index + 1`). Config segments must fit inside the sum of
+the configured output pixel counts. A structurally valid but not-yet-implemented
+field (`is_2d:true`, a non-null `ledmap`, a non-empty `inputs`, a physical
+output `reversed:true`, a present segment `mirror`/`reversed`/`custom`/
+`color_source` field regardless of value, an unregistered/dimension-mismatched
+`effect_id`, or a preset payload's own non-empty `outputs`) is rejected as
+`SchemaError::Unsupported`, never silently ignored. Unknown JSON members
+anywhere are accepted for forward compatibility. Limits: 8192 bytes per
+payload, one or two outputs, 32 segments, 2048 pixels per output.
+
+`components/pixels_command_executor` is the synchronous, application-layer
+orchestrator: one `execute()` call turns one command message into a terminal
+outcome, independent of MQTT/HTTP/clock/NVS-policy specifics through four
+narrow injected interfaces (`PayloadSource`, `EventSink`, `TimestampSource`,
+`ActiveTargetProbe`). Step order: bounded `command_id` extraction; a duplicate
+replays its exact stored terminal event and stops (no re-parse, re-resolve or
+re-activation); full envelope parse (`command_received`); resolve bytes,
+checksum-verify, and schema-validate -- all before touching durable/live state.
+For `apply_config`, the envelope checksum is authoritative and cannot be
+replaced by resolver metadata; for `activate_preset`, the resolver supplies the
+digest because the provisional envelope has none. `reboot`/`ota` stop here as
+`command_rejected`/`not_implemented`, parsed but never executed. An
+`activate_preset` already matching the live target emits `command_accepted`
+and a successful terminal result without staging or restarting the animation.
+Other accepted pixel commands continue through `staging.begin()` -> `append()`
+-> `verifyAndCommit()` -> `activateAtFrameBoundary()`, then durably store and
+publish `command_applied`. A
+checksum/schema/unsupported failure before staging is `command_rejected` and
+does not roll back; a resolver transport/cache failure is `command_failed`.
+A failure at staging, activation, or storing the terminal record after a
+successful activation is `command_failed`,
+followed by `rollback()`; a rollback error is exposed as `rollback_failed`
+rather than hidden. "Applied but not saved" is forbidden.
+Reason codes beyond `pixels_firmware::parseErrorCode()`/
+`pixels_payload::schemaErrorCode()`: `checksum_mismatch`, `resolve_failed`,
+`staging_failed`, `activation_failed`, `terminal_store_failed`,
+`rollback_failed`, `not_implemented`. `Executor` owns its fixed-capacity
+scratch (command, payload buffer, candidate, event buffers) as class members,
+never task-stack
+locals or function-local statics, so it is safe to place on a small FreeRTOS
+task and never aliases across a second instance.
+
+Not implemented by this delivery: real HTTPS retrieval, MQTT topic policy,
+capability publication, NVS-backed `TerminalJournal`/`DurableStaging`, OTA
+execution, and reconfiguring a `PixelFrameSink`'s physical outputs at runtime
+(`Composer::build()` runs once per boot in this cut; a config payload's own
+`outputs[]` are validated but not yet re-applied to a live sink).
 
 ## Build and local profile
 
@@ -114,11 +172,22 @@ python validation/backup_flash.py --port COM6 --output build/flash-before.bin
 
 ## Focused local validation
 
-`validation/` runs the fragment assembler, firmware-contract component and a real
-50-pixel Composer render in an ESP32 QEMU target with no network adapter. It checks
-the two exact provisional fixture hashes, command parsing, event serialization,
-terminal replay, pixel-stack linking and all previous message assembly cases. It
-does **not** validate radio, TLS, broker permissions, storage durability or HTTPS.
+`validation/` runs the fragment assembler, firmware-contract component, the
+payload adapter, the command executor and a real Composer render in an ESP32
+QEMU target with no network adapter. The seven fixture strings the tests use
+(two payloads, two command envelopes, three events) live as inspectable files
+under `validation/fixtures/*.provisional.json`, embedded into the binary via
+`EMBED_TXTFILES` rather than duplicated as string literals. It checks the two
+exact provisional fixture hashes, command parsing, event serialization,
+terminal replay, the payload adapter's happy paths and a representative
+type/range/duplicate/unsupported failure table, and the executor's full
+scenario table (happy-path apply_config, duplicate replay, preset cache-miss/
+already-active no-op, checksum-mismatch rejection, staging/activation-failure
+rollback, terminal-store-failure rollback, terminal-publish-failure survival,
+reboot/ota rejection, and 20 repeated commands with no leak) through a real
+`Composer`/`FakeSink` pair, proving a fixture's own bytes reach rendered
+pixels. It does **not** validate radio, TLS, broker permissions, storage
+durability or HTTPS.
 
 ```powershell
 cd validation
@@ -129,26 +198,38 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe"
 The script merges only a local emulated flash file, captures the result in
 `build/network-contract-validation/qemu-validation.log`, and terminates QEMU after
 15 seconds. The expected marker is
-`NETWORK_CONTRACT_VALIDATION checks=52 failures=0 RESULT=ALL_PASS`.
+`NETWORK_CONTRACT_VALIDATION checks=153 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
 shell's `PATH` before invoking the script (no machine-wide configuration change).
 
-Build verified with ESP-IDF 6.0.2: combined image 971968 B, static DRAM 43207 B
-(23.91%) and IRAM 87891 B (67.06%). The 1.5 MiB app partition retains 564032 B
+The validation target uses the ESP-IDF 4096 B main-task stack. Large candidates,
+fixture strings, journal records and fake storage remain in owning/static
+storage; QEMU runs the repeated-command loop without stack overflow or panic.
+
+Build verified with ESP-IDF 6.0.2: combined image 971880 B, static DRAM 43207 B
+(23.91%) and IRAM 87891 B (67.06%). The 1.5 MiB app partition retains 564000 B
 (37%) after the build. These figures exclude runtime Wi-Fi/TLS heap use.
-The focused image is 198080 B and ran on Espressif QEMU 9.2.2: all 52 checks
-passed, with no assertion or panic. No broker was accessed.
+The focused image is 261725 B and ran on Espressif QEMU 9.2.2: all 153 checks
+passed, with no assertion or panic. Its own static DRAM is 148284 B (82.04%,
+dominated by `.bss` -- the test harness's fixed-capacity fakes, including a
+second `Composer`/`FakeSink` pair and several `ComposerBackedDurableStaging`/
+event-recording instances, are deliberately `static`, not stack-resident) and
+IRAM 44899 B (34.26%). No broker was accessed.
 
 ## Next integration step
 
-Implement the bounded config/preset payload adapter into a durable candidate,
-then provide concrete NVS-backed `TerminalJournal` and `DurableStaging`
-implementations in the product application. HTTPS retrieval, state publication,
-provisioning and broker-loss tests remain dependent on the EasyLED delivery flows.
-Runtime heap, stack and render continuity must be measured with the combined
-firmware and an authorized development broker before product release.
+Wire `pixels_command_executor` into the combined application's own MQTT
+callback/control task, backed by concrete (not `static`-test-fake) `PayloadSource`
+(HTTPS), `EventSink` (MQTT publish), `TimestampSource` (SNTP-derived) and
+`ActiveTargetProbe` implementations, plus NVS-backed `TerminalJournal` and
+`DurableStaging`. Reconfiguring a `PixelFrameSink`'s physical outputs at
+runtime from a config payload's own `outputs[]` is still open. HTTPS
+retrieval, state publication, provisioning and broker-loss tests remain
+dependent on the EasyLED delivery flows. Runtime heap, stack and render
+continuity must be measured with the combined firmware and an authorized
+development broker before product release.
 
 Official references: [ESP-IDF 6.0.2 MQTT component migration](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32/api-reference/protocols/mqtt.html),
 [ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme),

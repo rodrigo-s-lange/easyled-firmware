@@ -51,6 +51,18 @@ struct Command {
     char firmware_version[33]{};
 };
 
+/// Extracts ONLY the envelope's own `command_id`, without validating or
+/// parsing anything else (type, payload, actor, timestamp). Intended for an
+/// executor's own terminal-journal deduplication check, before deciding
+/// whether the full envelope needs parsing/revalidating at all. Still
+/// rejects a malformed/oversized message or an invalid UUID -- this is a
+/// bounded extraction, not a lax pre-scan.
+/// @param json UTF-8 JSON bytes; no trailing NUL is required.
+/// @param size Exact byte count, at most 1024.
+/// @param command_id Receives the canonical UUID on success only.
+/// @return ESP_OK or ESP_ERR_INVALID_ARG/SIZE.
+esp_err_t extractCommandId(const char *json, size_t size, char command_id[kUuidBytes + 1]);
+
 /// Parses one complete, non-retained command message.
 /// @param json UTF-8 JSON bytes; no trailing NUL is required.
 /// @param size Exact byte count, at most 1024.
