@@ -2,9 +2,10 @@
 
 Application-layer Wi-Fi + MQTT over secure WebSocket (WSS), compiled together
 with the pixel transport, effects, Composer and two-output adapter. This is a
-buildable integration boundary, **not the completed EasyLED device firmware**.
-It does not yet download or activate remote configuration. No EasyLED repository
-files are dependencies.
+provisional EasyLED device-control integration, **not the completed product
+firmware**. It now restores and activates durable pixel configuration and
+executes the two versioned starter-pack resources end to end; authenticated
+HTTPS resolution is still pending. No EasyLED repository files are dependencies.
 
 `components/pixels_network` owns the session and bounded message queue. It reuses
 the existing `esp32libfun_wifi_sta` HAL for initialization and connection state;
@@ -142,16 +143,33 @@ intended for a single application control task.
   `init()` returns `ESP_ERR_NOT_FOUND` on a legitimately empty partition while
   leaving the instance ready for its first transaction.
 
-The storage implementation is compiled by the combined application but is not
-yet instantiated by `main.cpp`; the network callback still does not execute
-remote commands.
+## Integrated control runtime
 
-Not implemented by this delivery: real HTTPS retrieval, MQTT topic policy,
-capability publication, OTA execution, wiring the executor/storage into the
-combined application's control task, and reconfiguring a `PixelFrameSink`'s
-physical outputs at runtime
-(`Composer::build()` runs once per boot in this cut; a config payload's own
-`outputs[]` are validated but not yet re-applied to a live sink).
+`components/pixels_control_runtime` supplies the concrete application adapters
+and `main.cpp` now owns their lifecycle. Boot initializes the real GPIO16/50 GRB
+pixel output, starts Composer's managed render task, opens the terminal journal,
+and restores the newest durable payload before networking starts. With a local
+profile, the same application task that calls `NetworkSession::poll()` dequeues
+complete MQTT commands and calls `Executor::execute()`; no product action runs
+inside an MQTT callback. Events are published non-retained with QoS1 through the
+configured exact event topic and timestamps come from the SNTP-derived UTC clock.
+
+`ComposerActivationTarget` reparses persisted bytes on every activation, checks
+an `apply_config` payload's topology against the already-built physical sink,
+publishes its scene, and reports success only after `Composer::reclaim()` directly
+proves frame-boundary adoption. The physical topology in this cut is exactly one
+WS2812B/GRB output with 50 pixels on GPIO16. A config asking for another topology
+fails activation and rolls back; a preset inherits the active topology.
+
+`EmbeddedPayloadSource` resolves only the starter pack's exact config URL and
+preset UUID to the versioned fixture bytes embedded from `validation/fixtures`.
+It is an explicit development bridge for offline/broker integration testing,
+not an HTTPS substitute or a production compatibility claim. A different URL or
+preset UUID fails as `resolve_failed` without changing live state.
+
+Not implemented by this delivery: authenticated HTTPS retrieval, final MQTT
+topic/provisioning policy, retained state and capability publication, OTA
+execution, runtime physical-output reconfiguration, and live broker-loss tests.
 
 ## Build and local profile
 
@@ -161,22 +179,27 @@ From an ESP-IDF 6.0.2 shell in this directory:
 idf.py -D IDF_TARGET=esp32 build
 ```
 
-Without `main/network_credentials.hpp`, startup reports that networking is
-disabled and returns. An optional, gitignored profile has this shape:
+Without `main/network_credentials.hpp`, startup still initializes pixels and
+restores durable local state, then leaves networking disabled. An optional,
+gitignored profile has this shape:
 
 ```cpp
 #pragma once
 #include "network_session.hpp"
-static pixels_network::NetworkSession::Config networkConfig()
+static ApplicationConfig applicationConfig()
 {
     return {
-        .ssid = "YOUR_WIFI",
-        .wifi_password = "YOUR_WIFI_PASSWORD",
-        .broker_uri = "wss://broker.example.invalid/mqtt",
-        .client_id = "YOUR_DEVICE_ID",
-        .username = "YOUR_DEVICE_USERNAME",
-        .password = "YOUR_DEVICE_PASSWORD",
-        .command_topic = "YOUR_EXACT_COMMAND_TOPIC",
+        .network = {
+            .ssid = "YOUR_WIFI",
+            .wifi_password = "YOUR_WIFI_PASSWORD",
+            .broker_uri = "wss://broker.example.invalid/mqtt",
+            .client_id = "YOUR_MQTT_CLIENT_ID",
+            .username = "YOUR_DEVICE_USERNAME",
+            .password = "YOUR_DEVICE_PASSWORD",
+            .command_topic = "YOUR_EXACT_COMMAND_TOPIC",
+        },
+        .device_id = "YOUR_CANONICAL_DEVICE_UUID",
+        .event_topic = "YOUR_EXACT_EVENT_TOPIC",
     };
 }
 ```
@@ -191,6 +214,11 @@ the preset application's layout. Back up the complete flash before a bench run
 and restore that image afterward; flashing only the previous application binary
 is insufficient to restore its partition table and NVS data.
 
+This target sets the task-watchdog timeout to 10 seconds in `sdkconfig.defaults`.
+The 128 KiB NVS partition scan takes more than the ESP-IDF default five seconds
+under the supported QEMU build; the same boot completes without disabling the
+watchdog. No generated `sdkconfig` is edited.
+
 For USB links that fail during a single 4 MiB read, `validation/backup_flash.py`
 reads 256 KiB chunks, retries each failed chunk at a lower baud rate, validates
 every chunk length and assembles one SHA-256-labelled image. It refuses to
@@ -203,8 +231,8 @@ python validation/backup_flash.py --port COM6 --output build/flash-before.bin
 ## Focused local validation
 
 `validation/` runs the fragment assembler, firmware-contract component, the
-payload adapter, command executor, real NVS storage and a Composer render in an
-ESP32 QEMU target with no network adapter. The seven fixture strings the tests use
+payload adapter, command executor, real NVS storage and the control-runtime
+adapters in an ESP32 QEMU target with no network adapter. The seven fixture strings the tests use
 (two payloads, two command envelopes, three events) live as inspectable files
 under `validation/fixtures/*.provisional.json`, embedded into the binary via
 `EMBED_TXTFILES` rather than duplicated as string literals. It checks the two
@@ -219,6 +247,9 @@ reboot/ota rejection, and 20 repeated commands with no leak) through a real
 It also executes the concrete eight-entry journal, immutable duplicates and
 oldest eviction; A/B recovery and rollback across simulated reboot; an actual
 8192-byte transaction; preset identity recovery; and corrupt-active rejection.
+It also covers exact embedded-resource lookup, timestamp format, physical
+topology mismatch rejection, and the production activation adapter over a real
+managed Composer/FakeSink pair through config, preset and clear adoption.
 It does **not** validate radio, TLS, broker permissions, physical flash failure
 or HTTPS.
 
@@ -231,7 +262,7 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe"
 The script merges only a local emulated flash file, captures the result in
 `build/network-contract-validation/qemu-validation.log`, and terminates QEMU
 after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
-marker is `NETWORK_CONTRACT_VALIDATION checks=259 failures=0 RESULT=ALL_PASS`.
+marker is `NETWORK_CONTRACT_VALIDATION checks=276 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
@@ -241,27 +272,23 @@ The validation target uses the ESP-IDF 4096 B main-task stack. Large candidates,
 fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
-Build verified with ESP-IDF 6.0.2: combined image 971880 B, static DRAM 43207 B
-(23.91%) and IRAM 87891 B (67.06%). The 1.5 MiB app partition retains 600864 B
-(38%) after the build. These figures exclude runtime Wi-Fi/TLS heap use and do
-not include a live instance of the new storage/executor objects.
-The focused image is 301885 B and ran on Espressif QEMU 9.2.2: all 259 checks
-passed, with no assertion, watchdog or panic. Its static DRAM is 163692 B (90.57%, 17044 B
-free, dominated by `.bss` test fixtures and real-NVS transaction buffers) and
-IRAM 47003 B (35.86%). No broker was accessed.
+Build verified with ESP-IDF 6.0.2: combined image 1049248 B, static DRAM 69407 B
+(38.40%) and IRAM 90447 B (69.01%). The 1.5 MiB app partition retains 523616 B
+(33%) after the build. These figures include live storage, executor, fixture
+resolver and Composer activation objects but exclude runtime Wi-Fi/TLS heap use.
+The focused image is 313264 B and ran on Espressif QEMU 9.2.2: all 276 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 166812 B (92.30%,
+13924 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
+and IRAM is 47003 B (35.86%). No broker was accessed.
 
 ## Next integration step
 
-Wire `pixels_command_executor` and `pixels_durable_storage` into the combined
-application's own control task, outside the MQTT callback. Add concrete
-`PayloadSource` (HTTPS), `EventSink` (MQTT publish), `TimestampSource`
-(SNTP-derived), `ActiveTargetProbe` and `ActivationTarget` adapters.
-Reconfiguring a `PixelFrameSink`'s physical outputs at runtime from a config
-payload's own `outputs[]` is still open. HTTPS
-retrieval, state publication, provisioning and broker-loss tests remain
-dependent on the EasyLED delivery flows. Runtime heap, stack and render
-continuity must be measured with the combined firmware and an authorized
-development broker before product release.
+Replace `EmbeddedPayloadSource` with authenticated HTTPS delivery once EasyLED
+#60 preserves and serves the exact canonical bytes/checksum. Add retained state
+and capability publication after those schemas/topics enter the canonical
+contract, then exercise command/event/state behavior with an authorized broker.
+Runtime `PixelFrameSink` output rebuild, provisioning, heap/stack measurements
+under TLS load and broker-loss/render-continuity tests remain product work.
 
 Official references: [ESP-IDF 6.0.2 MQTT component migration](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32/api-reference/protocols/mqtt.html),
 [ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme),

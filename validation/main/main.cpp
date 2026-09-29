@@ -3,6 +3,7 @@
 #include "firmware_contract.hpp"
 #include "pixels_payload_adapter.hpp"
 #include "pixels_command_executor.hpp"
+#include "pixels_control_runtime.hpp"
 #include "pixels_durable_storage.hpp"
 #include "esp_pixels_composer.hpp"
 #include "esp_pixels_composer_adapter_esp_pixels.hpp"
@@ -684,6 +685,84 @@ void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(journal.init() == ESP_ERR_INVALID_RESPONSE); // never risk replay after journal corruption
 }
 
+void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t preset_digest[32])
+{
+    static const pixels_control::EmbeddedResource resources[] = {
+        {pixels_firmware::CommandType::ApplyConfig,
+         "https://example.invalid/api/v1/devices/11111111-1111-4111-8111-111111111111/config/13",
+         FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
+         FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json), config_digest},
+        {pixels_firmware::CommandType::ActivatePreset, kPresetId,
+         FIXTURE_BYTES(preset_payload_provisional_json),
+         FIXTURE_SIZE(preset_payload_provisional_json), preset_digest},
+    };
+    static pixels_control::EmbeddedPayloadSource source(resources, 2);
+    static char resolved[1024]{};
+    static uint8_t resolved_digest[pixels_firmware::kSha256Bytes]{};
+    size_t resolved_size = 0;
+    pixels_firmware::Command command{};
+    pixels_firmware::ParseError parse_error = pixels_firmware::ParseError::None;
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
+                                        FIXTURE_SIZE(apply_config_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(source.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_OK);
+    CHECK(resolved_size == FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json) &&
+          std::memcmp(resolved, FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
+                      resolved_size) == 0 &&
+          std::memcmp(resolved_digest, config_digest, sizeof(resolved_digest)) == 0);
+    CHECK(source.resolve(command, resolved, resolved_size - 1, resolved_size, resolved_digest) ==
+          ESP_ERR_INVALID_SIZE);
+    command.resource_url[0] = 'x';
+    CHECK(source.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_ERR_NOT_FOUND);
+
+    command = pixels_firmware::Command{};
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(activate_preset_command_provisional_json),
+                                        FIXTURE_SIZE(activate_preset_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(source.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_OK &&
+          resolved_size == FIXTURE_SIZE(preset_payload_provisional_json) &&
+          std::memcmp(resolved_digest, preset_digest, sizeof(resolved_digest)) == 0);
+
+    char timestamp[36]{};
+    pixels_control::UtcTimestampSource timestamps;
+    timestamps.now(timestamp);
+    CHECK(std::strlen(timestamp) == 20 && timestamp[4] == '-' && timestamp[10] == 'T' &&
+          timestamp[19] == 'Z');
+
+    // This is the production activation adapter over a real managed Composer,
+    // with only the hardware transport replaced by FakeSink. Confirmation is
+    // obtained from reclaim(), not from a timing guess.
+    static FakeSink sink;
+    static esp_pixels_composer::Composer composer;
+    CHECK(composer.build(sink) == ESP_OK);
+    CHECK(composer.start(2) == ESP_OK);
+    static constexpr pixels_payload::OutputCandidate topology[] = {
+        {.gpio = 16, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
+    };
+    static pixels_control::ComposerActivationTarget target(composer, topology, 1);
+    const size_t config_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
+    std::memcpy(resolved, FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json), config_size);
+    resolved[config_size] = '\0';
+    char *gpio = std::strstr(resolved, "\"gpio\":16");
+    CHECK(gpio != nullptr);
+    if (gpio != nullptr) { gpio[8] = '7'; }
+    CHECK(target.activateAtFrameBoundary(
+              pixels_firmware::CommandType::ApplyConfig,
+              resolved, config_size) == ESP_ERR_NOT_SUPPORTED);
+    CHECK(target.activateAtFrameBoundary(
+              pixels_firmware::CommandType::ApplyConfig,
+              FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
+              FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json)) == ESP_OK);
+    CHECK(target.activateAtFrameBoundary(
+              pixels_firmware::CommandType::ActivatePreset,
+              FIXTURE_BYTES(preset_payload_provisional_json),
+              FIXTURE_SIZE(preset_payload_provisional_json)) == ESP_OK);
+    CHECK(sink.pixel(0).r == 0x00 && sink.pixel(0).g == 0x37 && sink.pixel(0).b == 0xDC);
+    CHECK(target.clearAtFrameBoundary() == ESP_OK);
+    CHECK(composer.end() == ESP_OK);
+}
+
 } // namespace
 
 extern "C" void app_main()
@@ -730,6 +809,7 @@ extern "C" void app_main()
     CHECK(parseSha256(kConfigHash, config_digest) == ESP_OK);
     CHECK(parseSha256(kPresetHash, preset_digest) == ESP_OK);
     runDurableStorageChecks(config_digest, preset_digest);
+    runControlRuntimeChecks(config_digest, preset_digest);
     CHECK(verifySha256(FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
                        FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json), config_digest) == ESP_OK);
     CHECK(verifySha256(FIXTURE_BYTES(preset_payload_provisional_json),
