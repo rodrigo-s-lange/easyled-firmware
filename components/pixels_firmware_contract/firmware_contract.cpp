@@ -183,6 +183,27 @@ bool boundedText(const char *value, size_t maximum)
     return value != nullptr && value[0] != '\0' && strnlen(value, maximum + 1) <= maximum;
 }
 
+const char *modeName(DeviceMode mode)
+{
+    switch (mode) {
+        case DeviceMode::Idle: return "idle";
+        case DeviceMode::ConfigActive: return "config_active";
+        case DeviceMode::PresetActive: return "preset_active";
+    }
+    return nullptr;
+}
+
+esp_err_t printJson(cJSON *root, char *output, size_t capacity, size_t &size)
+{
+    if (root == nullptr || output == nullptr || capacity == 0) { return ESP_ERR_INVALID_ARG; }
+    if (capacity > INT_MAX ||
+        !cJSON_PrintPreallocated(root, output, static_cast<int>(capacity), false)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size = std::strlen(output);
+    return ESP_OK;
+}
+
 } // namespace
 
 esp_err_t extractCommandId(const char *json, size_t size, char command_id[kUuidBytes + 1])
@@ -339,6 +360,128 @@ esp_err_t serializeEvent(const Event &event, char *output, size_t capacity, size
     cJSON_Delete(root);
     size = std::strlen(output);
     return ESP_OK;
+}
+
+esp_err_t serializeState(const StateReport &state, char *output, size_t capacity, size_t &size)
+{
+    size = 0;
+    const char *mode = modeName(state.mode);
+    if (output == nullptr || capacity == 0 || !uuid(state.device_id) ||
+        !uuid(state.hardware_binding_id) || state.generation == 0 ||
+        state.boot_counter == 0 || state.state_sequence == 0 ||
+        !timestamp(state.reported_at) || !boundedText(state.firmware_version, 32) ||
+        mode == nullptr ||
+        (state.active_preset_id != nullptr && !uuid(state.active_preset_id)) ||
+        (state.last_applied_command_id != nullptr && !uuid(state.last_applied_command_id)) ||
+        (state.mode == DeviceMode::PresetActive && state.active_preset_id == nullptr) ||
+        (state.mode != DeviceMode::PresetActive && state.active_preset_id != nullptr)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (root == nullptr) { return ESP_ERR_NO_MEM; }
+    bool ok = cJSON_AddStringToObject(root, "device_id", state.device_id) != nullptr &&
+        cJSON_AddStringToObject(root, "hardware_binding_id", state.hardware_binding_id) != nullptr &&
+        cJSON_AddNumberToObject(root, "generation", state.generation) != nullptr &&
+        cJSON_AddNumberToObject(root, "boot_counter", state.boot_counter) != nullptr &&
+        cJSON_AddNumberToObject(root, "state_sequence", state.state_sequence) != nullptr &&
+        cJSON_AddStringToObject(root, "reported_at", state.reported_at) != nullptr &&
+        cJSON_AddStringToObject(root, "fw_version", state.firmware_version) != nullptr &&
+        cJSON_AddStringToObject(root, "mode", mode) != nullptr;
+    if (ok) {
+        ok = state.active_preset_id != nullptr
+            ? cJSON_AddStringToObject(root, "active_preset_id", state.active_preset_id) != nullptr
+            : cJSON_AddNullToObject(root, "active_preset_id") != nullptr;
+    }
+    if (ok) { ok = cJSON_AddNumberToObject(root, "cfg_ver", state.config_version) != nullptr; }
+    if (ok) {
+        ok = state.last_applied_command_id != nullptr
+            ? cJSON_AddStringToObject(root, "last_applied_command_id",
+                                     state.last_applied_command_id) != nullptr
+            : cJSON_AddNullToObject(root, "last_applied_command_id") != nullptr;
+    }
+    if (!ok) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    const esp_err_t result = printJson(root, output, capacity, size);
+    cJSON_Delete(root);
+    return result;
+}
+
+esp_err_t serializeCapabilityReport(const CapabilityReport &report, char *output,
+                                    size_t capacity, size_t &size)
+{
+    size = 0;
+    const CapabilityManifest &caps = report.capabilities;
+    if (output == nullptr || capacity == 0 || !uuid(report.device_id) ||
+        !boundedText(report.firmware_version, 32) || !timestamp(report.reported_at) ||
+        caps.free_internal_heap_bytes == 0 || caps.largest_internal_heap_block_bytes == 0 ||
+        caps.largest_internal_heap_block_bytes > caps.free_internal_heap_bytes ||
+        caps.max_output_slots == 0 || caps.max_pixels_per_output == 0 ||
+        caps.configured_output_count == 0 ||
+        caps.configured_output_count > caps.max_output_slots || caps.configured_total_pixels == 0 ||
+        caps.max_segments == 0 || caps.custom_param_slots > 3 || caps.effect_count == 0 ||
+        caps.effect_count > 16 || caps.effect_ids == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON *manifest = cJSON_CreateObject();
+    cJSON *effects = cJSON_CreateArray();
+    if (root == nullptr || manifest == nullptr || effects == nullptr) {
+        cJSON_Delete(effects);
+        cJSON_Delete(manifest);
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    bool ok = cJSON_AddStringToObject(root, "event_type", "capability_reported") != nullptr &&
+        cJSON_AddStringToObject(root, "device_id", report.device_id) != nullptr &&
+        cJSON_AddStringToObject(root, "fw_version", report.firmware_version) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "schema_version", 1) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "free_internal_heap_bytes",
+                               caps.free_internal_heap_bytes) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "largest_internal_heap_block_bytes",
+                               caps.largest_internal_heap_block_bytes) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "psram_total_bytes", caps.psram_total_bytes) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "psram_free_bytes", caps.psram_free_bytes) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "max_output_slots", caps.max_output_slots) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "max_pixels_per_output",
+                               caps.max_pixels_per_output) != nullptr &&
+        cJSON_AddBoolToObject(manifest, "synchronized_start", caps.synchronized_start) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "configured_output_count",
+                               caps.configured_output_count) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "configured_total_pixels",
+                               caps.configured_total_pixels) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "max_segments", caps.max_segments) != nullptr;
+    for (size_t i = 0; ok && i < caps.effect_count; ++i) {
+        cJSON *id = cJSON_CreateNumber(caps.effect_ids[i]);
+        if (id == nullptr) { ok = false; break; }
+        cJSON_AddItemToArray(effects, id);
+    }
+    if (ok) {
+        cJSON_AddItemToObject(manifest, "effect_ids", effects);
+        effects = nullptr;
+        ok = cJSON_AddBoolToObject(manifest, "supports_ledmap", caps.supports_ledmap) != nullptr &&
+            cJSON_AddBoolToObject(manifest, "supports_2d", caps.supports_2d) != nullptr &&
+            cJSON_AddBoolToObject(manifest, "supports_mirror", caps.supports_mirror) != nullptr &&
+            cJSON_AddNumberToObject(manifest, "custom_param_slots",
+                                   caps.custom_param_slots) != nullptr &&
+            cJSON_AddNumberToObject(manifest, "preset_cache_slots",
+                                   caps.preset_cache_slots) != nullptr;
+    }
+    if (ok) {
+        cJSON_AddItemToObject(root, "capabilities", manifest);
+        manifest = nullptr;
+        ok = cJSON_AddStringToObject(root, "reported_at", report.reported_at) != nullptr;
+    }
+    cJSON_Delete(effects);
+    cJSON_Delete(manifest);
+    if (!ok) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    const esp_err_t result = printJson(root, output, capacity, size);
+    cJSON_Delete(root);
+    return result;
 }
 
 esp_err_t replayTerminal(const TerminalJournal &journal, const char *command_id,

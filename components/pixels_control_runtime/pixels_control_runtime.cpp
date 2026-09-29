@@ -78,6 +78,30 @@ esp_err_t MqttEventSink::publish(const char *event_json, size_t size)
     return session_.publish(topic_, event_json, size, false) >= 0 ? ESP_OK : ESP_FAIL;
 }
 
+MqttTelemetrySink::MqttTelemetrySink(pixels_network::NetworkSession &session,
+                                     const char *state_topic, const char *event_topic)
+    : session_(session), state_topic_(state_topic), event_topic_(event_topic)
+{
+}
+
+esp_err_t MqttTelemetrySink::publishState(const pixels_firmware::StateReport &state)
+{
+    size_t size = 0;
+    esp_err_t err = pixels_firmware::serializeState(state, buffer_, sizeof(buffer_), size);
+    if (err != ESP_OK) { return err; }
+    return session_.publish(state_topic_, buffer_, size, true) >= 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t MqttTelemetrySink::publishCapability(
+    const pixels_firmware::CapabilityReport &report)
+{
+    size_t size = 0;
+    esp_err_t err = pixels_firmware::serializeCapabilityReport(
+        report, buffer_, sizeof(buffer_), size);
+    if (err != ESP_OK) { return err; }
+    return session_.publish(event_topic_, buffer_, size, false) >= 0 ? ESP_OK : ESP_FAIL;
+}
+
 void UtcTimestampSource::now(char out[36])
 {
     if (out == nullptr) { return; }

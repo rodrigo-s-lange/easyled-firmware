@@ -9,4 +9,6 @@ idf_component_register(SRCS "main.cpp"
         "../fixtures/preset-payload.provisional.json"
         "../fixtures/event-command-applied.provisional.json"
         "../fixtures/event-checksum-mismatch-rejected.provisional.json"
-        "../fixtures/event-command-failed.provisional.json")
+        "../fixtures/event-command-failed.provisional.json"
+        "../fixtures/state-config-active.provisional.json"
+        "../fixtures/event-capability-reported.provisional.json")

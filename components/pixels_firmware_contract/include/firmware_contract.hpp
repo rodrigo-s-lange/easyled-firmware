@@ -10,6 +10,8 @@ constexpr size_t kUuidBytes = 36;
 constexpr size_t kSha256Bytes = 32;
 constexpr size_t kSha256HexBytes = 64;
 constexpr size_t kMaxEventBytes = 512;
+constexpr size_t kMaxStateBytes = 512;
+constexpr size_t kMaxCapabilityBytes = 1024;
 
 enum class CommandType : uint8_t {
     ApplyConfig,
@@ -115,6 +117,76 @@ struct Event {
 /// @param size Receives JSON byte count, excluding the trailing NUL.
 /// @return ESP_OK, ESP_ERR_INVALID_ARG, ESP_ERR_NO_MEM, or ESP_ERR_INVALID_SIZE.
 esp_err_t serializeEvent(const Event &event, char *output, size_t capacity, size_t &size);
+
+enum class DeviceMode : uint8_t {
+    Idle,
+    ConfigActive,
+    PresetActive,
+};
+
+/// Compact retained device truth. UUID pointers may be null only where the
+/// corresponding wire field is nullable.
+struct StateReport {
+    const char *device_id = nullptr;
+    const char *hardware_binding_id = nullptr;
+    uint32_t generation = 0;
+    uint32_t boot_counter = 0;
+    uint32_t state_sequence = 0;
+    const char *reported_at = nullptr;
+    const char *firmware_version = nullptr;
+    DeviceMode mode = DeviceMode::Idle;
+    const char *active_preset_id = nullptr;
+    uint32_t config_version = 0;
+    const char *last_applied_command_id = nullptr;
+};
+
+/// Serializes the provisional retained EasyLED state fixture.
+/// @param state State fields; identity, timestamp and bounded strings are validated.
+/// @param output Destination buffer.
+/// @param capacity Destination capacity, including the trailing NUL.
+/// @param size Receives JSON byte count, excluding the trailing NUL.
+/// @return ESP_OK, ESP_ERR_INVALID_ARG, ESP_ERR_NO_MEM, or ESP_ERR_INVALID_SIZE.
+esp_err_t serializeState(const StateReport &state, char *output, size_t capacity, size_t &size);
+
+/// Versioned provisional technical capability data reported on the event topic.
+struct CapabilityManifest {
+    uint32_t free_internal_heap_bytes = 0;
+    uint32_t largest_internal_heap_block_bytes = 0;
+    uint32_t psram_total_bytes = 0;
+    uint32_t psram_free_bytes = 0;
+    uint16_t max_pixels_per_output = 0;
+    uint16_t configured_total_pixels = 0;
+    uint8_t max_output_slots = 0;
+    uint8_t configured_output_count = 0;
+    uint8_t max_segments = 0;
+    bool synchronized_start = false;
+    bool supports_ledmap = false;
+    bool supports_2d = false;
+    bool supports_mirror = false;
+    uint8_t custom_param_slots = 0;
+    uint8_t preset_cache_slots = 0;
+    const uint8_t *effect_ids = nullptr;
+    size_t effect_count = 0;
+};
+
+/// Values used to serialize one `capability_reported` event.
+struct CapabilityReport {
+    const char *device_id = nullptr;
+    const char *firmware_version = nullptr;
+    const char *reported_at = nullptr;
+    CapabilityManifest capabilities{};
+};
+
+/// Serializes the provisional boot/hourly capability event. The outer event
+/// shape follows EasyLED PR #66; the versioned capabilities object remains a
+/// firmware-side provisional schema until the platform canonizes it.
+/// @param report Identity, timestamp, firmware version and technical limits.
+/// @param output Destination buffer.
+/// @param capacity Destination capacity, including the trailing NUL.
+/// @param size Receives JSON byte count, excluding the trailing NUL.
+/// @return ESP_OK, ESP_ERR_INVALID_ARG, ESP_ERR_NO_MEM, or ESP_ERR_INVALID_SIZE.
+esp_err_t serializeCapabilityReport(const CapabilityReport &report, char *output,
+                                    size_t capacity, size_t &size);
 
 /// Exact terminal event retained for command-id deduplication. Persist the
 /// serialized bytes so a duplicate republishes the original timestamp/reason.

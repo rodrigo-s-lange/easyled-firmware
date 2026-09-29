@@ -4,8 +4,9 @@ Application-layer Wi-Fi + MQTT over secure WebSocket (WSS), compiled together
 with the pixel transport, effects, Composer and two-output adapter. This is a
 provisional EasyLED device-control integration, **not the completed product
 firmware**. It now restores and activates durable pixel configuration and
-executes the two versioned starter-pack resources end to end; authenticated
-HTTPS resolution is still pending. No EasyLED repository files are dependencies.
+executes the two versioned starter-pack resources end to end. It also publishes
+retained device state and boot/hourly capability telemetry; authenticated HTTPS
+resolution is still pending. No EasyLED repository files are dependencies.
 
 `components/pixels_network` owns the session and bounded message queue. It reuses
 the existing `esp32libfun_wifi_sta` HAL for initialization and connection state;
@@ -54,6 +55,8 @@ layout:
 - exact-byte SHA-256 verification using the ESP-IDF PSA crypto API;
 - compact serialization of `command_received`, `command_accepted`,
   `command_rejected`, `command_applied` and `command_failed`;
+- compact serialization of the provisional retained device-state fixture and
+  the PR #66 `capability_reported` event envelope;
 - `TerminalJournal`, an application-owned durable interface that permits a
   duplicate `command_id` to replay its original terminal event without executing
   the command again;
@@ -142,6 +145,11 @@ intended for a single application control task.
 - A corrupt active set fails initialization instead of silently starting blank.
   `init()` returns `ESP_ERR_NOT_FOUND` on a legitimately empty partition while
   leaving the instance ready for its first transaction.
+- `NvsTelemetryState` durably increments the boot counter, reserves each state
+  sequence before publication, and remembers the last applied command UUID.
+  `ActiveSnapshot` exposes the recovered command type, config version and preset
+  identity without reparsing storage in the application loop. Preset activation
+  preserves the active config version.
 
 ## Integrated control runtime
 
@@ -153,6 +161,14 @@ profile, the same application task that calls `NetworkSession::poll()` dequeues
 complete MQTT commands and calls `Executor::execute()`; no product action runs
 inside an MQTT callback. Events are published non-retained with QoS1 through the
 configured exact event topic and timestamps come from the SNTP-derived UTC clock.
+After subscription, the runtime publishes one retained QoS1 state document on
+the exact state topic. It publishes again after each successful command and
+retries enqueue failures without consuming another sequence number. The state
+contains durable boot/state counters, active config/preset identity and the last
+applied command. `capability_reported` uses the event topic, QoS1 without retain,
+once after subscription and every 60 minutes. Its measured heap/PSRAM and output
+topology accompany supported effect IDs 0..8, ledmap/2D/mirror/custom support and
+the 100-slot disposable local preset cache.
 
 `ComposerActivationTarget` reparses persisted bytes on every activation, checks
 an `apply_config` payload's topology against the already-built physical sink,
@@ -167,17 +183,24 @@ It is an explicit development bridge for offline/broker integration testing,
 not an HTTPS substitute or a production compatibility claim. A different URL or
 preset UUID fails as `resolve_failed` without changing live state.
 
-Not implemented by this delivery: authenticated HTTPS retrieval, final MQTT
-topic/provisioning policy, retained state and capability publication, OTA
-execution, runtime physical-output reconfiguration, and live broker-loss tests.
+The capability envelope/cadence follows PR #66, but the inner capability object
+is explicitly provisional schema version 1 because EasyLED has not yet closed
+that canonical schema. Not implemented by this delivery: authenticated HTTPS
+retrieval, final MQTT topic/provisioning policy, OTA execution, runtime
+physical-output reconfiguration, and live broker-loss tests.
 
 ## Build and local profile
 
 From an ESP-IDF 6.0.2 shell in this directory:
 
 ```powershell
-idf.py -D IDF_TARGET=esp32 build
+idf.py -B ../../../build/pixels-network-session `
+  -D IDF_TARGET=esp32 `
+  -D SDKCONFIG=../../../build/pixels-network-session/sdkconfig build
 ```
+
+The explicit `SDKCONFIG` path keeps generated configuration in the build tree
+and applies this target's `sdkconfig.defaults`, including `partitions_network.csv`.
 
 Without `main/network_credentials.hpp`, startup still initializes pixels and
 restores durable local state, then leaves networking disabled. An optional,
@@ -199,7 +222,11 @@ static ApplicationConfig applicationConfig()
             .command_topic = "YOUR_EXACT_COMMAND_TOPIC",
         },
         .device_id = "YOUR_CANONICAL_DEVICE_UUID",
+        .hardware_binding_id = "YOUR_HARDWARE_BINDING_UUID",
+        .generation = 1,
+        .firmware_version = "0.1.0-dev",
         .event_topic = "YOUR_EXACT_EVENT_TOPIC",
+        .state_topic = "YOUR_EXACT_STATE_TOPIC",
     };
 }
 ```
@@ -232,12 +259,13 @@ python validation/backup_flash.py --port COM6 --output build/flash-before.bin
 
 `validation/` runs the fragment assembler, firmware-contract component, the
 payload adapter, command executor, real NVS storage and the control-runtime
-adapters in an ESP32 QEMU target with no network adapter. The seven fixture strings the tests use
-(two payloads, two command envelopes, three events) live as inspectable files
+adapters in an ESP32 QEMU target with no network adapter. The nine fixture strings
+the tests use (two payloads, two command envelopes, four events and one retained
+state) live as inspectable files
 under `validation/fixtures/*.provisional.json`, embedded into the binary via
 `EMBED_TXTFILES` rather than duplicated as string literals. It checks the two
-exact provisional fixture hashes, command parsing, event serialization,
-terminal replay, the payload adapter's happy paths and a representative
+exact provisional fixture hashes, command parsing, event/state/capability
+serialization, terminal replay, the payload adapter's happy paths and a representative
 type/range/duplicate/unsupported failure table, and the executor's full
 scenario table (happy-path apply_config, duplicate replay, preset cache-miss/
 already-active no-op, checksum-mismatch rejection, staging/activation-failure
@@ -247,6 +275,9 @@ reboot/ota rejection, and 20 repeated commands with no leak) through a real
 It also executes the concrete eight-entry journal, immutable duplicates and
 oldest eviction; A/B recovery and rollback across simulated reboot; an actual
 8192-byte transaction; preset identity recovery; and corrupt-active rejection.
+The telemetry store is rebooted in place to prove durable boot-counter,
+state-sequence and last-applied-command behavior, while active snapshots prove
+that config version survives preset activation.
 It also covers exact embedded-resource lookup, timestamp format, physical
 topology mismatch rejection, and the production activation adapter over a real
 managed Composer/FakeSink pair through config, preset and clear adoption.
@@ -262,7 +293,7 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe"
 The script merges only a local emulated flash file, captures the result in
 `build/network-contract-validation/qemu-validation.log`, and terminates QEMU
 after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
-marker is `NETWORK_CONTRACT_VALIDATION checks=276 failures=0 RESULT=ALL_PASS`.
+marker is `NETWORK_CONTRACT_VALIDATION checks=292 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
@@ -272,21 +303,23 @@ The validation target uses the ESP-IDF 4096 B main-task stack. Large candidates,
 fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
-Build verified with ESP-IDF 6.0.2: combined image 1049248 B, static DRAM 69407 B
-(38.40%) and IRAM 90447 B (69.01%). The 1.5 MiB app partition retains 523616 B
-(33%) after the build. These figures include live storage, executor, fixture
+Build verified with ESP-IDF 6.0.2: combined image 1044096 B, static DRAM 70795 B
+(39.17%) and IRAM 89615 B (68.37%). The 1.5 MiB app partition retains 528768 B
+(34%) after the build. These figures include live storage, executor, fixture
 resolver and Composer activation objects but exclude runtime Wi-Fi/TLS heap use.
-The focused image is 313264 B and ran on Espressif QEMU 9.2.2: all 276 checks
-passed, with no assertion, watchdog or panic. Its static DRAM is 166812 B (92.30%,
-13924 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
-and IRAM is 47003 B (35.86%). No broker was accessed.
+The focused image is 320176 B and ran on Espressif QEMU 9.2.2: all 292 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 168460 B (93.21%,
+12276 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
+and IRAM is 46907 B (35.79%). The combined image also booted through real NVS
+initialization with the five-entry network partition table. No broker was accessed.
 
 ## Next integration step
 
 Replace `EmbeddedPayloadSource` with authenticated HTTPS delivery once EasyLED
-#60 preserves and serves the exact canonical bytes/checksum. Add retained state
-and capability publication after those schemas/topics enter the canonical
-contract, then exercise command/event/state behavior with an authorized broker.
+#60 preserves and serves the exact canonical bytes/checksum. Replace the
+provisional capability object with its canonical schema when EasyLED closes it,
+then exercise command/event/state retain, acknowledgement and reconnect behavior
+with an authorized broker.
 Runtime `PixelFrameSink` output rebuild, provisioning, heap/stack measurements
 under TLS load and broker-loss/render-continuity tests remain product work.
 

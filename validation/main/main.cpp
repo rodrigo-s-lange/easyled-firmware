@@ -52,6 +52,14 @@ extern const uint8_t event_command_failed_provisional_json_start[] asm(
     "_binary_event_command_failed_provisional_json_start");
 extern const uint8_t event_command_failed_provisional_json_end[] asm(
     "_binary_event_command_failed_provisional_json_end");
+extern const uint8_t state_config_active_provisional_json_start[] asm(
+    "_binary_state_config_active_provisional_json_start");
+extern const uint8_t state_config_active_provisional_json_end[] asm(
+    "_binary_state_config_active_provisional_json_end");
+extern const uint8_t event_capability_reported_provisional_json_start[] asm(
+    "_binary_event_capability_reported_provisional_json_start");
+extern const uint8_t event_capability_reported_provisional_json_end[] asm(
+    "_binary_event_capability_reported_provisional_json_end");
 }
 
 namespace {
@@ -68,6 +76,7 @@ size_t fixtureSize(const uint8_t *start, const uint8_t *end)
 constexpr char kDeviceId[] = "11111111-1111-4111-8111-111111111111";
 constexpr char kApplyCommandId[] = "22222222-2222-4222-8222-222222222222";
 constexpr char kActorId[] = "33333333-3333-4333-8333-333333333333";
+constexpr char kHardwareBindingId[] = "44444444-4444-4444-8444-444444444444";
 constexpr char kPresetId[] = "55555555-5555-4555-8555-555555555555";
 constexpr char kActivateCommandId[] = "66666666-6666-4666-8666-666666666666";
 constexpr char kConfigHash[] = "b62868aef25369d8b00db8dbc6af34c7c82b060b5570b0b7b24859a7d5547c5a";
@@ -526,6 +535,19 @@ void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t pres
     // Production classes never erase or auto-format storage.
     CHECK(nvs_flash_erase_partition(pixels_storage::kPartitionLabel) == ESP_OK);
 
+    static pixels_storage::NvsTelemetryState telemetry;
+    CHECK(telemetry.init() == ESP_OK && telemetry.bootCounter() == 1);
+    uint32_t state_sequence = 0;
+    CHECK(telemetry.nextStateSequence(state_sequence) == ESP_OK && state_sequence == 1);
+    CHECK(telemetry.nextStateSequence(state_sequence) == ESP_OK && state_sequence == 2);
+    CHECK(telemetry.noteApplied(kApplyCommandId) == ESP_OK &&
+          std::strcmp(telemetry.lastAppliedCommandId(), kApplyCommandId) == 0);
+    telemetry.end();
+    CHECK(telemetry.init() == ESP_OK && telemetry.bootCounter() == 2);
+    CHECK(telemetry.nextStateSequence(state_sequence) == ESP_OK && state_sequence == 3);
+    CHECK(std::strcmp(telemetry.lastAppliedCommandId(), kApplyCommandId) == 0);
+    telemetry.end();
+
     static pixels_storage::NvsTerminalJournal journal;
     CHECK(journal.init() == ESP_OK);
     static TerminalRecord record{};
@@ -579,6 +601,12 @@ void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(staging.verifyAndCommit(config_digest) == ESP_OK);
     CHECK(staging.activateAtFrameBoundary() == ESP_OK);
     CHECK(staging.hasActive() && target.matches(CommandType::ApplyConfig, config, config_size));
+    pixels_storage::ActiveSnapshot active_snapshot{};
+    CHECK(staging.activeSnapshot(active_snapshot) == ESP_OK && active_snapshot.active &&
+          active_snapshot.type == CommandType::ApplyConfig &&
+          active_snapshot.config_version == 13 &&
+          std::strcmp(active_snapshot.command_id, kApplyCommandId) == 0 &&
+          active_snapshot.preset_id[0] == '\0');
     CHECK(journal.store(record) == ESP_OK);
 
     // A reboot after terminal success but before finalize() reconciles through
@@ -648,6 +676,11 @@ void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(staging.init(target, journal) == ESP_OK);
     CHECK(target.activateCalls() == 1 && target.matches(CommandType::ActivatePreset, preset, preset_size));
     CHECK(staging.activePresetMatches(kPresetId, preset_digest));
+    CHECK(staging.activeSnapshot(active_snapshot) == ESP_OK && active_snapshot.active &&
+          active_snapshot.type == CommandType::ActivatePreset &&
+          active_snapshot.config_version == 13 &&
+          std::strcmp(active_snapshot.command_id, kActivateCommandId) == 0 &&
+          std::strcmp(active_snapshot.preset_id, kPresetId) == 0);
 
     // The declared 8192-byte limit is exercised against real NVS rather
     // than inferred from the smaller contract fixtures.
@@ -869,6 +902,58 @@ extern "C" void app_main()
     CHECK(serializeEvent(failed, event_json, sizeof(event_json), event_size) == ESP_OK);
     CHECK(event_size == FIXTURE_SIZE(event_command_failed_provisional_json) &&
           std::memcmp(event_json, FIXTURE_BYTES(event_command_failed_provisional_json), event_size) == 0);
+
+    StateReport state{};
+    state.device_id = kDeviceId;
+    state.hardware_binding_id = kHardwareBindingId;
+    state.generation = 1;
+    state.boot_counter = 4;
+    state.state_sequence = 128;
+    state.reported_at = "2026-09-22T12:00:06Z";
+    state.firmware_version = "0.1.0-dev";
+    state.mode = DeviceMode::ConfigActive;
+    state.config_version = 13;
+    state.last_applied_command_id = kApplyCommandId;
+    static char state_json[kMaxStateBytes]{};
+    size_t state_size = 0;
+    CHECK(serializeState(state, state_json, sizeof(state_json), state_size) == ESP_OK);
+    CHECK(state_size == FIXTURE_SIZE(state_config_active_provisional_json) &&
+          std::memcmp(state_json, FIXTURE_BYTES(state_config_active_provisional_json), state_size) == 0);
+    state.mode = DeviceMode::PresetActive;
+    CHECK(serializeState(state, state_json, sizeof(state_json), state_size) == ESP_ERR_INVALID_ARG);
+    state.mode = DeviceMode::ConfigActive;
+    CHECK(serializeState(state, state_json, 32, state_size) == ESP_ERR_INVALID_SIZE && state_size == 0);
+
+    static constexpr uint8_t kEffectIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    CapabilityReport capability{};
+    capability.device_id = kDeviceId;
+    capability.firmware_version = "0.1.0-dev";
+    capability.reported_at = "2026-09-22T12:00:06Z";
+    capability.capabilities.free_internal_heap_bytes = 120000;
+    capability.capabilities.largest_internal_heap_block_bytes = 64000;
+    capability.capabilities.max_output_slots = 2;
+    capability.capabilities.max_pixels_per_output = 50;
+    capability.capabilities.configured_output_count = 1;
+    capability.capabilities.configured_total_pixels = 50;
+    capability.capabilities.max_segments = 32;
+    capability.capabilities.effect_ids = kEffectIds;
+    capability.capabilities.effect_count = sizeof(kEffectIds);
+    capability.capabilities.supports_ledmap = true;
+    capability.capabilities.supports_2d = true;
+    capability.capabilities.supports_mirror = true;
+    capability.capabilities.custom_param_slots = 3;
+    capability.capabilities.preset_cache_slots = 100;
+    static char capability_json[kMaxCapabilityBytes]{};
+    size_t capability_size = 0;
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_OK);
+    CHECK(capability_size == FIXTURE_SIZE(event_capability_reported_provisional_json) &&
+          std::memcmp(capability_json,
+                      FIXTURE_BYTES(event_capability_reported_provisional_json),
+                      capability_size) == 0);
+    capability.capabilities.largest_internal_heap_block_bytes = 120001;
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
 
     static OneRecordJournal journal;
     static TerminalRecord terminal{};

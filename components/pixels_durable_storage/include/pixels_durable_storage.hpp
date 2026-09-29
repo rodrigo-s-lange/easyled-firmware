@@ -12,6 +12,16 @@ namespace pixels_storage {
 constexpr const char *kPartitionLabel = "easyled";
 constexpr size_t kTerminalCapacity = 8;
 
+/// Durable metadata describing the pixel payload currently selected by the
+/// A/B staging store.
+struct ActiveSnapshot {
+    bool active = false;
+    pixels_firmware::CommandType type = pixels_firmware::CommandType::ApplyConfig;
+    uint32_t config_version = 0;
+    char command_id[pixels_firmware::kUuidBytes + 1]{};
+    char preset_id[pixels_firmware::kUuidBytes + 1]{};
+};
+
 /// Application target that can atomically replace or clear the live pixel
 /// configuration at a render-frame boundary.
 class ActivationTarget {
@@ -103,6 +113,11 @@ public:
     bool activePresetMatches(const char *preset_id,
                              const uint8_t checksum[pixels_firmware::kSha256Bytes]) const;
 
+    /// Copies the durable active command metadata used to construct retained state.
+    /// @param snapshot Receives an owned snapshot; `active` is false for an empty store.
+    /// @return ESP_OK, or ESP_ERR_INVALID_STATE before init().
+    esp_err_t activeSnapshot(ActiveSnapshot &snapshot) const;
+
     /// Starts one staging transaction after finalizing the prior success.
     /// @param command Parsed command whose payload will be stored.
     /// @param total_size Exact payload byte count expected from append().
@@ -140,7 +155,8 @@ private:
 
     esp_err_t scanActive();
     esp_err_t loadSlot(int slot, pixels_firmware::CommandType &type, const char *&payload,
-                       size_t &size, uint64_t &sequence, char preset_id[37],
+                       size_t &size, uint64_t &sequence, char command_id[37],
+                       uint32_t &config_version, char preset_id[37],
                        uint8_t checksum[pixels_firmware::kSha256Bytes]);
     esp_err_t eraseKey(const char *key);
     esp_err_t commitAndVerify(const char *key, const uint8_t *bytes, size_t size);
@@ -155,6 +171,8 @@ private:
     int active_slot_ = -1;
     uint64_t active_sequence_ = 0;
     pixels_firmware::CommandType active_type_ = pixels_firmware::CommandType::ApplyConfig;
+    uint32_t active_config_version_ = 0;
+    char active_command_id_[pixels_firmware::kUuidBytes + 1]{};
     char active_preset_id_[37]{};
     uint8_t active_checksum_[pixels_firmware::kSha256Bytes]{};
 
@@ -170,6 +188,51 @@ private:
 
     mutable uint8_t record_[kWireBytes]{};
     mutable pixels_firmware::TerminalRecord terminal_scratch_{};
+};
+
+/// Small durable metadata store for retained-state sequencing. It increments
+/// the boot counter once per init, reserves monotonically increasing state
+/// sequence numbers before publication, and remembers the newest applied
+/// command ID. Single control-task use only.
+class NvsTelemetryState final {
+public:
+    /// Closes an open NVS namespace; persisted counters remain.
+    ~NvsTelemetryState();
+
+    /// Opens the telemetry namespace and durably increments the boot counter.
+    /// @return ESP_OK after commit/readback, or an NVS/data error.
+    esp_err_t init();
+
+    /// Closes the namespace and clears RAM state; persisted values remain.
+    void end();
+
+    /// Returns the boot counter committed by init().
+    /// @return Current boot counter, or zero before init().
+    uint32_t bootCounter() const { return boot_counter_; }
+
+    /// Durably reserves the next retained-state sequence value.
+    /// @param sequence Receives the committed nonzero sequence on success.
+    /// @return ESP_OK after readback, or a state/NVS/data error.
+    esp_err_t nextStateSequence(uint32_t &sequence);
+
+    /// Durably records the most recent command whose terminal result is applied.
+    /// @param command_id Canonical command UUID.
+    /// @return ESP_OK after readback, or an argument/state/NVS error.
+    esp_err_t noteApplied(const char *command_id);
+
+    /// Returns the durable last-applied UUID, or null when none was recorded.
+    /// @return Stable pointer owned by this object, or null.
+    const char *lastAppliedCommandId() const
+    {
+        return last_applied_command_id_[0] == '\0' ? nullptr : last_applied_command_id_;
+    }
+
+private:
+    nvs_handle_t handle_ = 0;
+    bool initialized_ = false;
+    uint32_t boot_counter_ = 0;
+    uint32_t next_state_sequence_ = 1;
+    char last_applied_command_id_[pixels_firmware::kUuidBytes + 1]{};
 };
 
 } // namespace pixels_storage

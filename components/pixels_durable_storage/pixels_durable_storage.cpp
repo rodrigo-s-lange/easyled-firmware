@@ -12,6 +12,7 @@ constexpr uint32_t kStagingMagic = 0x53544c45; // ELTS, little-endian
 constexpr uint8_t kSchema = 1;
 constexpr const char *kJournalNamespace = "easyled_journal";
 constexpr const char *kStagingNamespace = "easyled_stage";
+constexpr const char *kTelemetryNamespace = "easyled_state";
 constexpr const char *kPendingKey = "pending";
 constexpr const char *kActiveKeys[] = {"active_a", "active_b"};
 
@@ -168,6 +169,7 @@ size_t encodeStaging(uint8_t *out, size_t capacity, uint64_t sequence,
 
 esp_err_t decodeStaging(const uint8_t *bytes, size_t size, pixels_firmware::CommandType &type,
                         const char *&payload, size_t &payload_size, uint64_t &sequence,
+                        char command_id[37], uint32_t &config_version,
                         char preset_id[37], uint8_t checksum[32])
 {
     constexpr size_t kHeader = 130;
@@ -187,8 +189,7 @@ esp_err_t decodeStaging(const uint8_t *bytes, size_t size, pixels_firmware::Comm
     }
     sequence = get64(bytes + 8);
     if (sequence == 0 || sequence == UINT64_MAX) { return ESP_ERR_INVALID_RESPONSE; }
-    char command_id[37]{};
-    std::memcpy(command_id, bytes + 16, sizeof(command_id));
+    std::memcpy(command_id, bytes + 16, pixels_firmware::kUuidBytes + 1);
     if (!exactString(command_id, pixels_firmware::kUuidBytes)) { return ESP_ERR_INVALID_RESPONSE; }
     std::memcpy(preset_id, bytes + 53, 37);
     if (decoded_type == pixels_firmware::CommandType::ActivatePreset &&
@@ -196,6 +197,7 @@ esp_err_t decodeStaging(const uint8_t *bytes, size_t size, pixels_firmware::Comm
         return ESP_ERR_INVALID_RESPONSE;
     }
     std::memcpy(checksum, bytes + 94, 32);
+    config_version = get32(bytes + 90);
     type = decoded_type;
     payload = reinterpret_cast<const char *>(bytes + kHeader);
     payload_size = declared;
@@ -329,19 +331,23 @@ esp_err_t NvsDurableStaging::commitAndVerify(const char *key, const uint8_t *byt
 
 esp_err_t NvsDurableStaging::loadSlot(int slot, pixels_firmware::CommandType &type,
                                       const char *&payload, size_t &size, uint64_t &sequence,
+                                      char command_id[37], uint32_t &config_version,
                                       char preset_id[37], uint8_t checksum[32])
 {
     if (slot < 0 || slot > 1) { return ESP_ERR_INVALID_ARG; }
     size_t record_size = sizeof(record_);
     esp_err_t err = nvs_get_blob(handle_, kActiveKeys[slot], record_, &record_size);
     if (err != ESP_OK) { return err; }
-    return decodeStaging(record_, record_size, type, payload, size, sequence, preset_id, checksum);
+    return decodeStaging(record_, record_size, type, payload, size, sequence,
+                         command_id, config_version, preset_id, checksum);
 }
 
 esp_err_t NvsDurableStaging::scanActive()
 {
     active_slot_ = -1;
     active_sequence_ = 0;
+    active_config_version_ = 0;
+    std::memset(active_command_id_, 0, sizeof(active_command_id_));
     std::memset(active_preset_id_, 0, sizeof(active_preset_id_));
     std::memset(active_checksum_, 0, sizeof(active_checksum_));
     esp_err_t last_error = ESP_ERR_NOT_FOUND;
@@ -350,15 +356,20 @@ esp_err_t NvsDurableStaging::scanActive()
         const char *payload = nullptr;
         size_t size = 0;
         uint64_t sequence = 0;
+        char command_id[37]{};
+        uint32_t config_version = 0;
         char preset_id[37]{};
         uint8_t checksum[32]{};
-        const esp_err_t err = loadSlot(slot, type, payload, size, sequence, preset_id, checksum);
+        const esp_err_t err = loadSlot(slot, type, payload, size, sequence, command_id,
+                                       config_version, preset_id, checksum);
         if (err == ESP_ERR_NVS_NOT_FOUND) { continue; }
         if (err != ESP_OK) { last_error = err; continue; }
         if (sequence <= active_sequence_) { continue; }
         active_slot_ = slot;
         active_sequence_ = sequence;
         active_type_ = type;
+        active_config_version_ = config_version;
+        std::memcpy(active_command_id_, command_id, sizeof(active_command_id_));
         std::memcpy(active_preset_id_, preset_id, sizeof(active_preset_id_));
         std::memcpy(active_checksum_, checksum, sizeof(active_checksum_));
     }
@@ -388,9 +399,12 @@ esp_err_t NvsDurableStaging::init(ActivationTarget &target,
         const char *pending_payload = nullptr;
         size_t pending_payload_size = 0;
         char pending_preset_id[37]{};
+        char pending_decoded_command_id[37]{};
+        uint32_t pending_config_version = 0;
         uint8_t pending_checksum[32]{};
         err = decodeStaging(record_, pending_size, pending_type, pending_payload,
                             pending_payload_size, pending_sequence,
+                            pending_decoded_command_id, pending_config_version,
                             pending_preset_id, pending_checksum);
         if (err != ESP_OK) { end(); return err; }
         std::memcpy(pending_command_id, record_ + 16, sizeof(pending_command_id));
@@ -444,9 +458,12 @@ esp_err_t NvsDurableStaging::init(ActivationTarget &target,
         const char *payload = nullptr;
         size_t size = 0;
         uint64_t sequence = 0;
+        char command_id[37]{};
+        uint32_t config_version = 0;
         char preset_id[37]{};
         uint8_t checksum[32]{};
-        err = loadSlot(active_slot_, type, payload, size, sequence, preset_id, checksum);
+        err = loadSlot(active_slot_, type, payload, size, sequence, command_id,
+                       config_version, preset_id, checksum);
         if (err != ESP_OK) { end(); return err; }
         err = target_->activateAtFrameBoundary(type, payload, size);
         if (err != ESP_OK) { end(); return err; }
@@ -472,6 +489,8 @@ void NvsDurableStaging::end()
     journal_ = nullptr;
     active_slot_ = -1;
     active_sequence_ = 0;
+    active_config_version_ = 0;
+    std::memset(active_command_id_, 0, sizeof(active_command_id_));
     resetTransaction();
 }
 
@@ -482,6 +501,19 @@ bool NvsDurableStaging::activePresetMatches(const char *preset_id, const uint8_t
            exactString(preset_id, pixels_firmware::kUuidBytes) && checksum != nullptr &&
            std::strcmp(preset_id, active_preset_id_) == 0 &&
            std::memcmp(checksum, active_checksum_, sizeof(active_checksum_)) == 0;
+}
+
+esp_err_t NvsDurableStaging::activeSnapshot(ActiveSnapshot &snapshot) const
+{
+    if (!initialized_) { return ESP_ERR_INVALID_STATE; }
+    snapshot = ActiveSnapshot{};
+    if (active_slot_ < 0) { return ESP_OK; }
+    snapshot.active = true;
+    snapshot.type = active_type_;
+    snapshot.config_version = active_config_version_;
+    std::memcpy(snapshot.command_id, active_command_id_, sizeof(snapshot.command_id));
+    std::memcpy(snapshot.preset_id, active_preset_id_, sizeof(snapshot.preset_id));
+    return ESP_OK;
 }
 
 void NvsDurableStaging::resetTransaction()
@@ -524,6 +556,9 @@ esp_err_t NvsDurableStaging::begin(const pixels_firmware::Command &command, size
     esp_err_t err = finalizePrevious();
     if (err != ESP_OK) { return err; }
     command_ = command;
+    if (command_.type == pixels_firmware::CommandType::ActivatePreset) {
+        command_.config_version = active_config_version_;
+    }
     expected_size_ = total_size;
     begun_ = true;
     prior_slot_ = active_slot_;
@@ -569,9 +604,12 @@ esp_err_t NvsDurableStaging::verifyAndCommit(const uint8_t expected[32])
     const char *payload = nullptr;
     size_t payload_size = 0;
     uint64_t sequence = 0;
+    char command_id[37]{};
+    uint32_t config_version = 0;
     char preset_id[37]{};
     uint8_t checksum[32]{};
-    err = decodeStaging(record_, read_size, type, payload, payload_size, sequence, preset_id, checksum);
+    err = decodeStaging(record_, read_size, type, payload, payload_size, sequence,
+                        command_id, config_version, preset_id, checksum);
     if (err != ESP_OK || sequence != active_sequence_ + 1 || type != command_.type ||
         payload_size != staged_size_ ||
         std::memcmp(checksum, expected, 32) != 0) {
@@ -592,9 +630,12 @@ esp_err_t NvsDurableStaging::activateAtFrameBoundary()
     const char *payload = nullptr;
     size_t payload_size = 0;
     uint64_t sequence = 0;
+    char command_id[37]{};
+    uint32_t config_version = 0;
     char preset_id[37]{};
     uint8_t checksum[32]{};
-    err = decodeStaging(record_, record_size, type, payload, payload_size, sequence, preset_id, checksum);
+    err = decodeStaging(record_, record_size, type, payload, payload_size, sequence,
+                        command_id, config_version, preset_id, checksum);
     if (err != ESP_OK || sequence != active_sequence_ + 1 ||
         std::memcmp(checksum, staged_checksum_, 32) != 0) {
         return err == ESP_OK ? ESP_ERR_INVALID_CRC : err;
@@ -609,6 +650,8 @@ esp_err_t NvsDurableStaging::activateAtFrameBoundary()
     active_slot_ = transaction_slot_;
     active_sequence_ = sequence;
     active_type_ = type;
+    active_config_version_ = config_version;
+    std::memcpy(active_command_id_, command_id, sizeof(active_command_id_));
     std::memcpy(active_preset_id_, preset_id, sizeof(active_preset_id_));
     std::memcpy(active_checksum_, checksum, sizeof(active_checksum_));
     return ESP_OK;
@@ -630,9 +673,12 @@ esp_err_t NvsDurableStaging::rollback()
             const char *payload = nullptr;
             size_t size = 0;
             uint64_t sequence = 0;
+            char command_id[37]{};
+            uint32_t config_version = 0;
             char preset_id[37]{};
             uint8_t checksum[32]{};
-            err = loadSlot(prior_slot_, type, payload, size, sequence, preset_id, checksum);
+            err = loadSlot(prior_slot_, type, payload, size, sequence, command_id,
+                           config_version, preset_id, checksum);
             if (err == ESP_OK) { err = target_->activateAtFrameBoundary(type, payload, size); }
             if (err != ESP_OK) { return err; }
         } else {
@@ -651,6 +697,100 @@ esp_err_t NvsDurableStaging::rollback()
     if (err == ESP_OK) { err = nvs_commit(handle_); }
     if (err == ESP_OK) { resetTransaction(); }
     return err;
+}
+
+NvsTelemetryState::~NvsTelemetryState() { end(); }
+
+esp_err_t NvsTelemetryState::init()
+{
+    if (initialized_) { return ESP_ERR_INVALID_STATE; }
+    esp_err_t err = initPartition();
+    if (err != ESP_OK) { return err; }
+    err = nvs_open_from_partition(kPartitionLabel, kTelemetryNamespace, NVS_READWRITE, &handle_);
+    if (err != ESP_OK) { return err; }
+
+    uint32_t previous_boot = 0;
+    err = nvs_get_u32(handle_, "boot", &previous_boot);
+    if (err == ESP_ERR_NVS_NOT_FOUND) { previous_boot = 0; err = ESP_OK; }
+    if (err != ESP_OK || previous_boot == UINT32_MAX) { end(); return err == ESP_OK ? ESP_ERR_INVALID_STATE : err; }
+
+    uint32_t previous_sequence = 0;
+    err = nvs_get_u32(handle_, "state_seq", &previous_sequence);
+    if (err == ESP_ERR_NVS_NOT_FOUND) { previous_sequence = 0; err = ESP_OK; }
+    if (err != ESP_OK || previous_sequence == UINT32_MAX) {
+        end();
+        return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
+    }
+
+    std::memset(last_applied_command_id_, 0, sizeof(last_applied_command_id_));
+    size_t applied_size = sizeof(last_applied_command_id_);
+    err = nvs_get_str(handle_, "applied", last_applied_command_id_, &applied_size);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+    } else if (err == ESP_OK &&
+               (!exactString(last_applied_command_id_, pixels_firmware::kUuidBytes) ||
+                applied_size != sizeof(last_applied_command_id_))) {
+        err = ESP_ERR_INVALID_RESPONSE;
+    }
+    if (err != ESP_OK) { end(); return err; }
+
+    boot_counter_ = previous_boot + 1;
+    next_state_sequence_ = previous_sequence + 1;
+    err = nvs_set_u32(handle_, "boot", boot_counter_);
+    if (err == ESP_OK) { err = nvs_commit(handle_); }
+    uint32_t verified_boot = 0;
+    if (err == ESP_OK) { err = nvs_get_u32(handle_, "boot", &verified_boot); }
+    if (err != ESP_OK || verified_boot != boot_counter_) {
+        end();
+        return err == ESP_OK ? ESP_ERR_INVALID_CRC : err;
+    }
+    initialized_ = true;
+    return ESP_OK;
+}
+
+void NvsTelemetryState::end()
+{
+    if (handle_ != 0) { nvs_close(handle_); }
+    handle_ = 0;
+    initialized_ = false;
+    boot_counter_ = 0;
+    next_state_sequence_ = 1;
+    std::memset(last_applied_command_id_, 0, sizeof(last_applied_command_id_));
+}
+
+esp_err_t NvsTelemetryState::nextStateSequence(uint32_t &sequence)
+{
+    sequence = 0;
+    if (!initialized_ || handle_ == 0 || next_state_sequence_ == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint32_t candidate = next_state_sequence_;
+    esp_err_t err = nvs_set_u32(handle_, "state_seq", candidate);
+    if (err == ESP_OK) { err = nvs_commit(handle_); }
+    uint32_t verified = 0;
+    if (err == ESP_OK) { err = nvs_get_u32(handle_, "state_seq", &verified); }
+    if (err != ESP_OK || verified != candidate) {
+        return err == ESP_OK ? ESP_ERR_INVALID_CRC : err;
+    }
+    sequence = candidate;
+    next_state_sequence_ = candidate == UINT32_MAX ? 0 : candidate + 1;
+    return ESP_OK;
+}
+
+esp_err_t NvsTelemetryState::noteApplied(const char *command_id)
+{
+    if (!initialized_ || handle_ == 0) { return ESP_ERR_INVALID_STATE; }
+    if (!exactString(command_id, pixels_firmware::kUuidBytes)) { return ESP_ERR_INVALID_ARG; }
+    esp_err_t err = nvs_set_str(handle_, "applied", command_id);
+    if (err == ESP_OK) { err = nvs_commit(handle_); }
+    char verified[pixels_firmware::kUuidBytes + 1]{};
+    size_t size = sizeof(verified);
+    if (err == ESP_OK) { err = nvs_get_str(handle_, "applied", verified, &size); }
+    if (err != ESP_OK || size != sizeof(verified) || std::strcmp(verified, command_id) != 0) {
+        return err == ESP_OK ? ESP_ERR_INVALID_CRC : err;
+    }
+    std::memcpy(last_applied_command_id_, verified, sizeof(verified));
+    return ESP_OK;
 }
 
 } // namespace pixels_storage

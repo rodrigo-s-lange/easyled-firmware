@@ -69,6 +69,34 @@ private:
     const char *topic_ = nullptr;
 };
 
+/// Publishes compact retained state and non-retained capability reports over
+/// the application-owned MQTT session. Single control-task use only.
+class MqttTelemetrySink final {
+public:
+    /// Binds the exact state and event topics; both strings must outlive this object.
+    /// @param session Started application MQTT session.
+    /// @param state_topic Exact retained state topic without wildcards.
+    /// @param event_topic Exact event topic used by capability_reported.
+    MqttTelemetrySink(pixels_network::NetworkSession &session, const char *state_topic,
+                      const char *event_topic);
+
+    /// Serializes and enqueues retained current state at QoS1.
+    /// @param state Current device truth.
+    /// @return ESP_OK, a serialization error, or ESP_FAIL when MQTT rejects it.
+    esp_err_t publishState(const pixels_firmware::StateReport &state);
+
+    /// Serializes and enqueues a non-retained capability_reported event at QoS1.
+    /// @param report Current capability measurement.
+    /// @return ESP_OK, a serialization error, or ESP_FAIL when MQTT rejects it.
+    esp_err_t publishCapability(const pixels_firmware::CapabilityReport &report);
+
+private:
+    pixels_network::NetworkSession &session_;
+    const char *state_topic_ = nullptr;
+    const char *event_topic_ = nullptr;
+    char buffer_[pixels_firmware::kMaxCapabilityBytes]{};
+};
+
 /// Supplies UTC wall-clock timestamps after network session time bootstrap.
 class UtcTimestampSource final : public pixels_executor::TimestampSource {
 public:
