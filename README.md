@@ -183,11 +183,25 @@ It is an explicit development bridge for offline/broker integration testing,
 not an HTTPS substitute or a production compatibility claim. A different URL or
 preset UUID fails as `resolve_failed` without changing live state.
 
+`HttpsPayloadSource` is the prepared production config source. It receives its
+HTTP client, bearer token, optional CA PEM, timeout and payload-size limit by
+injection; the URL remains the command's `config_url`. The ESP-IDF client accepts
+only HTTPS, verifies the peer certificate and hostname through the supplied CA
+or the full certificate bundle, disables redirects and authorization retries,
+and never logs the token or response body. It accepts only a complete HTTP 200
+`application/json` body within the configured limit (8192 B maximum) and verifies
+the command's SHA-256 before returning bytes to the executor. Consequently the
+executor cannot stage or activate a partial, oversized or checksum-invalid
+download. Preset resolution intentionally remains with `EmbeddedPayloadSource`
+until EasyLED publishes the second #60 contract package.
+
 The capability envelope/cadence follows PR #66, but the inner capability object
 is explicitly provisional schema version 1 because EasyLED has not yet closed
-that canonical schema. Not implemented by this delivery: authenticated HTTPS
-retrieval, final MQTT topic/provisioning policy, OTA execution, runtime
-physical-output reconfiguration, and live broker-loss tests.
+that canonical schema. The HTTPS source is not wired into `main.cpp` until the
+backend PR supplies the byte-exact fixture, definitive checksum header and real
+HTTP error mapping. Also not implemented: final MQTT topic/provisioning policy,
+OTA execution, runtime physical-output reconfiguration, and live broker-loss
+tests.
 
 ## Build and local profile
 
@@ -281,8 +295,11 @@ that config version survives preset activation.
 It also covers exact embedded-resource lookup, timestamp format, physical
 topology mismatch rejection, and the production activation adapter over a real
 managed Composer/FakeSink pair through config, preset and clear adoption.
-It does **not** validate radio, TLS, broker permissions, physical flash failure
-or HTTPS.
+An injected fake HTTP client verifies exact config-byte delivery, URL/token/CA/
+timeout/limit forwarding, non-HTTPS rejection, transport failure, HTTP status,
+content type, oversize and checksum failures. It does **not** open a network
+connection or validate a live TLS peer, broker permissions or physical flash
+failure.
 
 ```powershell
 cd validation
@@ -293,7 +310,7 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe"
 The script merges only a local emulated flash file, captures the result in
 `build/network-contract-validation/qemu-validation.log`, and terminates QEMU
 after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
-marker is `NETWORK_CONTRACT_VALIDATION checks=292 failures=0 RESULT=ALL_PASS`.
+marker is `NETWORK_CONTRACT_VALIDATION checks=308 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
@@ -303,23 +320,24 @@ The validation target uses the ESP-IDF 4096 B main-task stack. Large candidates,
 fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
-Build verified with ESP-IDF 6.0.2: combined image 1044096 B, static DRAM 70795 B
+Build verified with ESP-IDF 6.0.0: combined image 1044096 B, static DRAM 70795 B
 (39.17%) and IRAM 89615 B (68.37%). The 1.5 MiB app partition retains 528768 B
 (34%) after the build. These figures include live storage, executor, fixture
 resolver and Composer activation objects but exclude runtime Wi-Fi/TLS heap use.
-The focused image is 320176 B and ran on Espressif QEMU 9.2.2: all 292 checks
-passed, with no assertion, watchdog or panic. Its static DRAM is 168460 B (93.21%,
-12276 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
-and IRAM is 46907 B (35.79%). The combined image also booted through real NVS
+The focused image is 680560 B and ran on Espressif QEMU 9.2.2: all 308 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 172324 B (95.35%,
+8412 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
+and IRAM is 47511 B (36.25%). The combined image also booted through real NVS
 initialization with the five-entry network partition table. No broker was accessed.
 
 ## Next integration step
 
-Replace `EmbeddedPayloadSource` with authenticated HTTPS delivery once EasyLED
-#60 preserves and serves the exact canonical bytes/checksum. Replace the
-provisional capability object with its canonical schema when EasyLED closes it,
-then exercise command/event/state retain, acknowledgement and reconnect behavior
-with an authorized broker.
+Import the backend PR's byte-exact fixture and checksum, bind its definitive
+checksum header and HTTP error codes, then route `apply_config` through
+`HttpsPayloadSource` while retaining `EmbeddedPayloadSource` for preset/offline
+tests. Replace the provisional capability object with its canonical schema when
+EasyLED closes it, then exercise command/event/state retain, acknowledgement and
+reconnect behavior with an authorized broker.
 Runtime `PixelFrameSink` output rebuild, provisioning, heap/stack measurements
 under TLS load and broker-loss/render-continuity tests remain product work.
 

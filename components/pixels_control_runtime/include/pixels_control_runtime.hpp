@@ -50,6 +50,93 @@ private:
     size_t count_ = 0;
 };
 
+/// One bounded authenticated HTTP download request. The URL, bearer token and
+/// optional CA certificate are borrowed for the duration of download().
+struct HttpPayloadRequest {
+    const char *url = nullptr;
+    const char *bearer_token = nullptr;
+    const char *server_ca_pem = nullptr;
+    uint32_t timeout_ms = 0;
+    char *destination = nullptr;
+    size_t capacity = 0;
+};
+
+/// Metadata returned after a complete HTTP response body has been received.
+struct HttpPayloadResult {
+    int status_code = 0;
+    size_t size = 0;
+    bool application_json = false;
+};
+
+/// Injectable HTTP boundary used by HttpsPayloadSource. Implementations must
+/// never log request credentials or response bodies.
+class HttpPayloadClient {
+public:
+    /// Releases an HTTP client through its interface.
+    virtual ~HttpPayloadClient() = default;
+
+    /// Downloads one complete response into a caller-owned bounded buffer.
+    /// @param request HTTPS URL, credential, trust source, timeout and destination.
+    /// @param result Receives status, byte count and content-type classification.
+    /// @return ESP_OK after a complete HTTP exchange, or a transport/size error.
+    virtual esp_err_t download(const HttpPayloadRequest &request,
+                               HttpPayloadResult &result) = 0;
+};
+
+/// ESP-IDF HTTP implementation with mandatory TLS verification, disabled
+/// redirects and bounded response collection. Single control-task use only.
+class EspHttpPayloadClient final : public HttpPayloadClient {
+public:
+    /// Performs one authenticated GET using a supplied CA or the IDF bundle.
+    /// @param request HTTPS request parameters and destination buffer.
+    /// @param result Receives response metadata after the complete transfer.
+    /// @return ESP_OK, ESP_ERR_INVALID_ARG/SIZE, or an ESP-IDF TLS/HTTP error.
+    esp_err_t download(const HttpPayloadRequest &request,
+                       HttpPayloadResult &result) override;
+
+private:
+    static constexpr size_t kAuthorizationBytes = 392;
+    char authorization_[kAuthorizationBytes]{};
+};
+
+/// Authenticated HTTPS configuration resolver. It accepts apply_config only;
+/// presets remain routed to EmbeddedPayloadSource until the platform publishes
+/// its second download contract package.
+class HttpsPayloadSource final : public pixels_executor::PayloadSource {
+public:
+    static constexpr size_t kMaxBearerTokenBytes = 384;
+
+    /// Borrowed runtime configuration; no endpoint, credential or certificate
+    /// is compiled into this component.
+    struct Config {
+        const char *bearer_token = nullptr;
+        const char *server_ca_pem = nullptr;
+        uint32_t timeout_ms = 10000;
+        size_t max_payload_bytes = pixels_payload::kMaxPayloadBytes;
+    };
+
+    /// Creates a resolver over an injected HTTP client and runtime credentials.
+    /// @param client HTTP implementation that outlives this source.
+    /// @param config Borrowed strings that outlive this source.
+    HttpsPayloadSource(HttpPayloadClient &client, const Config &config);
+
+    /// Downloads, bounds and verifies one apply_config resource before returning it.
+    /// @param command Parsed apply_config command whose HTTPS URL/checksum are authoritative.
+    /// @param buffer Destination for exact canonical response bytes.
+    /// @param capacity Destination capacity.
+    /// @param size Receives the verified byte count on success only.
+    /// @param expected_checksum Receives command.checksum on success only.
+    /// @return ESP_OK, ESP_ERR_NOT_SUPPORTED for presets, an argument/size/checksum
+    ///         error, ESP_FAIL for a non-200/JSON response, or a transport error.
+    esp_err_t resolve(const pixels_firmware::Command &command, char *buffer, size_t capacity,
+                      size_t &size,
+                      uint8_t expected_checksum[pixels_firmware::kSha256Bytes]) override;
+
+private:
+    HttpPayloadClient &client_;
+    Config config_{};
+};
+
 /// Publishes executor events through the application-owned MQTT session.
 class MqttEventSink final : public pixels_executor::EventSink {
 public:

@@ -93,6 +93,34 @@ void check(bool value, int line)
 
 // --- Fakes / injected boundaries --------------------------------------------
 
+class FakeHttpPayloadClient final : public pixels_control::HttpPayloadClient {
+public:
+    esp_err_t download(const pixels_control::HttpPayloadRequest &request,
+                       pixels_control::HttpPayloadResult &result) override
+    {
+        ++calls;
+        last_request = request;
+        result = pixels_control::HttpPayloadResult{};
+        if (error != ESP_OK) { return error; }
+        if (body == nullptr || body_size == 0 || body_size > request.capacity) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        std::memcpy(request.destination, body, body_size);
+        result.status_code = status_code;
+        result.size = body_size;
+        result.application_json = application_json;
+        return ESP_OK;
+    }
+
+    const char *body = nullptr;
+    size_t body_size = 0;
+    int status_code = 200;
+    bool application_json = true;
+    esp_err_t error = ESP_OK;
+    int calls = 0;
+    pixels_control::HttpPayloadRequest last_request{};
+};
+
 class OneRecordJournal final : public pixels_firmware::TerminalJournal {
 public:
     esp_err_t find(const char *command_id, pixels_firmware::TerminalRecord &record) const override
@@ -756,6 +784,95 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(source.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_OK &&
           resolved_size == FIXTURE_SIZE(preset_payload_provisional_json) &&
           std::memcmp(resolved_digest, preset_digest, sizeof(resolved_digest)) == 0);
+
+    // HttpsPayloadSource owns contract-independent policy while the injected
+    // fake owns transport. No live endpoint, credential or certificate is used.
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
+                                        FIXTURE_SIZE(apply_config_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    static FakeHttpPayloadClient http;
+    http.body = FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json);
+    http.body_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
+    static constexpr char kTestToken[] = "fixture-device-token";
+    static constexpr char kTestCa[] = "fixture-ca-pem";
+    pixels_control::HttpsPayloadSource::Config https_config{};
+    https_config.bearer_token = kTestToken;
+    https_config.server_ca_pem = kTestCa;
+    https_config.timeout_ms = 4321;
+    https_config.max_payload_bytes = sizeof(resolved);
+    static pixels_control::HttpsPayloadSource https_source(http, https_config);
+    resolved_size = 99;
+    std::memset(resolved_digest, 0xa5, sizeof(resolved_digest));
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_OK &&
+          resolved_size == http.body_size &&
+          std::memcmp(resolved, http.body, http.body_size) == 0 &&
+          std::memcmp(resolved_digest, config_digest, sizeof(resolved_digest)) == 0);
+    CHECK(http.calls == 1 && std::strcmp(http.last_request.url, command.resource_url) == 0 &&
+          std::strcmp(http.last_request.bearer_token, kTestToken) == 0 &&
+          http.last_request.server_ca_pem == kTestCa &&
+          http.last_request.timeout_ms == 4321 &&
+          http.last_request.capacity == sizeof(resolved));
+
+    http.status_code = 403;
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_FAIL &&
+          resolved_size == 0 && resolved_digest[0] == 0);
+    http.status_code = 200;
+    http.application_json = false;
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_FAIL && resolved_size == 0);
+    http.application_json = true;
+    static constexpr char kWrongBody[] = "{}";
+    http.body = kWrongBody;
+    http.body_size = sizeof(kWrongBody) - 1;
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_ERR_INVALID_CRC && resolved_size == 0);
+    http.error = ESP_ERR_TIMEOUT;
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_ERR_TIMEOUT && resolved_size == 0);
+    http.error = ESP_OK;
+    http.body = FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json);
+    http.body_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
+    CHECK(https_source.resolve(command, resolved, http.body_size - 1, resolved_size,
+                               resolved_digest) == ESP_ERR_INVALID_SIZE && resolved_size == 0);
+
+    const int calls_before_invalid = http.calls;
+    command.resource_url[4] = '\0';
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_ERR_INVALID_ARG &&
+          http.calls == calls_before_invalid);
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
+                                        FIXTURE_SIZE(apply_config_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    command.has_checksum = false;
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_ERR_INVALID_ARG &&
+          http.calls == calls_before_invalid);
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(activate_preset_command_provisional_json),
+                                        FIXTURE_SIZE(activate_preset_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_ERR_NOT_SUPPORTED &&
+          http.calls == calls_before_invalid);
+
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
+                                        FIXTURE_SIZE(apply_config_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    pixels_control::HttpsPayloadSource::Config missing_token{};
+    static pixels_control::HttpsPayloadSource invalid_source(http, missing_token);
+    CHECK(invalid_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                                 resolved_digest) == ESP_ERR_INVALID_ARG);
+
+    static pixels_control::EspHttpPayloadClient idf_http;
+    pixels_control::HttpPayloadRequest invalid_request{};
+    invalid_request.url = "http://example.invalid/config";
+    invalid_request.bearer_token = kTestToken;
+    invalid_request.timeout_ms = 1000;
+    invalid_request.destination = resolved;
+    invalid_request.capacity = sizeof(resolved);
+    pixels_control::HttpPayloadResult invalid_result{};
+    CHECK(idf_http.download(invalid_request, invalid_result) == ESP_ERR_INVALID_ARG);
 
     char timestamp[36]{};
     pixels_control::UtcTimestampSource timestamps;
