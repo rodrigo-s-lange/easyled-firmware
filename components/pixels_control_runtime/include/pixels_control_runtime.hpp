@@ -66,6 +66,10 @@ struct HttpPayloadResult {
     int status_code = 0;
     size_t size = 0;
     bool application_json = false;
+    /// True when the response carried X-Config-Checksum.
+    bool has_config_checksum = false;
+    /// NUL-terminated hexadecimal response checksum when present.
+    char config_checksum[pixels_firmware::kSha256HexBytes + 1]{};
 };
 
 /// Injectable HTTP boundary used by HttpsPayloadSource. Implementations must
@@ -77,7 +81,7 @@ public:
 
     /// Downloads one complete response into a caller-owned bounded buffer.
     /// @param request HTTPS URL, credential, trust source, timeout and destination.
-    /// @param result Receives status, byte count and content-type classification.
+    /// @param result Receives status, byte count, content type and optional checksum header.
     /// @return ESP_OK after a complete HTTP exchange, or a transport/size error.
     virtual esp_err_t download(const HttpPayloadRequest &request,
                                HttpPayloadResult &result) = 0;
@@ -121,6 +125,8 @@ public:
     HttpsPayloadSource(HttpPayloadClient &client, const Config &config);
 
     /// Downloads, bounds and verifies one apply_config resource before returning it.
+    /// The exact response bytes must match the command checksum and, when the
+    /// server supplies X-Config-Checksum, that independently parsed digest too.
     /// @param command Parsed apply_config command whose HTTPS URL/checksum are authoritative.
     /// @param buffer Destination for exact canonical response bytes.
     /// @param capacity Destination capacity.

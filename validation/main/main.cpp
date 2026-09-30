@@ -32,6 +32,10 @@ extern const uint8_t config_payload_bench_gpio16_50_provisional_json_start[] asm
     "_binary_config_payload_bench_gpio16_50_provisional_json_start");
 extern const uint8_t config_payload_bench_gpio16_50_provisional_json_end[] asm(
     "_binary_config_payload_bench_gpio16_50_provisional_json_end");
+extern const uint8_t sample_config_payload_canonical_json_start[] asm(
+    "_binary_sample_config_payload_canonical_json_start");
+extern const uint8_t sample_config_payload_canonical_json_end[] asm(
+    "_binary_sample_config_payload_canonical_json_end");
 extern const uint8_t activate_preset_command_provisional_json_start[] asm(
     "_binary_activate_preset_command_provisional_json_start");
 extern const uint8_t activate_preset_command_provisional_json_end[] asm(
@@ -80,6 +84,7 @@ constexpr char kHardwareBindingId[] = "44444444-4444-4444-8444-444444444444";
 constexpr char kPresetId[] = "55555555-5555-4555-8555-555555555555";
 constexpr char kActivateCommandId[] = "66666666-6666-4666-8666-666666666666";
 constexpr char kConfigHash[] = "b62868aef25369d8b00db8dbc6af34c7c82b060b5570b0b7b24859a7d5547c5a";
+constexpr char kCanonicalConfigHash[] = "112ef822a45000a449e87b97170d5448cdfc2afbc11c33728e39a1095b4eca6f";
 constexpr char kPresetHash[] = "c9be5621fa0109c6acbf4461a47191b80b3b6ebae2d50714d5c56172f7cc5174";
 pixels_payload::Candidate payload_candidate{};
 
@@ -109,6 +114,11 @@ public:
         result.status_code = status_code;
         result.size = body_size;
         result.application_json = application_json;
+        result.has_config_checksum = checksum_header != nullptr;
+        if (checksum_header != nullptr) {
+            std::strncpy(result.config_checksum, checksum_header,
+                         sizeof(result.config_checksum) - 1);
+        }
         return ESP_OK;
     }
 
@@ -116,6 +126,7 @@ public:
     size_t body_size = 0;
     int status_code = 200;
     bool application_json = true;
+    const char *checksum_header = nullptr;
     esp_err_t error = ESP_OK;
     int calls = 0;
     pixels_control::HttpPayloadRequest last_request{};
@@ -746,7 +757,8 @@ void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(journal.init() == ESP_ERR_INVALID_RESPONSE); // never risk replay after journal corruption
 }
 
-void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t preset_digest[32])
+void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t preset_digest[32],
+                             const uint8_t canonical_config_digest[32])
 {
     static const pixels_control::EmbeddedResource resources[] = {
         {pixels_firmware::CommandType::ApplyConfig,
@@ -787,12 +799,17 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
 
     // HttpsPayloadSource owns contract-independent policy while the injected
     // fake owns transport. No live endpoint, credential or certificate is used.
-    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
-                                        FIXTURE_SIZE(apply_config_command_provisional_json),
-                                        command, parse_error) == ESP_OK);
+    command = pixels_firmware::Command{};
+    command.type = pixels_firmware::CommandType::ApplyConfig;
+    command.has_checksum = true;
+    std::strncpy(command.resource_url,
+                 "https://example.invalid/api/v1/devices/33333333-3333-3333-3333-333333333333/config/1",
+                 sizeof(command.resource_url) - 1);
+    std::memcpy(command.checksum, canonical_config_digest, sizeof(command.checksum));
     static FakeHttpPayloadClient http;
-    http.body = FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json);
-    http.body_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
+    http.body = FIXTURE_BYTES(sample_config_payload_canonical_json);
+    http.body_size = FIXTURE_SIZE(sample_config_payload_canonical_json);
+    http.checksum_header = kCanonicalConfigHash;
     static constexpr char kTestToken[] = "fixture-device-token";
     static constexpr char kTestCa[] = "fixture-ca-pem";
     pixels_control::HttpsPayloadSource::Config https_config{};
@@ -807,7 +824,7 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
                                resolved_digest) == ESP_OK &&
           resolved_size == http.body_size &&
           std::memcmp(resolved, http.body, http.body_size) == 0 &&
-          std::memcmp(resolved_digest, config_digest, sizeof(resolved_digest)) == 0);
+          std::memcmp(resolved_digest, canonical_config_digest, sizeof(resolved_digest)) == 0);
     CHECK(http.calls == 1 && std::strcmp(http.last_request.url, command.resource_url) == 0 &&
           std::strcmp(http.last_request.bearer_token, kTestToken) == 0 &&
           http.last_request.server_ca_pem == kTestCa &&
@@ -823,6 +840,18 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
                                resolved_digest) == ESP_FAIL && resolved_size == 0);
     http.application_json = true;
+    static constexpr char kWrongHeader[] =
+        "012ef822a45000a449e87b97170d5448cdfc2afbc11c33728e39a1095b4eca6f";
+    http.checksum_header = kWrongHeader;
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_ERR_INVALID_CRC && resolved_size == 0);
+    http.checksum_header = "malformed";
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_ERR_INVALID_RESPONSE && resolved_size == 0);
+    http.checksum_header = nullptr;
+    CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
+                               resolved_digest) == ESP_OK && resolved_size == http.body_size);
+    http.checksum_header = kCanonicalConfigHash;
     static constexpr char kWrongBody[] = "{}";
     http.body = kWrongBody;
     http.body_size = sizeof(kWrongBody) - 1;
@@ -832,8 +861,8 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
                                resolved_digest) == ESP_ERR_TIMEOUT && resolved_size == 0);
     http.error = ESP_OK;
-    http.body = FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json);
-    http.body_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
+    http.body = FIXTURE_BYTES(sample_config_payload_canonical_json);
+    http.body_size = FIXTURE_SIZE(sample_config_payload_canonical_json);
     CHECK(https_source.resolve(command, resolved, http.body_size - 1, resolved_size,
                                resolved_digest) == ESP_ERR_INVALID_SIZE && resolved_size == 0);
 
@@ -842,9 +871,13 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
                                resolved_digest) == ESP_ERR_INVALID_ARG &&
           http.calls == calls_before_invalid);
-    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
-                                        FIXTURE_SIZE(apply_config_command_provisional_json),
-                                        command, parse_error) == ESP_OK);
+    command = pixels_firmware::Command{};
+    command.type = pixels_firmware::CommandType::ApplyConfig;
+    command.has_checksum = true;
+    std::strncpy(command.resource_url,
+                 "https://example.invalid/api/v1/devices/33333333-3333-3333-3333-333333333333/config/1",
+                 sizeof(command.resource_url) - 1);
+    std::memcpy(command.checksum, canonical_config_digest, sizeof(command.checksum));
     command.has_checksum = false;
     CHECK(https_source.resolve(command, resolved, sizeof(resolved), resolved_size,
                                resolved_digest) == ESP_ERR_INVALID_ARG &&
@@ -908,7 +941,16 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
               pixels_firmware::CommandType::ActivatePreset,
               FIXTURE_BYTES(preset_payload_provisional_json),
               FIXTURE_SIZE(preset_payload_provisional_json)) == ESP_OK);
-    CHECK(sink.pixel(0).r == 0x00 && sink.pixel(0).g == 0x37 && sink.pixel(0).b == 0xDC);
+    bool preset_pushed = false;
+    const TickType_t push_started = xTaskGetTickCount();
+    while (xTaskGetTickCount() - push_started < pdMS_TO_TICKS(150)) {
+        if (sink.pixel(0).r == 0x00 && sink.pixel(0).g == 0x37 && sink.pixel(0).b == 0xDC) {
+            preset_pushed = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    CHECK(preset_pushed);
     CHECK(target.clearAtFrameBoundary() == ESP_OK);
     CHECK(composer.end() == ESP_OK);
 }
@@ -956,14 +998,21 @@ extern "C" void app_main()
     // (the fixture FILES are the source of truth now, not string literals)
     static uint8_t config_digest[kSha256Bytes]{};
     static uint8_t preset_digest[kSha256Bytes]{};
+    static uint8_t canonical_config_digest[kSha256Bytes]{};
     CHECK(parseSha256(kConfigHash, config_digest) == ESP_OK);
     CHECK(parseSha256(kPresetHash, preset_digest) == ESP_OK);
+    CHECK(parseSha256(kCanonicalConfigHash, canonical_config_digest) == ESP_OK);
     runDurableStorageChecks(config_digest, preset_digest);
-    runControlRuntimeChecks(config_digest, preset_digest);
+    runControlRuntimeChecks(config_digest, preset_digest, canonical_config_digest);
     CHECK(verifySha256(FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
                        FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json), config_digest) == ESP_OK);
     CHECK(verifySha256(FIXTURE_BYTES(preset_payload_provisional_json),
                        FIXTURE_SIZE(preset_payload_provisional_json), preset_digest) == ESP_OK);
+    CHECK(FIXTURE_SIZE(sample_config_payload_canonical_json) == 537 &&
+          FIXTURE_BYTES(sample_config_payload_canonical_json)[536] == '}' &&
+          verifySha256(FIXTURE_BYTES(sample_config_payload_canonical_json),
+                       FIXTURE_SIZE(sample_config_payload_canonical_json),
+                       canonical_config_digest) == ESP_OK);
 
     // --- Command envelope parsing (unchanged contract, now from fixture files) ---
     static Command command;
@@ -1128,6 +1177,18 @@ extern "C" void app_main()
         CHECK(pixels_payload::parseConfigPayload(kWithUnknown, sizeof(kWithUnknown) - 1, payload_candidate, schema_error) ==
               ESP_OK);
         CHECK(payload_candidate.scene.brightness == 10 && payload_candidate.scene.count == 0 && payload_candidate.output_count == 1);
+
+        // JSON object order is insignificant. In particular, the backend's
+        // jsonb round-trip may reorder outputs[].config keys.
+        static constexpr char kReorderedOutputConfig[] =
+            "{\"global_brightness\":10,\"segments\":[],\"inputs\":[],\"outputs\":[{\"config\":{\"reversed\":false,\"color_order\":\"GRB\",\"strip_type\":\"WS2812B\",\"pixel_count\":50,\"gpio\":16},\"type\":\"digital_out\",\"slot_index\":0}],\"ledmap\":null}";
+        CHECK(pixels_payload::parseConfigPayload(kReorderedOutputConfig,
+                                                  sizeof(kReorderedOutputConfig) - 1,
+                                                  payload_candidate, schema_error) == ESP_OK &&
+              payload_candidate.output_count == 1 &&
+              payload_candidate.outputs[0].gpio == 16 &&
+              payload_candidate.outputs[0].pixel_count == 50 &&
+              payload_candidate.outputs[0].order == esp_pixels::PixelOrder::GRB);
 
         CHECK(pixels_payload::parsePresetPayload(FIXTURE_BYTES(preset_payload_provisional_json),
                                                  FIXTURE_SIZE(preset_payload_provisional_json), payload_candidate,

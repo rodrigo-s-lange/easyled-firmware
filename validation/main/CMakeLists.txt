@@ -5,6 +5,7 @@ idf_component_register(SRCS "main.cpp"
     EMBED_TXTFILES
         "../fixtures/apply-config-command.provisional.json"
         "../fixtures/config-payload-bench-gpio16-50.provisional.json"
+        "../fixtures/sample-config-payload.canonical.json"
         "../fixtures/activate-preset-command.provisional.json"
         "../fixtures/preset-payload.provisional.json"
         "../fixtures/event-command-applied.provisional.json"

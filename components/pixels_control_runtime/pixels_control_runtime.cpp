@@ -53,15 +53,29 @@ struct HttpDownloadContext {
     size_t size = 0;
     bool overflow = false;
     bool application_json = false;
+    bool has_config_checksum = false;
+    bool invalid_config_checksum = false;
+    char config_checksum[pixels_firmware::kSha256HexBytes + 1]{};
 };
 
 esp_err_t onHttpEvent(esp_http_client_event_t *event)
 {
     if (event == nullptr || event->user_data == nullptr) { return ESP_ERR_INVALID_ARG; }
     auto &context = *static_cast<HttpDownloadContext *>(event->user_data);
-    if (event->event_id == HTTP_EVENT_ON_HEADER &&
-        sameHeader(event->header_key, "Content-Type")) {
-        context.application_json = jsonContentType(event->header_value);
+    if (event->event_id == HTTP_EVENT_ON_HEADER) {
+        if (sameHeader(event->header_key, "Content-Type")) {
+            context.application_json = jsonContentType(event->header_value);
+        } else if (sameHeader(event->header_key, "X-Config-Checksum")) {
+            const size_t size = event->header_value == nullptr ? 0 :
+                strnlen(event->header_value, pixels_firmware::kSha256HexBytes + 1);
+            if (context.has_config_checksum || size != pixels_firmware::kSha256HexBytes) {
+                context.invalid_config_checksum = true;
+            } else {
+                std::memcpy(context.config_checksum, event->header_value, size);
+                context.config_checksum[size] = '\0';
+                context.has_config_checksum = true;
+            }
+        }
     }
     if (event->event_id != HTTP_EVENT_ON_DATA || event->data_len == 0) { return ESP_OK; }
     if (event->data == nullptr || event->data_len < 0) { return ESP_ERR_INVALID_RESPONSE; }
@@ -180,10 +194,16 @@ esp_err_t EspHttpPayloadClient::download(const HttpPayloadRequest &request,
         result.status_code = esp_http_client_get_status_code(client);
         result.size = context.size;
         result.application_json = context.application_json;
+        result.has_config_checksum = context.has_config_checksum;
+        if (context.has_config_checksum) {
+            std::memcpy(result.config_checksum, context.config_checksum,
+                        sizeof(result.config_checksum));
+        }
     }
     const esp_err_t cleanup = esp_http_client_cleanup(client);
     std::memset(authorization_, 0, sizeof(authorization_));
     if (context.overflow) { return ESP_ERR_INVALID_SIZE; }
+    if (context.invalid_config_checksum) { return ESP_ERR_INVALID_RESPONSE; }
     if (err != ESP_OK) { return err; }
     return cleanup;
 }
@@ -228,6 +248,14 @@ esp_err_t HttpsPayloadSource::resolve(
     if (result.size == 0 || result.size > request.capacity) { return ESP_ERR_INVALID_SIZE; }
     err = pixels_firmware::verifySha256(buffer, result.size, command.checksum);
     if (err != ESP_OK) { return err; }
+    if (result.has_config_checksum) {
+        uint8_t header_checksum[pixels_firmware::kSha256Bytes]{};
+        if (pixels_firmware::parseSha256(result.config_checksum, header_checksum) != ESP_OK) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        err = pixels_firmware::verifySha256(buffer, result.size, header_checksum);
+        if (err != ESP_OK) { return err; }
+    }
     std::memcpy(expected_checksum, command.checksum, pixels_firmware::kSha256Bytes);
     size = result.size;
     return ESP_OK;

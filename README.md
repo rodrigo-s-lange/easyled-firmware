@@ -190,18 +190,34 @@ only HTTPS, verifies the peer certificate and hostname through the supplied CA
 or the full certificate bundle, disables redirects and authorization retries,
 and never logs the token or response body. It accepts only a complete HTTP 200
 `application/json` body within the configured limit (8192 B maximum) and verifies
-the command's SHA-256 before returning bytes to the executor. Consequently the
-executor cannot stage or activate a partial, oversized or checksum-invalid
-download. Preset resolution intentionally remains with `EmbeddedPayloadSource`
-until EasyLED publishes the second #60 contract package.
+the command's SHA-256 before returning bytes to the executor. When present, the
+canonical `X-Config-Checksum` response header must be a 64-character SHA-256 and
+the exact body must match it through the same constant-time digest comparison.
+Malformed, duplicate or divergent checksum headers fail closed. Consequently
+the executor cannot stage or activate a partial, oversized or checksum-invalid
+download. HTTP 401, 403 (including `missing_capability_manifest`), 404 and 500
+all remain resolution failures and preserve the active durable configuration.
+Preset resolution intentionally remains with `EmbeddedPayloadSource` until
+EasyLED publishes the second #60 contract package.
+
+The backend fixture from EasyLED PR #72 is embedded verbatim as
+`validation/fixtures/sample-config-payload.canonical.json`: 537 bytes, no final
+newline, SHA-256
+`112ef822a45000a449e87b97170d5448cdfc2afbc11c33728e39a1095b4eca6f`.
+Validation downloads and verifies those exact bytes using the definitive header.
+The fixture is not activated yet: it contains a 2D ledmap and identifies output
+slot 0 without a GPIO, while this application still requires an explicit physical
+GPIO mapping. The adapter continues to reject that unsupported combination
+instead of guessing. Its supported object parsing is key-order independent,
+including `outputs[].config`, and validation exercises a reordered object.
 
 The capability envelope/cadence follows PR #66, but the inner capability object
 is explicitly provisional schema version 1 because EasyLED has not yet closed
-that canonical schema. The HTTPS source is not wired into `main.cpp` until the
-backend PR supplies the byte-exact fixture, definitive checksum header and real
-HTTP error mapping. Also not implemented: final MQTT topic/provisioning policy,
-OTA execution, runtime physical-output reconfiguration, and live broker-loss
-tests.
+that canonical schema. The HTTPS source is not wired into `main.cpp` until device
+credential provisioning and capability-manifest ingestion are available; the
+offline application therefore keeps `EmbeddedPayloadSource`. Also not implemented:
+final MQTT topic/provisioning policy, OTA execution, runtime physical-output
+reconfiguration, and live broker-loss tests.
 
 ## Build and local profile
 
@@ -276,7 +292,7 @@ payload adapter, command executor, real NVS storage and the control-runtime
 adapters in an ESP32 QEMU target with no network adapter. The nine fixture strings
 the tests use (two payloads, two command envelopes, four events and one retained
 state) live as inspectable files
-under `validation/fixtures/*.provisional.json`, embedded into the binary via
+under `validation/fixtures/`, embedded into the binary via
 `EMBED_TXTFILES` rather than duplicated as string literals. It checks the two
 exact provisional fixture hashes, command parsing, event/state/capability
 serialization, terminal replay, the payload adapter's happy paths and a representative
@@ -310,7 +326,7 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe"
 The script merges only a local emulated flash file, captures the result in
 `build/network-contract-validation/qemu-validation.log`, and terminates QEMU
 after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
-marker is `NETWORK_CONTRACT_VALIDATION checks=308 failures=0 RESULT=ALL_PASS`.
+marker is `NETWORK_CONTRACT_VALIDATION checks=312 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
@@ -332,12 +348,13 @@ initialization with the five-entry network partition table. No broker was access
 
 ## Next integration step
 
-Import the backend PR's byte-exact fixture and checksum, bind its definitive
-checksum header and HTTP error codes, then route `apply_config` through
-`HttpsPayloadSource` while retaining `EmbeddedPayloadSource` for preset/offline
-tests. Replace the provisional capability object with its canonical schema when
-EasyLED closes it, then exercise command/event/state retain, acknowledgement and
-reconnect behavior with an authorized broker.
+Provision a real device credential and capability-manifest ingestion, then route
+`apply_config` through `HttpsPayloadSource` while retaining
+`EmbeddedPayloadSource` for preset/offline tests. Close the platform-to-hardware
+output-slot mapping before accepting the canonical fixture's slot-only topology.
+Replace the provisional capability object with its canonical schema when EasyLED
+closes it, then exercise command/event/state retain, acknowledgement and reconnect
+behavior with an authorized broker.
 Runtime `PixelFrameSink` output rebuild, provisioning, heap/stack measurements
 under TLS load and broker-loss/render-continuity tests remain product work.
 
