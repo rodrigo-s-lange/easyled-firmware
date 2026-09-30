@@ -101,7 +101,7 @@ uint32_t boundedU32(size_t value)
 pixels_firmware::CapabilityManifest capabilityManifest(
     const esp_pixels_composer_adapter_esp_pixels::EspPixelsSink &sink)
 {
-    static constexpr uint8_t kEffectIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    static constexpr uint8_t kEffectIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
     const auto transport = sink.capabilities();
     uint32_t total_pixels = 0;
     for (uint8_t slot = 0; slot < sink.outputCount(); ++slot) {
