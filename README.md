@@ -167,7 +167,7 @@ retries enqueue failures without consuming another sequence number. The state
 contains durable boot/state counters, active config/preset identity and the last
 applied command. `capability_reported` uses the event topic, QoS1 without retain,
 once after subscription and every 60 minutes. Its measured heap/PSRAM and output
-topology accompany supported effect IDs 0..14, ledmap/2D/mirror/custom support and
+topology accompany supported effect IDs 0..16, ledmap/2D/mirror/custom support and
 the 100-slot disposable local preset cache.
 
 `ComposerActivationTarget` reparses persisted bytes on every activation, checks
