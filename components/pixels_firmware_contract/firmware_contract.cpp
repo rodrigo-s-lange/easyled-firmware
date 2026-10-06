@@ -421,7 +421,7 @@ esp_err_t serializeCapabilityReport(const CapabilityReport &report, char *output
         caps.configured_output_count == 0 ||
         caps.configured_output_count > caps.max_output_slots || caps.configured_total_pixels == 0 ||
         caps.max_segments == 0 || caps.custom_param_slots > 3 || caps.effect_count == 0 ||
-        caps.effect_count > 16 || caps.effect_ids == nullptr) {
+        caps.effect_count > 32 || caps.effect_ids == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     cJSON *root = cJSON_CreateObject();

@@ -1090,7 +1090,7 @@ extern "C" void app_main()
     state.mode = DeviceMode::ConfigActive;
     CHECK(serializeState(state, state_json, 32, state_size) == ESP_ERR_INVALID_SIZE && state_size == 0);
 
-    static constexpr uint8_t kEffectIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    static constexpr uint8_t kEffectIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
     CapabilityReport capability{};
     capability.device_id = kDeviceId;
     capability.firmware_version = "0.1.0-dev";
