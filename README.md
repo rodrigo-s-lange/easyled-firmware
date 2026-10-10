@@ -154,6 +154,10 @@ intended for a single application control task.
 - `NvsDurableStaging` accepts at most 8192 exact payload bytes and uses a pending
   record plus A/B active records. Every record has schema, bounds, CRC32 and NVS
   commit/readback checks; payload activation additionally requires exact SHA-256.
+- The last successful `apply_config` is retained separately as the base topology
+  and canvas. Because a preset is scene-only, boot and rollback restore this base
+  configuration before applying an active preset. A preset without a recoverable
+  base configuration fails closed.
 - On boot, the newest valid active record is reapplied at a render-frame boundary.
   A pending candidate is reconciled against its command's terminal journal
   entry: durable success keeps it; a missing result restores the prior A/B slot.
@@ -171,9 +175,9 @@ intended for a single application control task.
 ## Integrated control runtime
 
 `components/pixels_control_runtime` supplies the concrete application adapters
-and `main.cpp` now owns their lifecycle. Boot initializes the real GPIO16/50 GRB
-pixel output, starts Composer's managed render task, opens the terminal journal,
-and restores the newest durable payload before networking starts. With a local
+and `main.cpp` now owns their lifecycle. Boot first builds a safe black topology,
+opens the terminal journal, and reconstructs the newest durable output topology,
+ledmap and scene before networking starts. With a local
 profile, the same application task that calls `NetworkSession::poll()` dequeues
 complete MQTT commands and calls `Executor::execute()`; no product action runs
 inside an MQTT callback. Events are published non-retained with QoS1 through the
@@ -187,12 +191,16 @@ once after subscription and every 60 minutes. Its measured heap/PSRAM and output
 topology accompany supported effect IDs 0..21, ledmap/2D/mirror/custom support and
 the 100-slot disposable local preset cache.
 
-`ComposerActivationTarget` reparses persisted bytes on every activation, checks
-an `apply_config` payload's topology against the already-built physical sink,
-publishes its scene, and reports success only after `Composer::reclaim()` directly
-proves frame-boundary adoption. The physical topology in this cut is exactly one
-WS2812B/GRB output with 50 pixels on GPIO16. A config asking for another topology
-fails activation and rolls back; a preset inherits the active topology.
+`TransactionalPixelActivationTarget` reparses persisted bytes on every
+activation, resolves logical output slots through an immutable local board
+profile, installs the ledmap before the scene, and reports success only after
+`Composer::reclaim()` proves frame-boundary adoption. Remote JSON cannot choose
+GPIOs. The current laboratory profile binds slot 0 to GPIO16 and slot 1 to
+GPIO17, permits up to 2048 pixels per slot, and clears 372 GRB pixels on GPIO16
+when no durable configuration exists. A failed rebuild or scene adoption restores
+the prior confirmed topology, canvas and scene before returning the error. A
+preset inherits the last confirmed base configuration; reboot restores that base
+before the scene-only preset.
 
 `EmbeddedPayloadSource` resolves only the starter pack's exact config URL and
 preset UUID to the versioned fixture bytes embedded from `validation/fixtures`.
@@ -222,20 +230,18 @@ The backend fixture from EasyLED PR #72 is embedded verbatim as
 newline, SHA-256
 `112ef822a45000a449e87b97170d5448cdfc2afbc11c33728e39a1095b4eca6f`.
 Validation downloads and verifies those exact bytes using the definitive header,
-then parses its logical slot, 4x4 ledmap and 2D segment without inventing a GPIO.
-The fixture is not activated yet because the current runtime owns a fixed 50-pixel
-identity Composer and cannot rebuild its physical outputs/canvas transactionally.
-That runtime reconfiguration is the next firmware integration step. Object parsing
-is key-order independent, including `outputs[].config`, and validation exercises a
-reordered object.
+then activates its logical slot through the local GPIO16 binding, materializes
+the 4x4 ledmap and adopts its 2D segment. Validation also injects a post-rebuild
+failure and proves restoration of the previous topology, canvas and scene. Object
+parsing is key-order independent, including `outputs[].config`, and validation
+exercises a reordered object.
 
 The capability envelope/cadence follows PR #66, but the inner capability object
 is explicitly provisional schema version 1 because EasyLED has not yet closed
 that canonical schema. The HTTPS source is not wired into `main.cpp` until device
 credential provisioning and capability-manifest ingestion are available; the
 offline application therefore keeps `EmbeddedPayloadSource`. Also not implemented:
-final MQTT topic/provisioning policy, OTA execution, runtime physical-output
-reconfiguration, and live broker-loss tests.
+final MQTT topic/provisioning policy, OTA execution, and live broker-loss tests.
 
 ## Checkout, build and local profile
 
@@ -340,9 +346,11 @@ oldest eviction; A/B recovery and rollback across simulated reboot; an actual
 The telemetry store is rebooted in place to prove durable boot-counter,
 state-sequence and last-applied-command behavior, while active snapshots prove
 that config version survives preset activation.
-It also covers exact embedded-resource lookup, timestamp format, physical
-topology mismatch rejection, and the production activation adapter over a real
-managed Composer/FakeSink pair through config, preset and clear adoption.
+It also covers exact embedded-resource lookup, timestamp format, logical-slot
+rejection, transactional runtime reconstruction, canonical 4x4 activation,
+scene-only preset inheritance, and restoration after an injected activation
+failure. Durable-storage checks prove rebooting an active preset restores its
+base configuration before the preset scene.
 An injected fake HTTP client verifies exact config-byte delivery, URL/token/CA/
 timeout/limit forwarding, non-HTTPS rejection, transport failure, HTTP status,
 content type, oversize and checksum failures. It does **not** open a network
@@ -358,37 +366,37 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build
 The script merges only a local emulated flash file, captures the result in
 `validation/build/qemu-validation.log`, and terminates QEMU
 after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
-marker is `NETWORK_CONTRACT_VALIDATION checks=312 failures=0 RESULT=ALL_PASS`.
+marker is `NETWORK_CONTRACT_VALIDATION checks=321 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
 shell's `PATH` before invoking the script (no machine-wide configuration change).
 
-The validation target uses the ESP-IDF 4096 B main-task stack. Large candidates,
+The validation target uses an ESP-IDF 8192 B main-task stack. Large candidates,
 fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
-Build verified with ESP-IDF 6.0.0: combined image 1044096 B, static DRAM 70795 B
-(39.17%) and IRAM 89615 B (68.37%). The 1.5 MiB app partition retains 528768 B
-(34%) after the build. These figures include live storage, executor, fixture
+Build verified with ESP-IDF 6.0.2: combined binary 1078640 B, static DRAM 72911 B
+(40.34%) and IRAM 90555 B (69.09%). The 1.5 MiB app partition retains 494224 B
+(31%) after the build. These figures include live storage, executor, fixture
 resolver and Composer activation objects but exclude runtime Wi-Fi/TLS heap use.
-The focused image is 680560 B and ran on Espressif QEMU 9.2.2: all 308 checks
-passed, with no assertion, watchdog or panic. Its static DRAM is 172324 B (95.35%,
-8412 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
-and IRAM is 47511 B (36.25%). The combined image also booted through real NVS
+The focused binary is 700528 B and ran on Espressif QEMU 9.2.2: all 321 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 175828 B (97.28%,
+4908 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
+and IRAM is 47715 B (36.40%). The combined image also booted through real NVS
 initialization with the five-entry network partition table. No broker was accessed.
 
 ## Next integration step
 
 Provision a real device credential and capability-manifest ingestion, then route
 `apply_config` through `HttpsPayloadSource` while retaining
-`EmbeddedPayloadSource` for preset/offline tests. Close the platform-to-hardware
-output-slot mapping before accepting the canonical fixture's slot-only topology.
+`EmbeddedPayloadSource` for preset/offline tests. Replace the laboratory board
+profile with the first product board's reviewed slot/GPIO/current limits.
 Replace the provisional capability object with its canonical schema when EasyLED
 closes it, then exercise command/event/state retain, acknowledgement and reconnect
 behavior with an authorized broker.
-Runtime `PixelFrameSink` output rebuild, provisioning, heap/stack measurements
-under TLS load and broker-loss/render-continuity tests remain product work.
+Provisioning, heap/stack measurements under TLS load and
+broker-loss/render-continuity tests remain product work.
 
 Official references: [ESP-IDF 6.0.2 MQTT component migration](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32/api-reference/protocols/mqtt.html),
 [ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme),

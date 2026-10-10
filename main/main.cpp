@@ -137,13 +137,6 @@ bool terminalApplied(const pixels_storage::NvsTerminalJournal &journal, const ch
            std::strstr(record.event_json, "\"event_type\":\"command_applied\"") != nullptr;
 }
 
-void stopRenderer(esp_pixels_composer::Composer &composer,
-                  esp_pixels_composer_adapter_esp_pixels::EspPixelsSink &sink)
-{
-    (void)composer.end();
-    (void)sink.end();
-}
-
 } // namespace
 
 extern "C" void app_main()
@@ -162,17 +155,27 @@ extern "C" void app_main()
         return;
     }
 
-    // Product-bench topology for this cut: the currently connected 50-pixel
-    // GRB WS2812B strip on GPIO16. Payload topology must match this exactly.
-    static esp_pixels::Pixels pixels;
-    static esp_pixels_composer_adapter_esp_pixels::EspPixelsSink sink;
-    static esp_pixels_composer::Composer composer;
-    esp_err_t err = sink.init(pixels, 16, 50, esp_pixels::PixelOrder::GRB);
-    if (err == ESP_OK) { err = composer.build(sink); }
-    if (err == ESP_OK) { err = composer.start(); }
+    // Lab-board wiring is firmware-owned. Remote configuration selects only
+    // logical slots and can never redirect a signal to another GPIO. The safe
+    // boot count covers the currently connected 31x12 matrix on GPIO16 so an
+    // empty store can actively clear every physical pixel.
+    static constexpr pixels_control::BoardOutputBinding board_outputs[] = {
+        {.slot_index = 0, .gpio = 16, .max_pixels = pixels_payload::kMaxPixelsPerOutput,
+         .safe_pixel_count = 372, .safe_order = esp_pixels::PixelOrder::GRB},
+        {.slot_index = 1, .gpio = 17, .max_pixels = pixels_payload::kMaxPixelsPerOutput,
+         .safe_pixel_count = 0, .safe_order = esp_pixels::PixelOrder::GRB},
+    };
+    static constexpr pixels_control::BoardProfile board_profile{
+        .outputs = board_outputs,
+        .output_count = sizeof(board_outputs) / sizeof(board_outputs[0]),
+    };
+    static pixels_control::EspPixelRuntimeBackend pixel_runtime;
+    static pixels_control::TransactionalPixelActivationTarget activation_target(
+        pixel_runtime, board_profile);
+    esp_err_t err = activation_target.beginSafeBlank();
     if (err != ESP_OK) {
         ESP_LOGE(kTag, "pixel runtime startup failed: %s", esp_err_to_name(err));
-        stopRenderer(composer, sink);
+        (void)pixel_runtime.shutdown();
         return;
     }
     // Boot performs several independent driver/NVS initialization phases.
@@ -180,11 +183,6 @@ extern "C" void app_main()
     // the default task watchdog meaningful on slow emulators and slow flash.
     vTaskDelay(1);
 
-    static constexpr pixels_payload::OutputCandidate fixed_outputs[] = {
-        {.slot_index = 0, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
-    };
-    static pixels_control::ComposerActivationTarget activation_target(
-        composer, fixed_outputs, sizeof(fixed_outputs) / sizeof(fixed_outputs[0]));
     static pixels_storage::NvsTerminalJournal journal;
     static pixels_storage::NvsDurableStaging staging;
     static pixels_storage::NvsTelemetryState telemetry_state;
@@ -205,7 +203,7 @@ extern "C" void app_main()
         telemetry_state.end();
         staging.end();
         journal.end();
-        stopRenderer(composer, sink);
+        (void)pixel_runtime.shutdown();
         return;
     }
 
@@ -377,7 +375,7 @@ extern "C" void app_main()
             report.device_id = config.device_id;
             report.firmware_version = config.firmware_version;
             report.reported_at = reported_at;
-            report.capabilities = capabilityManifest(sink);
+            report.capabilities = capabilityManifest(pixel_runtime.sink());
             err = telemetry_sink.publishCapability(report);
             if (err == ESP_OK) {
                 capability_due = false;

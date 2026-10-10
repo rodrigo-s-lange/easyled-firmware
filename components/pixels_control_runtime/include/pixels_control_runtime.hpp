@@ -9,6 +9,8 @@
 #include "pixels_command_executor.hpp"
 #include "pixels_durable_storage.hpp"
 #include "pixels_payload_adapter.hpp"
+#include "esp_pixels.hpp"
+#include "esp_pixels_composer_adapter_esp_pixels.hpp"
 
 namespace pixels_control {
 
@@ -216,39 +218,142 @@ private:
     const pixels_storage::NvsDurableStaging &staging_;
 };
 
-/// Applies persisted pixel payloads to one already-built, managed Composer.
-/// The physical output topology is fixed for the Composer lifetime; config
-/// payloads must match it exactly, while presets inherit it.
-class ComposerActivationTarget final : public pixels_storage::ActivationTarget {
-public:
-    /// Creates a target over a running Composer and its fixed physical outputs.
-    /// @param composer Built Composer whose managed render task adopts scenes.
-    /// @param outputs Fixed output table copied by this object.
-    /// @param output_count Number of configured outputs, one or two.
-    ComposerActivationTarget(esp_pixels_composer::Composer &composer,
-                             const pixels_payload::OutputCandidate *outputs,
-                             uint8_t output_count);
+/// One immutable application-owned binding from a platform output slot to
+/// physical board wiring. Remote payloads never supply or override the GPIO.
+struct BoardOutputBinding {
+    uint8_t slot_index = 0;
+    int gpio = -1;
+    uint16_t max_pixels = 0;
+    /// Pixels cleared on a boot with no durable configuration. Zero excludes
+    /// this binding from the safe blank topology.
+    uint16_t safe_pixel_count = 0;
+    esp_pixels::PixelOrder safe_order = esp_pixels::PixelOrder::GRB;
+};
 
-    /// Parses, topology-checks and confirms adoption of persisted bytes.
+/// Immutable board profile supplied by the product application.
+struct BoardProfile {
+    const BoardOutputBinding *outputs = nullptr;
+    uint8_t output_count = 0;
+};
+
+/// One resolved output ready for a concrete pixel transport.
+struct PhysicalOutput {
+    uint8_t slot_index = 0;
+    int gpio = -1;
+    uint16_t pixel_count = 0;
+    esp_pixels::PixelOrder order = esp_pixels::PixelOrder::GRB;
+};
+
+/// Injectable lifecycle boundary for rebuilding a pixel sink and Composer.
+class PixelRuntimeBackend {
+public:
+    /// Releases a backend through its interface.
+    virtual ~PixelRuntimeBackend() = default;
+
+    /// Rebuilds transport and Composer with an optional ledmap, initially empty.
+    /// @param outputs Resolved physical outputs in logical concatenation order.
+    /// @param output_count Number of outputs, one or two.
+    /// @param ledmap Validated canvas summary; configured=false selects identity.
+    /// @param entries Ledmap entries when configured, otherwise nullptr.
+    /// @return ESP_OK when the managed renderer is running with this topology.
+    virtual esp_err_t rebuild(const PhysicalOutput *outputs, uint8_t output_count,
+                              const pixels_payload::LedmapCandidate &ledmap,
+                              const int32_t *entries) = 0;
+
+    /// Publishes and confirms a scene on the running renderer.
+    /// @param scene Validated scene candidate.
+    /// @return ESP_OK only after frame-boundary adoption is confirmed.
+    virtual esp_err_t apply(const esp_pixels_composer::AtScene &scene) = 0;
+
+    /// Stops and releases all renderer and transport resources.
+    /// @return ESP_OK after release, or the first drain/release error.
+    virtual esp_err_t shutdown() = 0;
+};
+
+/// ESP-IDF/RMT implementation of the rebuildable pixel runtime.
+class EspPixelRuntimeBackend final : public PixelRuntimeBackend {
+public:
+    /// Stops the runtime and releases owned transport buffers.
+    ~EspPixelRuntimeBackend() override;
+
+    /// Rebuilds one or two esp_pixels outputs and a managed Composer.
+    /// @param outputs Resolved physical outputs.
+    /// @param output_count Number of outputs.
+    /// @param ledmap Canvas summary.
+    /// @param entries Ledmap entries when configured.
+    /// @return ESP_OK when the renderer is running.
+    esp_err_t rebuild(const PhysicalOutput *outputs, uint8_t output_count,
+                      const pixels_payload::LedmapCandidate &ledmap,
+                      const int32_t *entries) override;
+
+    /// Publishes and confirms a scene.
+    /// @param scene Scene to adopt.
+    /// @return ESP_OK only after confirmed adoption.
+    esp_err_t apply(const esp_pixels_composer::AtScene &scene) override;
+
+    /// Stops Composer, drains the sink and releases all outputs.
+    /// @return ESP_OK after release, or the first release error.
+    esp_err_t shutdown() override;
+
+    /// Exposes current transport capabilities for telemetry.
+    /// @return Stable sink owned by this backend.
+    const esp_pixels_composer_adapter_esp_pixels::EspPixelsSink &sink() const { return sink_; }
+
+private:
+    esp_pixels::Pixels pixels_[pixels_payload::kMaxOutputs]{};
+    esp_pixels_composer_adapter_esp_pixels::EspPixelsSink sink_{};
+    esp_pixels_composer::Composer composer_{};
+};
+
+/// Transactional activation target that resolves logical slots through a
+/// board profile and rebuilds transport/canvas for each apply_config. If a
+/// rebuild or scene adoption fails, the last confirmed topology and scene are
+/// restored before the error is returned.
+class TransactionalPixelActivationTarget final : public pixels_storage::ActivationTarget {
+public:
+    /// Copies and validates the immutable board profile.
+    /// @param backend Rebuildable runtime that outlives this target.
+    /// @param profile Board-owned slot/GPIO bindings.
+    TransactionalPixelActivationTarget(PixelRuntimeBackend &backend,
+                                       const BoardProfile &profile);
+
+    /// Releases cached ledmap storage; the backend remains caller-owned.
+    ~TransactionalPixelActivationTarget() override;
+
+    /// Builds the profile's safe topology and transmits an empty black scene.
+    /// @return ESP_OK when the physical outputs are confirmed black.
+    esp_err_t beginSafeBlank();
+
+    /// Parses, rebuilds when needed and confirms adoption of persisted bytes.
     /// @param type ApplyConfig or ActivatePreset.
     /// @param payload Exact payload JSON bytes.
     /// @param size Payload byte count.
-    /// @return ESP_OK only after direct reclaim proves frame-boundary adoption.
+    /// @return ESP_OK only after the live runtime matches the payload.
     esp_err_t activateAtFrameBoundary(pixels_firmware::CommandType type,
                                        const char *payload, size_t size) override;
 
-    /// Publishes and confirms an empty segment table.
-    /// @return ESP_OK only after direct reclaim proves frame-boundary clearing.
+    /// Restores the board profile's safe black topology.
+    /// @return ESP_OK only after physical outputs are confirmed black.
     esp_err_t clearAtFrameBoundary() override;
 
 private:
-    bool topologyMatches(const pixels_payload::Candidate &candidate) const;
-    esp_err_t applyAndConfirm(const esp_pixels_composer::AtScene &scene);
+    bool validProfile() const;
+    esp_err_t resolveOutputs(const pixels_payload::Candidate &candidate,
+                             PhysicalOutput outputs[pixels_payload::kMaxOutputs]) const;
+    esp_err_t restoreConfirmed();
+    esp_err_t buildSafeBlank();
 
-    esp_pixels_composer::Composer &composer_;
-    pixels_payload::OutputCandidate outputs_[pixels_payload::kMaxOutputs]{};
-    uint8_t output_count_ = 0;
+    PixelRuntimeBackend &backend_;
+    BoardOutputBinding bindings_[pixels_payload::kMaxOutputs]{};
+    uint8_t binding_count_ = 0;
+    bool profile_valid_ = false;
     pixels_payload::Candidate candidate_{};
+    PhysicalOutput base_outputs_[pixels_payload::kMaxOutputs]{};
+    uint8_t base_output_count_ = 0;
+    pixels_payload::LedmapCandidate base_ledmap_{};
+    int32_t *base_ledmap_entries_ = nullptr;
+    esp_pixels_composer::AtScene active_scene_{};
+    bool base_confirmed_ = false;
 };
 
 } // namespace pixels_control

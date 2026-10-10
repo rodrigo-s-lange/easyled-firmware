@@ -123,6 +123,21 @@ esp_err_t parseConfigPayload(const char *json, size_t size, Candidate &candidate
 /// @return ESP_OK, or ESP_ERR_INVALID_ARG/SIZE/NOT_SUPPORTED.
 esp_err_t parsePresetPayload(const char *json, size_t size, Candidate &candidate, SchemaError &error);
 
+/// Copies the validated version-1 ledmap table from an apply_config payload.
+/// Call this only with the LedmapCandidate returned by a successful
+/// parseConfigPayload() of the same exact bytes. This keeps the large table
+/// out of Candidate while allowing the runtime to install it before Composer
+/// starts.
+/// @param json Exact apply_config JSON bytes.
+/// @param size Exact byte count.
+/// @param ledmap Validated ledmap summary from parseConfigPayload().
+/// @param entries Destination for row-major logical indices and -1 holes.
+/// @param capacity Number of int32_t entries available at entries.
+/// @return ESP_OK, or ESP_ERR_INVALID_ARG/SIZE when the bytes no longer match
+///         the validated summary.
+esp_err_t materializeLedmap(const char *json, size_t size, const LedmapCandidate &ledmap,
+                            int32_t *entries, uint32_t capacity);
+
 /// Returns the stable wire-oriented reason code for a schema rejection.
 /// @param error Rejection category.
 /// @return Static NUL-terminated reason code.

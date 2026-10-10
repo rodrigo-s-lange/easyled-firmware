@@ -382,6 +382,67 @@ private:
     esp_pixels_composer::CRGB frame_[50]{};
 };
 
+class RecordingPixelRuntimeBackend final : public pixels_control::PixelRuntimeBackend {
+public:
+    esp_err_t rebuild(const pixels_control::PhysicalOutput *outputs, uint8_t output_count,
+                      const pixels_payload::LedmapCandidate &ledmap,
+                      const int32_t *entries) override
+    {
+        ++rebuild_calls_;
+        if (outputs == nullptr || output_count == 0 ||
+            output_count > pixels_payload::kMaxOutputs ||
+            (ledmap.configured && (entries == nullptr || ledmap.entry_count > kMapCapacity))) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        output_count_ = output_count;
+        for (uint8_t i = 0; i < output_count_; ++i) { outputs_[i] = outputs[i]; }
+        ledmap_ = ledmap;
+        if (ledmap.configured) {
+            std::memcpy(entries_, entries, ledmap.entry_count * sizeof(entries_[0]));
+        }
+        running_ = true;
+        return ESP_OK;
+    }
+
+    esp_err_t apply(const esp_pixels_composer::AtScene &scene) override
+    {
+        ++apply_calls_;
+        if (!running_) { return ESP_ERR_INVALID_STATE; }
+        if (fail_next_apply_) {
+            fail_next_apply_ = false;
+            return ESP_FAIL;
+        }
+        scene_ = scene;
+        return ESP_OK;
+    }
+
+    esp_err_t shutdown() override
+    {
+        running_ = false;
+        return ESP_OK;
+    }
+
+    void failNextApply() { fail_next_apply_ = true; }
+    uint8_t outputCount() const { return output_count_; }
+    const pixels_control::PhysicalOutput &output(uint8_t index) const { return outputs_[index]; }
+    const pixels_payload::LedmapCandidate &ledmap() const { return ledmap_; }
+    int32_t mapEntry(uint32_t index) const { return entries_[index]; }
+    const esp_pixels_composer::AtScene &scene() const { return scene_; }
+    int rebuildCalls() const { return rebuild_calls_; }
+
+private:
+    static constexpr uint32_t kMapCapacity = 64;
+    pixels_control::PhysicalOutput outputs_[pixels_payload::kMaxOutputs]{};
+    uint8_t output_count_ = 0;
+    pixels_payload::LedmapCandidate ledmap_{};
+    int32_t entries_[kMapCapacity]{};
+    esp_pixels_composer::AtScene scene_{};
+    bool running_ = false;
+    bool fail_next_apply_ = false;
+    int rebuild_calls_ = 0;
+    int apply_calls_ = 0;
+};
+
 // The one DurableStaging implementation these gates use: stages raw bytes
 // (append-only, exactly like a reboot-recoverable implementation would),
 // then on activateAtFrameBoundary() re-parses those staged bytes through
@@ -521,6 +582,7 @@ public:
     esp_err_t activateAtFrameBoundary(pixels_firmware::CommandType type,
                                       const char *payload, size_t size) override
     {
+        if (activate_calls_ == 0) { first_type_ = type; }
         ++activate_calls_;
         if (payload == nullptr || size == 0 || size > pixels_payload::kMaxPayloadBytes) {
             return ESP_ERR_INVALID_SIZE;
@@ -540,12 +602,18 @@ public:
         return ESP_OK;
     }
 
-    void resetObservation() { activate_calls_ = 0; clear_calls_ = 0; }
+    void resetObservation()
+    {
+        activate_calls_ = 0;
+        clear_calls_ = 0;
+        first_type_ = pixels_firmware::CommandType::ApplyConfig;
+    }
     bool matches(pixels_firmware::CommandType type, const char *payload, size_t size) const
     {
         return active_ && type_ == type && size_ == size && fingerprint_ == fingerprint(payload, size);
     }
     int activateCalls() const { return activate_calls_; }
+    pixels_firmware::CommandType firstType() const { return first_type_; }
 
 private:
     static uint32_t fingerprint(const char *bytes, size_t size)
@@ -560,6 +628,7 @@ private:
 
     bool active_ = false;
     pixels_firmware::CommandType type_ = pixels_firmware::CommandType::ApplyConfig;
+    pixels_firmware::CommandType first_type_ = pixels_firmware::CommandType::ApplyConfig;
     size_t size_ = 0;
     uint32_t fingerprint_ = 0;
     int activate_calls_ = 0;
@@ -713,7 +782,10 @@ void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t pres
     staging.end();
     target.resetObservation();
     CHECK(staging.init(target, journal) == ESP_OK);
-    CHECK(target.activateCalls() == 1 && target.matches(CommandType::ActivatePreset, preset, preset_size));
+    // A preset is scene-only. Boot first restores the separately retained
+    // base configuration (outputs + canvas), then the newest preset scene.
+    CHECK(target.activateCalls() == 2 && target.firstType() == CommandType::ApplyConfig &&
+          target.matches(CommandType::ActivatePreset, preset, preset_size));
     CHECK(staging.activePresetMatches(kPresetId, preset_digest));
     CHECK(staging.activeSnapshot(active_snapshot) == ESP_OK && active_snapshot.active &&
           active_snapshot.type == CommandType::ActivatePreset &&
@@ -913,23 +985,26 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(std::strlen(timestamp) == 20 && timestamp[4] == '-' && timestamp[10] == 'T' &&
           timestamp[19] == 'Z');
 
-    // This is the production activation adapter over a real managed Composer,
-    // with only the hardware transport replaced by FakeSink. Confirmation is
-    // obtained from reclaim(), not from a timing guess.
-    static FakeSink sink;
-    static esp_pixels_composer::Composer composer;
-    CHECK(composer.build(sink) == ESP_OK);
-    CHECK(composer.start(2) == ESP_OK);
-    static constexpr pixels_payload::OutputCandidate topology[] = {
-        {.slot_index = 0, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
+    static constexpr pixels_control::BoardOutputBinding bindings[] = {
+        {.slot_index = 0, .gpio = 16, .max_pixels = 372,
+         .safe_pixel_count = 50, .safe_order = esp_pixels::PixelOrder::GRB},
     };
-    static pixels_control::ComposerActivationTarget target(composer, topology, 1);
+    static constexpr pixels_control::BoardProfile profile{
+        .outputs = bindings,
+        .output_count = 1,
+    };
+    static RecordingPixelRuntimeBackend pixel_runtime;
+    static pixels_control::TransactionalPixelActivationTarget target(pixel_runtime, profile);
+    CHECK(target.beginSafeBlank() == ESP_OK && pixel_runtime.outputCount() == 1 &&
+          pixel_runtime.output(0).gpio == 16 && pixel_runtime.output(0).pixel_count == 50 &&
+          pixel_runtime.scene().brightness == 0);
+
     const size_t config_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
     std::memcpy(resolved, FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json), config_size);
     resolved[config_size] = '\0';
-    char *pixel_count = std::strstr(resolved, "\"pixel_count\":50");
-    CHECK(pixel_count != nullptr);
-    if (pixel_count != nullptr) { pixel_count[15] = '1'; }
+    char *slot_index = std::strstr(resolved, "\"slot_index\":0");
+    CHECK(slot_index != nullptr);
+    if (slot_index != nullptr) { slot_index[std::strlen("\"slot_index\":")] = '1'; }
     CHECK(target.activateAtFrameBoundary(
               pixels_firmware::CommandType::ApplyConfig,
               resolved, config_size) == ESP_ERR_NOT_SUPPORTED);
@@ -937,22 +1012,43 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
               pixels_firmware::CommandType::ApplyConfig,
               FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
               FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json)) == ESP_OK);
+    CHECK(pixel_runtime.outputCount() == 1 && pixel_runtime.output(0).slot_index == 0 &&
+          pixel_runtime.output(0).gpio == 16 && pixel_runtime.output(0).pixel_count == 50 &&
+          !pixel_runtime.ledmap().configured && pixel_runtime.scene().count == 1 &&
+          pixel_runtime.scene().segments[0].effect_id == 2);
     CHECK(target.activateAtFrameBoundary(
               pixels_firmware::CommandType::ActivatePreset,
               FIXTURE_BYTES(preset_payload_provisional_json),
               FIXTURE_SIZE(preset_payload_provisional_json)) == ESP_OK);
-    bool preset_pushed = false;
-    const TickType_t push_started = xTaskGetTickCount();
-    while (xTaskGetTickCount() - push_started < pdMS_TO_TICKS(150)) {
-        if (sink.pixel(0).r == 0x00 && sink.pixel(0).g == 0x37 && sink.pixel(0).b == 0xDC) {
-            preset_pushed = true;
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    CHECK(preset_pushed);
-    CHECK(target.clearAtFrameBoundary() == ESP_OK);
-    CHECK(composer.end() == ESP_OK);
+    CHECK(pixel_runtime.scene().count == 1 && pixel_runtime.scene().segments[0].effect_id == 0 &&
+          pixel_runtime.scene().segments[0].params.color[0].b == 0xff);
+
+    // The canonical PR #72 bytes now cross the complete activation boundary:
+    // logical slot -> board GPIO, 4x4 table materialization and 2D scene.
+    CHECK(target.activateAtFrameBoundary(
+              pixels_firmware::CommandType::ApplyConfig,
+              FIXTURE_BYTES(sample_config_payload_canonical_json),
+              FIXTURE_SIZE(sample_config_payload_canonical_json)) == ESP_OK);
+    CHECK(pixel_runtime.output(0).gpio == 16 && pixel_runtime.output(0).pixel_count == 16 &&
+          pixel_runtime.ledmap().configured && pixel_runtime.ledmap().width == 4 &&
+          pixel_runtime.ledmap().height == 4 && pixel_runtime.mapEntry(0) == 0 &&
+          pixel_runtime.mapEntry(15) == 15 && pixel_runtime.scene().count == 1 &&
+          pixel_runtime.scene().segments[0].is2D);
+
+    // A failure after the transport was rebuilt restores the last confirmed
+    // canonical topology and scene before reporting the candidate failure.
+    const int rebuilds_before_failure = pixel_runtime.rebuildCalls();
+    pixel_runtime.failNextApply();
+    CHECK(target.activateAtFrameBoundary(
+              pixels_firmware::CommandType::ApplyConfig,
+              FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
+              FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json)) == ESP_FAIL);
+    CHECK(pixel_runtime.rebuildCalls() == rebuilds_before_failure + 2 &&
+          pixel_runtime.output(0).pixel_count == 16 && pixel_runtime.ledmap().configured &&
+          pixel_runtime.scene().segments[0].is2D);
+
+    CHECK(target.clearAtFrameBoundary() == ESP_OK && pixel_runtime.output(0).pixel_count == 50 &&
+          !pixel_runtime.ledmap().configured && pixel_runtime.scene().brightness == 0);
 }
 
 } // namespace
