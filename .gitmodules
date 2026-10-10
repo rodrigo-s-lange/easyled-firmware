@@ -1,0 +1,12 @@
+[submodule "dependencies/esp32libfun"]
+	path = dependencies/esp32libfun
+	url = https://github.com/rodrigo-s-lange/esp32libfun.git
+[submodule "dependencies/esp_pixels_fx"]
+	path = dependencies/esp_pixels_fx
+	url = https://github.com/rodrigo-s-lange/esp_pixels_fx.git
+[submodule "dependencies/esp_pixels_composer"]
+	path = dependencies/esp_pixels_composer
+	url = https://github.com/rodrigo-s-lange/esp-pixels-composer.git
+[submodule "dependencies/esp_pixels"]
+	path = dependencies/esp_pixels
+	url = https://github.com/rodrigo-s-lange/esp-pixels.git

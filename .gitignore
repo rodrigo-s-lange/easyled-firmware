@@ -1,1 +1,8 @@
 /main/network_credentials.hpp
+/build*/
+/validation/build*/
+/managed_components/
+/validation/managed_components/
+/sdkconfig
+/validation/sdkconfig
+*.log

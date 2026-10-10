@@ -1,12 +1,27 @@
-# Pixel firmware network session
+# EasyLED firmware
 
-Application-layer Wi-Fi + MQTT over secure WebSocket (WSS), compiled together
-with the pixel transport, effects, Composer and two-output adapter. This is a
-provisional EasyLED device-control integration, **not the completed product
-firmware**. It now restores and activates durable pixel configuration and
+Product firmware for EasyLED devices, with Wi-Fi + MQTT over secure WebSocket
+(WSS), HTTPS payload delivery, durable command execution and local pixel
+rendering. This repository owns the application and product lifecycle; hardware
+access and pixel behavior remain versioned dependencies. The firmware restores
+and activates durable pixel configuration and
 executes the two versioned starter-pack resources end to end. It also publishes
 retained device state and boot/hourly capability telemetry; authenticated HTTPS
-resolution is still pending. No EasyLED repository files are dependencies.
+credential provisioning and the live backend pipeline are still pending.
+
+## Repository boundaries
+
+- `easyled-firmware` owns product boot, connectivity, commands, durable state,
+  partition layout, board profiles, recovery and OTA integration.
+- `esp32libfun` owns the ESP-IDF HAL/framework components.
+- `esp_pixels` owns the physical pixel transport library.
+- `esp_pixels_fx` owns effect implementations and their stable IDs.
+- `esp_pixels_composer` owns scenes, segments, mapping and composition.
+
+The four library repositories are pinned as Git submodules under
+`dependencies/`. Updating a dependency is an explicit firmware change followed
+by validation; cloning a newer library branch cannot silently change a released
+firmware build.
 
 `components/pixels_network` owns the session and bounded message queue. It reuses
 the existing `esp32libfun_wifi_sta` HAL for initialization and connection state;
@@ -219,18 +234,31 @@ offline application therefore keeps `EmbeddedPayloadSource`. Also not implemente
 final MQTT topic/provisioning policy, OTA execution, runtime physical-output
 reconfiguration, and live broker-loss tests.
 
-## Build and local profile
+## Checkout, build and local profile
+
+Clone with the pinned dependencies:
+
+```powershell
+git clone --recurse-submodules https://github.com/rodrigo-s-lange/easyled-firmware.git
+cd easyled-firmware
+```
+
+For an existing checkout:
+
+```powershell
+git submodule update --init --recursive
+```
 
 From an ESP-IDF 6.0.2 shell in this directory:
 
 ```powershell
-idf.py -B ../../../build/pixels-network-session `
-  -D IDF_TARGET=esp32 `
-  -D SDKCONFIG=../../../build/pixels-network-session/sdkconfig build
+idf.py -B build -D IDF_TARGET=esp32 build
 ```
 
-The explicit `SDKCONFIG` path keeps generated configuration in the build tree
-and applies this target's `sdkconfig.defaults`, including `partitions_network.csv`.
+The build uses this target's `sdkconfig.defaults`, including
+`partitions_network.csv`. The dependency paths are CMake cache variables, so a
+developer can test a local library checkout without changing the committed pins,
+for example `-D ESP_PIXELS_FX_DIR=C:/work/esp_pixels_fx`.
 
 Without `main/network_credentials.hpp`, startup still initializes pixels and
 restores durable local state, then leaves networking disabled. An optional,
@@ -263,9 +291,10 @@ static ApplicationConfig applicationConfig()
 
 These are placeholders, not an EasyLED provisioning contract. Supply credentials
 only for an authorized development device. The example does not print payloads or
-credentials. It does not erase NVS automatically on initialization failure.
+credentials. The firmware does not erase NVS automatically on initialization
+failure.
 
-The example uses a 4 MiB partition table with a 1.5 MiB factory application,
+The current product target uses a 4 MiB partition table with a 1.5 MiB factory application,
 128 KiB dedicated `easyled` NVS and 64 KiB coredump partition. It differs from
 the preset application's layout. Back up the complete flash before a bench run
 and restore that image afterward; flashing only the previous application binary
@@ -319,12 +348,12 @@ failure.
 
 ```powershell
 cd validation
-idf.py -B ../../../../build/network-contract-validation -D IDF_TARGET=esp32 build
-python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe"
+idf.py -B build -D IDF_TARGET=esp32 build
+python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build
 ```
 
 The script merges only a local emulated flash file, captures the result in
-`build/network-contract-validation/qemu-validation.log`, and terminates QEMU
+`validation/build/qemu-validation.log`, and terminates QEMU
 after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
 marker is `NETWORK_CONTRACT_VALIDATION checks=312 failures=0 RESULT=ALL_PASS`.
 
