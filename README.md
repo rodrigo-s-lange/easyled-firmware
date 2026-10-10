@@ -6,8 +6,13 @@ rendering. This repository owns the application and product lifecycle; hardware
 access and pixel behavior remain versioned dependencies. The firmware restores
 and activates durable pixel configuration and
 executes the two versioned starter-pack resources end to end. It also publishes
-retained device state and boot/hourly capability telemetry; authenticated HTTPS
-credential provisioning and the live backend pipeline are still pending.
+retained device state and boot/hourly capability telemetry. At boot,
+`apply_config` selects either the explicit laboratory mode backed by the
+embedded fixture or provisioned mode backed exclusively by authenticated
+HTTPS; it never falls back from HTTPS after a request failure.
+`activate_preset` remains an embedded fixture until the platform publishes its
+second download contract package. The live backend pipeline (the platform side
+issuing commands and credentials) is still pending.
 
 ## Repository boundaries
 
@@ -238,10 +243,37 @@ exercises a reordered object.
 
 The capability envelope/cadence follows PR #66, but the inner capability object
 is explicitly provisional schema version 1 because EasyLED has not yet closed
-that canonical schema. The HTTPS source is not wired into `main.cpp` until device
-credential provisioning and capability-manifest ingestion are available; the
-offline application therefore keeps `EmbeddedPayloadSource`. Also not implemented:
-final MQTT topic/provisioning policy, OTA execution, and live broker-loss tests.
+that canonical schema. `main.cpp` now routes `apply_config` through
+`HttpsPayloadSource` whenever a device bearer token is configured (see
+"Two apply_config modes" below); capability-manifest ingestion from a live
+backend is still not implemented. Also not implemented: final MQTT
+topic/provisioning policy, OTA execution, and live broker-loss tests.
+
+### Two apply_config modes
+
+`main.cpp` selects between them once at boot, from the local profile alone --
+never from a request outcome:
+
+- **Laboratory mode** (no `https_bearer_token` in the profile): `apply_config`
+  resolves from the same embedded fixture as `activate_preset`, for
+  offline/broker-integration testing. This is the default with no profile at
+  all, and remains available on a provisioned build that simply omits the
+  token.
+- **Provisioned mode** (`https_bearer_token` set): `apply_config` resolves
+  over authenticated HTTPS exclusively -- see `HttpsPayloadSource` above. Any
+  transport, status, size or checksum failure returns to the executor as-is;
+  there is no fallback to the embedded fixture. `activate_preset` still
+  resolves from the embedded fixture in this mode too, until EasyLED
+  publishes the second #60 contract package.
+
+A profile that sets a bearer token is read as an explicit claim of
+provisioned mode. If that token is empty or over
+`HttpsPayloadSource::kMaxBearerTokenBytes`, or a supplied CA is an empty
+string, or an explicitly set timeout/max-payload-bytes is out of
+`HttpsPayloadSource`'s supported bounds, startup logs the rejection and refuses
+to start networking -- it never silently drops back to
+laboratory mode for a device that claimed to be provisioned. Rendering and
+durable-state restoration are unaffected; only networking is refused.
 
 ## Checkout, build and local profile
 
@@ -271,7 +303,8 @@ for example `-D ESP_PIXELS_FX_DIR=C:/work/esp_pixels_fx`.
 
 Without `main/network_credentials.hpp`, startup still initializes pixels and
 restores durable local state, then leaves networking disabled. An optional,
-gitignored profile has this shape:
+gitignored profile has this shape (omit `.https_bearer_token` entirely for
+laboratory mode; see "Two apply_config modes" above):
 
 ```cpp
 #pragma once
@@ -294,6 +327,13 @@ static ApplicationConfig applicationConfig()
         .firmware_version = "0.1.0-dev",
         .event_topic = "YOUR_EXACT_EVENT_TOPIC",
         .state_topic = "YOUR_EXACT_STATE_TOPIC",
+        .https_bearer_token = "YOUR_DEVICE_HTTPS_BEARER_TOKEN", // provisioned mode; omit for laboratory mode
+        // Omit server_ca_pem to use the ESP-IDF certificate bundle (the
+        // default for a platform-issued certificate); set it only to pin a
+        // private/self-signed CA.
+        // .https_timeout_ms and .https_max_payload_bytes default to
+        // HttpsPayloadSource::Config's own values (10 s / the component's
+        // max payload) when left at zero; set either only to override it.
     };
 }
 ```
@@ -302,6 +342,14 @@ These are placeholders, not an EasyLED provisioning contract. Supply credentials
 only for an authorized development device. The example does not print payloads or
 credentials. The firmware does not erase NVS automatically on initialization
 failure.
+
+`apply_config`'s `command.resource_url` (from the parsed command itself, never a
+compiled-in endpoint) is fetched over HTTPS with this bearer token and TLS
+verification always enabled; a download, status, content-type or checksum
+failure is returned to the executor as-is -- the active durable configuration
+is preserved exactly like any other resolve failure, never silently replaced by
+a cached or embedded payload. An incomplete provisioned profile is rejected
+before networking ever starts; see "Two apply_config modes" above.
 
 The current product target uses a 4 MiB partition table with a 1.5 MiB factory application,
 128 KiB dedicated `easyled` NVS and 64 KiB coredump partition. It differs from
@@ -376,25 +424,28 @@ The validation target uses an ESP-IDF 8192 B main-task stack. Large candidates,
 fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
-Build verified with ESP-IDF 6.0.2: combined binary 1078640 B, static DRAM 72911 B
-(40.34%) and IRAM 90555 B (69.09%). The 1.5 MiB app partition retains 494224 B
-(31%) after the build. These figures include live storage, executor, fixture
-resolver and Composer activation objects but exclude runtime Wi-Fi/TLS heap use.
-The focused binary is 700528 B and ran on Espressif QEMU 9.2.2: all 321 checks
-passed, with no assertion, watchdog or panic. Its static DRAM is 175828 B (97.28%,
-4908 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
-and IRAM is 47715 B (36.40%). The combined image also booted through real NVS
-initialization with the five-entry network partition table. No broker was accessed.
+Build verified with ESP-IDF 6.0.2: combined binary 1109252 B, static DRAM 73391 B
+(40.61%) and IRAM 90555 B (69.09%). The 1.5 MiB app partition retains the
+margin reported by the build's own partition check. These figures include live
+storage, executor, fixture resolver, the HTTPS payload source and Composer
+activation objects but exclude runtime Wi-Fi/TLS heap use.
+The focused binary is 701793 B and ran on Espressif QEMU 9.2.2: all 343 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 176268 B
+(97.53%, 4468 B free, dominated by `.bss` test fixtures and real-NVS transaction
+buffers) and IRAM is 47715 B (36.40%). The combined image also booted through
+real NVS initialization with the five-entry network partition table. No broker
+or live HTTPS endpoint was accessed.
 
 ## Next integration step
 
-Provision a real device credential and capability-manifest ingestion, then route
-`apply_config` through `HttpsPayloadSource` while retaining
-`EmbeddedPayloadSource` for preset/offline tests. Replace the laboratory board
-profile with the first product board's reviewed slot/GPIO/current limits.
-Replace the provisional capability object with its canonical schema when EasyLED
-closes it, then exercise command/event/state retain, acknowledgement and reconnect
-behavior with an authorized broker.
+Provision a real device credential through platform flow #47, then exercise
+provisioned-mode `apply_config` against the deployed backend's own URL once
+that environment and its definitive MQTT topics/credentials exist (backend
+work tracked separately; issues #47 and #56-#61 remain open). Replace the
+laboratory board profile with the first product board's reviewed
+slot/GPIO/current limits. Replace the provisional capability object with its
+canonical schema when EasyLED closes it, then exercise command/event/state
+retain, acknowledgement and reconnect behavior with an authorized broker.
 Provisioning, heap/stack measurements under TLS load and
 broker-loss/render-continuity tests remain product work.
 

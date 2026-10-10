@@ -202,6 +202,20 @@ esp_err_t EspHttpPayloadClient::download(const HttpPayloadRequest &request,
     return cleanup;
 }
 
+bool validHttpsConfig(const HttpsPayloadSource::Config &config)
+{
+    const size_t token_size = config.bearer_token == nullptr ? 0 :
+        strnlen(config.bearer_token, HttpsPayloadSource::kMaxBearerTokenBytes + 1);
+    if (token_size == 0 || token_size > HttpsPayloadSource::kMaxBearerTokenBytes) { return false; }
+    if (config.server_ca_pem != nullptr && config.server_ca_pem[0] == '\0') { return false; }
+    if (config.timeout_ms == 0 || config.timeout_ms > kMaximumHttpTimeoutMs) { return false; }
+    if (config.max_payload_bytes == 0 ||
+        config.max_payload_bytes > pixels_payload::kMaxPayloadBytes) {
+        return false;
+    }
+    return true;
+}
+
 HttpsPayloadSource::HttpsPayloadSource(HttpPayloadClient &client, const Config &config)
     : client_(client), config_(config)
 {
@@ -219,12 +233,8 @@ esp_err_t HttpsPayloadSource::resolve(
     if (command.type != pixels_firmware::CommandType::ApplyConfig) {
         return ESP_ERR_NOT_SUPPORTED;
     }
-    const size_t token_size = config_.bearer_token == nullptr ? 0 :
-        strnlen(config_.bearer_token, kMaxBearerTokenBytes + 1);
-    if (!command.has_checksum || !httpsUrl(command.resource_url) || token_size == 0 ||
-        token_size > kMaxBearerTokenBytes || config_.timeout_ms == 0 ||
-        config_.timeout_ms > kMaximumHttpTimeoutMs || config_.max_payload_bytes == 0 ||
-        config_.max_payload_bytes > pixels_payload::kMaxPayloadBytes || capacity == 0) {
+    if (!command.has_checksum || !httpsUrl(command.resource_url) || capacity == 0 ||
+        !validHttpsConfig(config_)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -253,6 +263,22 @@ esp_err_t HttpsPayloadSource::resolve(
     std::memcpy(expected_checksum, command.checksum, pixels_firmware::kSha256Bytes);
     size = result.size;
     return ESP_OK;
+}
+
+RoutedPayloadSource::RoutedPayloadSource(HttpsPayloadSource *https_source,
+                                         EmbeddedPayloadSource &embedded_source)
+    : https_source_(https_source), embedded_source_(embedded_source)
+{
+}
+
+esp_err_t RoutedPayloadSource::resolve(
+    const pixels_firmware::Command &command, char *buffer, size_t capacity,
+    size_t &size, uint8_t expected_checksum[pixels_firmware::kSha256Bytes])
+{
+    if (https_source_ != nullptr && command.type == pixels_firmware::CommandType::ApplyConfig) {
+        return https_source_->resolve(command, buffer, capacity, size, expected_checksum);
+    }
+    return embedded_source_.resolve(command, buffer, capacity, size, expected_checksum);
 }
 
 MqttEventSink::MqttEventSink(pixels_network::NetworkSession &session, const char *topic)

@@ -979,6 +979,114 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
     pixels_control::HttpPayloadResult invalid_result{};
     CHECK(idf_http.download(invalid_request, invalid_result) == ESP_ERR_INVALID_ARG);
 
+    // RoutedPayloadSource, provisioned mode: apply_config must reach HTTPS
+    // (never the embedded table, even though `source` above also has an
+    // apply_config entry of its own), and every other type must reach the
+    // embedded table without ever touching the HTTP fake -- the product's
+    // fixed, non-fallback routing.
+    static pixels_control::RoutedPayloadSource routed(&https_source, source);
+    CHECK(routed.provisioned());
+    const int routed_calls_before = http.calls;
+    command = pixels_firmware::Command{};
+    command.type = pixels_firmware::CommandType::ApplyConfig;
+    command.has_checksum = true;
+    std::strncpy(command.resource_url,
+                 "https://example.invalid/api/v1/devices/33333333-3333-3333-3333-333333333333/config/1",
+                 sizeof(command.resource_url) - 1);
+    std::memcpy(command.checksum, canonical_config_digest, sizeof(command.checksum));
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_OK &&
+          resolved_size == http.body_size && std::memcmp(resolved, http.body, http.body_size) == 0 &&
+          http.calls == routed_calls_before + 1);
+
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(activate_preset_command_provisional_json),
+                                        FIXTURE_SIZE(activate_preset_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_OK &&
+          resolved_size == FIXTURE_SIZE(preset_payload_provisional_json) &&
+          std::memcmp(resolved_digest, preset_digest, sizeof(resolved_digest)) == 0 &&
+          http.calls == routed_calls_before + 1); // unchanged -- the embedded table handled this, not HTTPS
+
+    // Provisioned mode, transport/403/checksum failure: the failure returns
+    // as-is and the embedded apply_config fixture is never substituted.
+    command = pixels_firmware::Command{};
+    command.type = pixels_firmware::CommandType::ApplyConfig;
+    command.has_checksum = true;
+    std::strncpy(command.resource_url,
+                 "https://example.invalid/api/v1/devices/33333333-3333-3333-3333-333333333333/config/1",
+                 sizeof(command.resource_url) - 1);
+    std::memcpy(command.checksum, canonical_config_digest, sizeof(command.checksum));
+    http.status_code = 403;
+    resolved_size = 99;
+    std::memset(resolved_digest, 0xa5, sizeof(resolved_digest));
+    // ESP_FAIL (not ESP_OK with substituted bytes) is itself the proof that
+    // this did not quietly succeed via the embedded table instead.
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_FAIL &&
+          resolved_size == 0 && resolved_digest[0] == 0);
+    http.error = ESP_ERR_TIMEOUT;
+    http.status_code = 200;
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_ERR_TIMEOUT && resolved_size == 0);
+    http.error = ESP_OK;
+    std::memcpy(command.checksum, canonical_config_digest, sizeof(command.checksum));
+    command.checksum[0] = static_cast<uint8_t>(command.checksum[0] ^ 0xff); // force a mismatch
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_ERR_INVALID_CRC && resolved_size == 0);
+
+    // Laboratory mode: a null HTTPS source means apply_config also resolves
+    // from the embedded table, and the HTTP fake is never touched.
+    static pixels_control::RoutedPayloadSource lab_routed(nullptr, source);
+    CHECK(!lab_routed.provisioned());
+    const int lab_calls_before = http.calls;
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
+                                        FIXTURE_SIZE(apply_config_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(lab_routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_OK &&
+          resolved_size == FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json) &&
+          std::memcmp(resolved, FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
+                      resolved_size) == 0 &&
+          http.calls == lab_calls_before);
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(activate_preset_command_provisional_json),
+                                        FIXTURE_SIZE(activate_preset_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(lab_routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_OK && http.calls == lab_calls_before);
+
+    // validHttpsConfig: boot-time rejection of a profile that claims
+    // provisioned mode (a non-null token) but is otherwise malformed, before
+    // any command is ever received.
+    pixels_control::HttpsPayloadSource::Config candidate{};
+    candidate.bearer_token = kTestToken;
+    candidate.server_ca_pem = kTestCa;
+    CHECK(pixels_control::validHttpsConfig(candidate)); // complete: the baseline for every mutation below
+    candidate.bearer_token = nullptr;
+    // validHttpsConfig itself does not distinguish null from empty -- both
+    // fail. The application layer draws that line (null = laboratory mode,
+    // never even reaching this check; empty = an incomplete claimed profile).
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.bearer_token = "";
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    static char oversized_token[pixels_control::HttpsPayloadSource::kMaxBearerTokenBytes + 2];
+    std::memset(oversized_token, 'a', sizeof(oversized_token) - 1);
+    oversized_token[sizeof(oversized_token) - 1] = '\0';
+    candidate.bearer_token = oversized_token;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.bearer_token = kTestToken;
+    candidate.server_ca_pem = "";
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.server_ca_pem = kTestCa;
+    candidate.timeout_ms = 0;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.timeout_ms = 60001;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.timeout_ms = 10000;
+    candidate.max_payload_bytes = 0;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.max_payload_bytes = pixels_payload::kMaxPayloadBytes + 1;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
+    CHECK(pixels_control::validHttpsConfig(candidate)); // every mutation reverted -- complete again
+
     char timestamp[36]{};
     pixels_control::UtcTimestampSource timestamps;
     timestamps.now(timestamp);

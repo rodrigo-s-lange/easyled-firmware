@@ -145,6 +145,53 @@ private:
     Config config_{};
 };
 
+/// Checks whether a Config is complete enough to attempt HTTPS resolution at
+/// all: bearer token present, non-empty and bounded; an explicitly supplied
+/// CA is non-empty; timeout and max payload within supported bounds. Pure
+/// and network-free -- intended for boot-time rejection of a profile that
+/// supplies a token (claims provisioned/production mode) but is otherwise
+/// malformed, before any command is ever received. HttpsPayloadSource::resolve()
+/// re-applies the same bounds per request; this is not a relaxed pre-check.
+/// @param config Candidate configuration.
+/// @return True only when every field is individually well-formed.
+bool validHttpsConfig(const HttpsPayloadSource::Config &config);
+
+/// Routes `apply_config` to the authenticated HTTPS resolver in provisioned
+/// mode, or to the embedded resource table in laboratory mode; every other
+/// command type (currently only `activate_preset`) always goes to the
+/// embedded table -- the product's own policy for "HTTPS owns config once
+/// provisioned; presets remain embedded until the platform publishes its
+/// second download contract package." Neither mode falls back to the other
+/// at request time: a download/checksum/transport failure in provisioned
+/// mode is returned to the executor as-is, never retried against the
+/// embedded table. The mode itself is fixed for this object's lifetime --
+/// set once at construction from a boot-time decision, never toggled at
+/// runtime by a request outcome.
+class RoutedPayloadSource final : public pixels_executor::PayloadSource {
+public:
+    /// Binds the resolvers this source dispatches between.
+    /// @param https_source Provisioned mode when non-null (owns apply_config
+    ///        exclusively); nullptr selects laboratory mode, where
+    ///        embedded_source also serves apply_config. Must outlive this
+    ///        object when non-null.
+    /// @param embedded_source Owns every other command type always, and
+    ///        apply_config too in laboratory mode. Must outlive this object.
+    RoutedPayloadSource(HttpsPayloadSource *https_source, EmbeddedPayloadSource &embedded_source);
+
+    /// True when this instance is in provisioned mode (constructed with a
+    /// non-null https_source).
+    bool provisioned() const { return https_source_ != nullptr; }
+
+    /// Dispatches by `command.type` and the fixed mode; see class comment.
+    esp_err_t resolve(const pixels_firmware::Command &command, char *buffer, size_t capacity,
+                      size_t &size,
+                      uint8_t expected_checksum[pixels_firmware::kSha256Bytes]) override;
+
+private:
+    HttpsPayloadSource *https_source_ = nullptr;
+    EmbeddedPayloadSource &embedded_source_;
+};
+
 /// Publishes executor events through the application-owned MQTT session.
 class MqttEventSink final : public pixels_executor::EventSink {
 public:

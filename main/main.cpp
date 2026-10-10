@@ -38,6 +38,22 @@ struct ApplicationConfig {
     const char *firmware_version = nullptr;
     const char *event_topic = nullptr;
     const char *state_topic = nullptr;
+    /// A non-null token is this profile's claim to provisioned/production
+    /// mode: apply_config then resolves over HTTPS exclusively, with no
+    /// embedded fallback on any failure. Null selects laboratory mode
+    /// instead, where apply_config resolves from the embedded fixture --
+    /// never a silent downgrade, only ever this device's own explicit choice.
+    const char *https_bearer_token = nullptr;
+    /// Null selects the ESP-IDF certificate bundle (the default for a
+    /// platform-issued server certificate); set only for a pinned/private CA.
+    /// Ignored in laboratory mode.
+    const char *https_server_ca_pem = nullptr;
+    /// Zero selects HttpsPayloadSource::Config's own default (10 s). Ignored
+    /// in laboratory mode.
+    uint32_t https_timeout_ms = 0;
+    /// Zero selects HttpsPayloadSource::Config's own default
+    /// (pixels_payload::kMaxPayloadBytes). Ignored in laboratory mode.
+    size_t https_max_payload_bytes = 0;
 };
 
 // An optional, gitignored application profile supplies applicationConfig().
@@ -96,6 +112,24 @@ bool validVersion(const char *value)
 uint32_t boundedU32(size_t value)
 {
     return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value);
+}
+
+enum class HttpsProfileState {
+    Absent,     // no bearer token -- laboratory mode, not an error
+    Incomplete, // a token is present (claims provisioned mode) but the rest is malformed
+    Complete,   // provisioned mode, ready to construct HttpsPayloadSource
+};
+
+HttpsProfileState httpsProfileState(const ApplicationConfig &config,
+                                    pixels_control::HttpsPayloadSource::Config &out)
+{
+    if (config.https_bearer_token == nullptr) { return HttpsProfileState::Absent; }
+    out.bearer_token = config.https_bearer_token;
+    out.server_ca_pem = config.https_server_ca_pem;
+    if (config.https_timeout_ms != 0) { out.timeout_ms = config.https_timeout_ms; }
+    if (config.https_max_payload_bytes != 0) { out.max_payload_bytes = config.https_max_payload_bytes; }
+    return pixels_control::validHttpsConfig(out) ? HttpsProfileState::Complete
+                                                  : HttpsProfileState::Incomplete;
 }
 
 pixels_firmware::CapabilityManifest capabilityManifest(
@@ -214,6 +248,10 @@ extern "C" void app_main()
         ESP_LOGE(kTag, "embedded resource digest is invalid");
         return;
     }
+    // Always available: the embedded apply_config fixture backs laboratory
+    // mode (no HTTPS credential configured), and the preset fixture backs
+    // activate_preset in every mode until the platform publishes its second
+    // download contract package.
     static const pixels_control::EmbeddedResource resources[] = {
         {pixels_firmware::CommandType::ApplyConfig, kFixtureConfigUrl,
          fixtureBytes(config_payload_bench_gpio16_50_provisional_json_start),
@@ -226,7 +264,7 @@ extern "C" void app_main()
                      preset_payload_provisional_json_end),
          preset_digest},
     };
-    static pixels_control::EmbeddedPayloadSource payload_source(
+    static pixels_control::EmbeddedPayloadSource embedded_source(
         resources, sizeof(resources) / sizeof(resources[0]));
     static pixels_control::DurableActiveProbe active_probe(staging);
 
@@ -242,6 +280,24 @@ extern "C" void app_main()
         ESP_LOGE(kTag, "local control identity/topic is invalid");
         return;
     }
+
+    static pixels_control::HttpsPayloadSource::Config https_config{};
+    const HttpsProfileState https_state = httpsProfileState(config, https_config);
+    if (https_state == HttpsProfileState::Incomplete) {
+        // Rendering/local recovery stay independent of network availability
+        // (AGENTS.md): restored pixels remain active, only networking (and
+        // therefore any config/preset delivery) is refused.
+        ESP_LOGE(kTag, "HTTPS profile claims provisioned mode but is incomplete; refusing to start"
+                       " networking (never silently downgrading a claimed-production device to"
+                       " laboratory mode)");
+        return;
+    }
+    static pixels_control::EspHttpPayloadClient http_client;
+    static pixels_control::HttpsPayloadSource https_source(http_client, https_config);
+    const bool provisioned = https_state == HttpsProfileState::Complete;
+    ESP_LOGI(kTag, "apply_config mode: %s", provisioned ? "provisioned (HTTPS)" : "laboratory (embedded)");
+    static pixels_control::RoutedPayloadSource payload_source(
+        provisioned ? &https_source : nullptr, embedded_source);
 
     static pixels_control::MqttEventSink event_sink(session, config.event_topic);
     static pixels_control::MqttTelemetrySink telemetry_sink(
