@@ -1159,6 +1159,253 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
           !pixel_runtime.ledmap().configured && pixel_runtime.scene().brightness == 0);
 }
 
+// =========================================================================
+// NetworkSession: deterministic MQTT connect/subscribe/publish-ack/reconnect
+// lifecycle, driven entirely through the public event() test seam (see its
+// own doc comment in network_session.hpp). No real Wi-Fi, broker or MQTT
+// task exists anywhere below -- init() is called and start() never is, and
+// every esp_mqtt_event_t is hand-built. esp_mqtt_client_subscribe() itself
+// requires a real completed broker handshake to return a valid id, which
+// this fake transport cannot provide, so setSubscribeOverrideForTest()
+// substitutes a deterministic id generator for the SUBSCRIBE call only;
+// esp_mqtt_client_enqueue() (publish()'s own SDK call) has no such gate and
+// runs for real, unmodified.
+// =========================================================================
+int g_fake_subscribe_next_id = 100;
+int fakeSubscribe(const char *, int) { return g_fake_subscribe_next_id++; }
+
+esp_mqtt_event_t subackEvent(int msg_id, uint8_t &grant_byte)
+{
+    esp_mqtt_event_t ev{};
+    ev.msg_id = msg_id;
+    ev.data = reinterpret_cast<char *>(&grant_byte);
+    ev.data_len = 1;
+    return ev;
+}
+
+esp_mqtt_event_t publishedEvent(int msg_id)
+{
+    esp_mqtt_event_t ev{};
+    ev.msg_id = msg_id;
+    return ev;
+}
+
+esp_mqtt_event_t dataEvent(const char *topic, const char *payload, bool retain = false)
+{
+    esp_mqtt_event_t ev{};
+    ev.topic = const_cast<char *>(topic);
+    ev.topic_len = static_cast<int>(std::strlen(topic));
+    ev.data = const_cast<char *>(payload);
+    ev.data_len = static_cast<int>(std::strlen(payload));
+    ev.current_data_offset = 0;
+    ev.total_data_len = ev.data_len;
+    ev.retain = retain;
+    return ev;
+}
+
+void runNetworkSessionChecks(pixels_network::NetworkSession &session)
+{
+    using Ack = pixels_network::NetworkSession::PublishAck;
+    static constexpr char kCommandTopic[] =
+        "devices/11111111-1111-4111-8111-111111111111/commands";
+    static constexpr char kStateTopic[] =
+        "devices/11111111-1111-4111-8111-111111111111/state";
+    static constexpr char kEventTopic[] =
+        "devices/11111111-1111-4111-8111-111111111111/events";
+    pixels_network::NetworkSession::Config cfg{};
+    cfg.ssid = "validation-ssid";
+    cfg.wifi_password = "validation-password";
+    cfg.broker_uri = "wss://broker.invalid/mqtt";
+    cfg.client_id = "validation-client";
+    cfg.username = "validation-user";
+    cfg.password = "validation-password";
+    cfg.command_topic = kCommandTopic;
+
+    CHECK(session.init(cfg) == ESP_OK);
+    session.setSubscribeOverrideForTest(fakeSubscribe);
+    static pixels_control::MqttTelemetrySink telemetry(session, kStateTopic, kEventTopic);
+
+    // --- CONNECTED -> rejected SUBACK, then downgraded SUBACK: neither
+    // leaves the session ready to publish or receive commands. -----------
+    esp_mqtt_event_t connected_event{};
+    session.event(MQTT_EVENT_CONNECTED, connected_event);
+    const int subscribe_id_1 = g_fake_subscribe_next_id - 1;
+    uint8_t rejected = 0x80;
+    auto suback_rejected = subackEvent(subscribe_id_1, rejected);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_rejected);
+    CHECK(!session.status().subscribed && session.status().connections == 1 &&
+          session.status().transport_errors == 1);
+
+    session.event(MQTT_EVENT_CONNECTED, connected_event);
+    const int subscribe_id_2 = g_fake_subscribe_next_id - 1;
+    uint8_t downgraded = 0; // granted qos0, not the requested qos1
+    auto suback_downgraded = subackEvent(subscribe_id_2, downgraded);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_downgraded);
+    CHECK(!session.status().subscribed && session.status().connections == 2 &&
+          session.status().transport_errors == 2);
+    // A late SUBACK from the first, already-superseded subscribe attempt
+    // must not retroactively grant readiness.
+    uint8_t late_grant = 1;
+    auto suback_stale = subackEvent(subscribe_id_1, late_grant);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_stale);
+    CHECK(!session.status().subscribed);
+
+    // --- CONNECTED -> SUBACK granted -> ready. ---------------------------
+    session.event(MQTT_EVENT_CONNECTED, connected_event);
+    const int subscribe_id_3 = g_fake_subscribe_next_id - 1;
+    uint8_t granted = 1;
+    auto suback_granted = subackEvent(subscribe_id_3, granted);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_granted);
+    CHECK(session.status().subscribed && session.status().connections == 3);
+
+    // --- Bounded publish-ack tracking: a 9th publish evicts the oldest of
+    // 8 tracked slots, which then surfaces as Unknown. ---------------------
+    int ring_ids[9];
+    for (int i = 0; i < 9; ++i) {
+        ring_ids[i] = session.publish(kStateTopic, "x", 1);
+        CHECK(ring_ids[i] >= 0);
+    }
+    CHECK(session.publishStatus(ring_ids[0]) == Ack::Unknown);
+    CHECK(session.publishStatus(ring_ids[8]) == Ack::Pending);
+
+    // --- Queue overflow: kQueueLength (2) complete command messages fill
+    // the bounded queue; a 3rd is dropped and counted, never blocking. -----
+    auto data1 = dataEvent(kCommandTopic, "{\"a\":1}");
+    auto data2 = dataEvent(kCommandTopic, "{\"a\":2}");
+    auto data3 = dataEvent(kCommandTopic, "{\"a\":3}");
+    session.event(MQTT_EVENT_DATA, data1);
+    session.event(MQTT_EVENT_DATA, data2);
+    CHECK(session.status().queue_overflows == 0);
+    session.event(MQTT_EVENT_DATA, data3);
+    CHECK(session.status().queue_overflows == 1);
+    pixels_network::NetworkSession::Message drained{};
+    CHECK(session.receive(drained) && drained.size == 7 &&
+          std::memcmp(drained.data, "{\"a\":1}", 7) == 0);
+    CHECK(session.receive(drained) && std::memcmp(drained.data, "{\"a\":2}", 7) == 0);
+    CHECK(!session.receive(drained)); // the dropped 3rd message was never queued
+
+    // --- enqueue -> PUBACK for a retained state publication, including a
+    // duplicate in-epoch PUBACK staying idempotently Acknowledged. ---------
+    pixels_firmware::StateReport state1{};
+    state1.device_id = kDeviceId;
+    state1.hardware_binding_id = kHardwareBindingId;
+    state1.generation = 1;
+    state1.boot_counter = 1;
+    state1.state_sequence = 1;
+    state1.reported_at = "2026-10-10T12:00:00Z";
+    state1.firmware_version = "0.1.0-dev";
+    state1.mode = pixels_firmware::DeviceMode::ConfigActive;
+    state1.config_version = 1;
+    state1.last_applied_command_id = kApplyCommandId;
+    int msg_id_state = -1;
+    CHECK(telemetry.publishState(state1, msg_id_state) == ESP_OK && msg_id_state >= 0);
+    CHECK(session.publishStatus(msg_id_state) == Ack::Pending);
+    const uint32_t acks_before_state = session.status().publish_acks;
+    auto published_state = publishedEvent(msg_id_state);
+    session.event(MQTT_EVENT_PUBLISHED, published_state);
+    CHECK(session.publishStatus(msg_id_state) == Ack::Acknowledged &&
+          session.status().publish_acks == acks_before_state + 1);
+    session.event(MQTT_EVENT_PUBLISHED, published_state); // duplicate, same epoch
+    CHECK(session.publishStatus(msg_id_state) == Ack::Acknowledged &&
+          session.status().publish_acks == acks_before_state + 1);
+
+    // --- enqueue -> PUBACK for a non-retained capability report, left
+    // Pending so the next step can exercise disconnect-before-PUBACK. ------
+    static constexpr uint8_t kLocalEffectIds[] = {0, 2};
+    pixels_firmware::CapabilityReport capability1{};
+    capability1.device_id = kDeviceId;
+    capability1.firmware_version = "0.1.0-dev";
+    capability1.reported_at = "2026-10-10T12:00:01Z";
+    capability1.capabilities.free_internal_heap_bytes = 100000;
+    capability1.capabilities.largest_internal_heap_block_bytes = 60000;
+    capability1.capabilities.max_output_slots = 2;
+    capability1.capabilities.max_pixels_per_output = 50;
+    capability1.capabilities.configured_output_count = 1;
+    capability1.capabilities.configured_total_pixels = 50;
+    capability1.capabilities.max_segments = 32;
+    capability1.capabilities.effect_ids = kLocalEffectIds;
+    capability1.capabilities.effect_count = sizeof(kLocalEffectIds);
+    capability1.capabilities.supports_ledmap = true;
+    capability1.capabilities.supports_2d = true;
+    capability1.capabilities.supports_mirror = true;
+    capability1.capabilities.custom_param_slots = 3;
+    capability1.capabilities.preset_cache_slots = 100;
+    int msg_id_cap = -1;
+    CHECK(telemetry.publishCapability(capability1, msg_id_cap) == ESP_OK && msg_id_cap >= 0);
+    CHECK(session.publishStatus(msg_id_cap) == Ack::Pending);
+
+    // --- Disconnect before that PUBACK arrives: the pending capability
+    // publication (and any further status lookup for it) becomes Unknown,
+    // never a false Acknowledged. ------------------------------------------
+    esp_mqtt_event_t disconnected_event{};
+    session.event(MQTT_EVENT_DISCONNECTED, disconnected_event);
+    CHECK(session.publishStatus(msg_id_cap) == Ack::Unknown);
+
+    // --- The render/control runtime has no dependency on MQTT connectivity:
+    // a scene renders correctly while this session sits disconnected. ------
+    {
+        static FakeSink disconnected_sink;
+        static esp_pixels_composer::Composer disconnected_composer;
+        esp_pixels_fx::FxParams parameters{};
+        parameters.color[0] = {9, 10, 11};
+        CHECK(disconnected_composer.build(disconnected_sink) == ESP_OK);
+        CHECK(disconnected_composer.addSegment(0, 50, esp_pixels_fx::FX_SOLID, parameters) == ESP_OK);
+        CHECK(disconnected_composer.renderFrame(2000) == ESP_OK);
+        CHECK(disconnected_sink.pixel(0).r == 9 && disconnected_sink.pixel(0).g == 10 &&
+              disconnected_sink.pixel(0).b == 11);
+        CHECK(disconnected_composer.end() == ESP_OK);
+    }
+
+    // --- A late PUBACK for that same pre-disconnect message id, arriving
+    // only now, must still not resurrect it as Acknowledged (stale epoch). -
+    auto late_published_cap = publishedEvent(msg_id_cap);
+    const uint32_t acks_before_late = session.status().publish_acks;
+    session.event(MQTT_EVENT_PUBLISHED, late_published_cap);
+    CHECK(session.publishStatus(msg_id_cap) == Ack::Unknown &&
+          session.status().publish_acks == acks_before_late);
+
+    // --- Enqueue rejection while disconnected (not yet resubscribed): the
+    // telemetry sink fails closed, consuming no message id, leaving the
+    // caller free to retry the identical state/capability revision. --------
+    int msg_id_rejected = -1;
+    CHECK(telemetry.publishState(state1, msg_id_rejected) == ESP_FAIL && msg_id_rejected == -1);
+
+    // --- Reconnect and resubscribe: a fresh CONNECTED/SUBACK cycle restores
+    // readiness with a new subscribe id; the superseded one from before the
+    // disconnect cannot leak through. --------------------------------------
+    session.event(MQTT_EVENT_CONNECTED, connected_event);
+    const int subscribe_id_4 = g_fake_subscribe_next_id - 1;
+    CHECK(subscribe_id_4 != subscribe_id_3);
+    uint8_t stale_grant = 1;
+    auto suback_stale_after_reconnect = subackEvent(subscribe_id_3, stale_grant);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_stale_after_reconnect);
+    CHECK(!session.status().subscribed);
+    uint8_t granted_again = 1;
+    auto suback_granted_again = subackEvent(subscribe_id_4, granted_again);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_granted_again);
+    CHECK(session.status().subscribed && session.status().connections == 4);
+
+    // --- State/capability retry after reconnect: the SAME revision (same
+    // state_sequence, same capability content) is re-enqueued under a new
+    // message id and now reaches Acknowledged -- no second durable sequence
+    // was needed to make it eligible for retry. -----------------------------
+    int msg_id_cap_retry = -1;
+    CHECK(telemetry.publishCapability(capability1, msg_id_cap_retry) == ESP_OK &&
+          msg_id_cap_retry >= 0 && msg_id_cap_retry != msg_id_cap);
+    auto published_cap_retry = publishedEvent(msg_id_cap_retry);
+    session.event(MQTT_EVENT_PUBLISHED, published_cap_retry);
+    CHECK(session.publishStatus(msg_id_cap_retry) == Ack::Acknowledged);
+
+    pixels_firmware::StateReport state1_retry = state1;
+    CHECK(state1_retry.state_sequence == state1.state_sequence);
+    int msg_id_state_retry = -1;
+    CHECK(telemetry.publishState(state1_retry, msg_id_state_retry) == ESP_OK &&
+          msg_id_state_retry >= 0 && msg_id_state_retry != msg_id_state);
+    auto published_state_retry = publishedEvent(msg_id_state_retry);
+    session.event(MQTT_EVENT_PUBLISHED, published_state_retry);
+    CHECK(session.publishStatus(msg_id_state_retry) == Ack::Acknowledged);
+}
+
 } // namespace
 
 extern "C" void app_main()
@@ -1339,6 +1586,7 @@ extern "C" void app_main()
 
     static pixels_network::NetworkSession network_probe;
     CHECK(!network_probe.status().running && !network_probe.status().wifi_connected);
+    runNetworkSessionChecks(network_probe);
     static_assert(esp_pixels_composer_adapter_esp_pixels::EspPixelsSink::kMaxOutputs == 2);
     CHECK(esp_pixels_fx::describe(esp_pixels_fx::FX_RAINBOW) != nullptr);
 

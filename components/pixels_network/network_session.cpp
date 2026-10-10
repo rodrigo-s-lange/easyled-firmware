@@ -30,6 +30,10 @@ esp_err_t NetworkSession::init(const Config &config)
         (config.wifi_password != nullptr && strnlen(config.wifi_password, 65) > 64)) {
         return ESP_ERR_INVALID_ARG;
     }
+    next_tracked_slot_ = 0;
+    connection_epoch_ = 1;
+    acknowledged_ = 0;
+    for (auto &slot : tracked_) { slot.state = 0; }
     esp_mqtt_client_config_t cfg{};
     cfg.broker.address.uri = config.broker_uri;
     if (config.server_ca_pem != nullptr) {
@@ -123,6 +127,9 @@ esp_err_t NetworkSession::stop()
         if (err != ESP_OK) { return err; }
         mqtt_started_ = false;
     }
+    // stop() is also a session boundary even when the SDK does not deliver a
+    // DISCONNECTED event (for example, a caller stopping an idle client).
+    ++connection_epoch_;
     reconnect_requested_ = false;
     incoming_.reset(); // MQTT task has stopped before accessing its buffer.
     if (messages_ != nullptr) { xQueueReset(messages_); }
@@ -140,16 +147,61 @@ esp_err_t NetworkSession::end()
     vQueueDelete(messages_);
     messages_ = nullptr;
     config_ = Config{};
+    subscribe_override_ = nullptr;
+    for (auto &slot : tracked_) { slot.state = 0; }
     return ESP_OK;
+}
+
+uint32_t NetworkSession::trackedState(int msg_id, uint32_t epoch, bool acknowledged)
+{
+    return (static_cast<uint32_t>(msg_id) & kTrackedIdMask) |
+        ((epoch & kTrackedEpochMask) << 16) |
+        (acknowledged ? kTrackedAcknowledged : 0u);
 }
 
 int NetworkSession::publish(const char *destination, const char *payload, size_t size, bool retained)
 {
-    if (!running_.load() || !subscribed_.load() || !topic(destination) ||
+    // subscribed_ alone gates this: it can only be true after a real
+    // CONNECTED+granted-SUBACK sequence, which in production never happens
+    // without running_ also being true. Not also requiring running_ here
+    // lets a test drive the state machine through event() alone (see its
+    // own comment) without a real start()/Wi-Fi.
+    const uint32_t enqueue_epoch = connection_epoch_.load();
+    if (!subscribed_.load() || !topic(destination) ||
         size > kMaxMessageBytes || (payload == nullptr && size != 0)) { return -1; }
     // ESP-MQTT interprets len=0 as strlen(data); null explicitly means empty.
-    return esp_mqtt_client_enqueue(client_, destination, size == 0 ? nullptr : payload, static_cast<int>(size),
-                                   1, retained ? 1 : 0, true);
+    const int msg_id = esp_mqtt_client_enqueue(client_, destination, size == 0 ? nullptr : payload,
+                                               static_cast<int>(size), 1, retained ? 1 : 0, true);
+    if (msg_id > 0) {
+        TrackedPublish &slot = tracked_[next_tracked_slot_];
+        next_tracked_slot_ = (next_tracked_slot_ + 1) % kMaxTrackedPublishes;
+        // Capture the epoch from before enqueue. If a disconnect races the
+        // SDK call, current_epoch will already differ when the caller asks
+        // for status, so this publication correctly becomes Unknown.
+        slot.state.store(trackedState(msg_id, enqueue_epoch, false));
+    }
+    return msg_id;
+}
+
+void NetworkSession::setSubscribeOverrideForTest(int (*subscribe)(const char *topic, int qos))
+{
+    subscribe_override_ = subscribe;
+}
+
+NetworkSession::PublishAck NetworkSession::publishStatus(int msg_id) const
+{
+    if (msg_id < 0) { return PublishAck::Unknown; }
+    const uint32_t current_epoch = connection_epoch_.load() & kTrackedEpochMask;
+    for (const auto &slot : tracked_) {
+        const uint32_t state = slot.state.load();
+        if ((state & kTrackedIdMask) != (static_cast<uint32_t>(msg_id) & kTrackedIdMask) ||
+            ((state >> 16) & kTrackedEpochMask) != current_epoch) {
+            continue;
+        }
+        return (state & kTrackedAcknowledged) != 0
+            ? PublishAck::Acknowledged : PublishAck::Pending;
+    }
+    return PublishAck::Unknown;
 }
 
 bool NetworkSession::receive(Message &message)
@@ -160,7 +212,8 @@ bool NetworkSession::receive(Message &message)
 NetworkSession::Status NetworkSession::status() const
 {
     return {running_.load(), esp32libfun::wifi.isConnected(), subscribed_.load(),
-            connections_.load(), rejected_.load(), overflow_.load(), errors_.load()};
+            connections_.load(), rejected_.load(), overflow_.load(), errors_.load(),
+            acknowledged_.load()};
 }
 
 void NetworkSession::onEvent(void *arg, esp_event_base_t, int32_t id, void *data)
@@ -172,13 +225,19 @@ void NetworkSession::onEvent(void *arg, esp_event_base_t, int32_t id, void *data
 
 void NetworkSession::event(int32_t id, esp_mqtt_event_t &event)
 {
-    if (!running_.load()) { return; }
+    // client_ (not running_) is the guard: it is false only before init()
+    // or after end(), so a test may drive this state machine via init()
+    // alone, with no real start()/Wi-Fi. In production the callback is
+    // registered in init() and only ever fires while client_ is non-null.
+    if (client_ == nullptr) { return; }
     switch (id) {
     case MQTT_EVENT_CONNECTED:
         ++connections_;
         subscribed_ = false;
         incoming_.reset();
-        subscribe_id_ = esp_mqtt_client_subscribe(client_, config_.command_topic, 1);
+        subscribe_id_ = subscribe_override_ != nullptr
+            ? subscribe_override_(config_.command_topic, 1)
+            : esp_mqtt_client_subscribe(client_, config_.command_topic, 1);
         if (subscribe_id_ < 0) { reconnect_requested_ = true; }
         break;
     case MQTT_EVENT_SUBSCRIBED:
@@ -196,10 +255,36 @@ void NetworkSession::event(int32_t id, esp_mqtt_event_t &event)
         subscribed_ = false;
         subscribe_id_ = -1;
         incoming_.reset();
+        // Any publish tracked before this point becomes Unknown to
+        // publishStatus() regardless of whether the SDK's own outbox still
+        // holds and eventually redelivers it -- the application decides
+        // whether/how to retry rather than this session guessing.
+        ++connection_epoch_;
         break;
     case MQTT_EVENT_ERROR:
         ++errors_;
         break;
+    case MQTT_EVENT_PUBLISHED:
+    {
+        // PUBACK belongs to the current connection only. A single-word CAS
+        // makes a duplicate idempotent and cannot acknowledge a slot while
+        // publish() is atomically replacing it.
+        const uint32_t current_epoch = connection_epoch_.load() & kTrackedEpochMask;
+        for (auto &slot : tracked_) {
+            uint32_t state = slot.state.load();
+            while ((state & kTrackedIdMask) ==
+                       (static_cast<uint32_t>(event.msg_id) & kTrackedIdMask) &&
+                   ((state >> 16) & kTrackedEpochMask) == current_epoch) {
+                if ((state & kTrackedAcknowledged) != 0) { break; }
+                if (slot.state.compare_exchange_weak(
+                        state, state | kTrackedAcknowledged)) {
+                    ++acknowledged_;
+                    return;
+                }
+            }
+        }
+        break;
+    }
     case MQTT_EVENT_DATA: {
         if (!subscribed_.load() || event.retain) {
             incoming_.reset();

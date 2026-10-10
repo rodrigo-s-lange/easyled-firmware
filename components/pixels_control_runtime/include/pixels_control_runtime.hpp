@@ -222,15 +222,21 @@ public:
     MqttTelemetrySink(pixels_network::NetworkSession &session, const char *state_topic,
                       const char *event_topic);
 
-    /// Serializes and enqueues retained current state at QoS1.
+    /// Serializes and enqueues retained current state at QoS1. Enqueue
+    /// success (ESP_OK) is not delivery proof -- poll
+    /// NetworkSession::publishStatus(msg_id) for the broker's PUBACK before
+    /// considering this state revision actually delivered.
     /// @param state Current device truth.
+    /// @param msg_id Receives the enqueued message ID on ESP_OK only, -1 otherwise.
     /// @return ESP_OK, a serialization error, or ESP_FAIL when MQTT rejects it.
-    esp_err_t publishState(const pixels_firmware::StateReport &state);
+    esp_err_t publishState(const pixels_firmware::StateReport &state, int &msg_id);
 
-    /// Serializes and enqueues a non-retained capability_reported event at QoS1.
+    /// Serializes and enqueues a non-retained capability_reported event at
+    /// QoS1. Same PUBACK caveat as publishState().
     /// @param report Current capability measurement.
+    /// @param msg_id Receives the enqueued message ID on ESP_OK only, -1 otherwise.
     /// @return ESP_OK, a serialization error, or ESP_FAIL when MQTT rejects it.
-    esp_err_t publishCapability(const pixels_firmware::CapabilityReport &report);
+    esp_err_t publishCapability(const pixels_firmware::CapabilityReport &report, int &msg_id);
 
 private:
     pixels_network::NetworkSession &session_;

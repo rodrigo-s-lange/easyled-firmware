@@ -324,8 +324,18 @@ extern "C" void app_main()
     int64_t next_state_attempt_us = 0;
     int64_t next_capability_attempt_us = 0;
     bool capability_due = false;
+    // An enqueue (ESP_OK from publishState/publishCapability) starts
+    // tracking, not completion: these stay set until NetworkSession::
+    // publishStatus() reports the broker's PUBACK (success) or Unknown
+    // (disconnect/eviction -- retry the *same* pending sequence/report, no
+    // new durable state sequence is allocated for an unacknowledged resend).
+    int pending_state_msg_id = -1;
+    int64_t pending_state_sent_us = 0;
+    int pending_capability_msg_id = -1;
+    int64_t pending_capability_sent_us = 0;
     constexpr int64_t kRetryIntervalUs = 5LL * 1000 * 1000;
     constexpr int64_t kCapabilityIntervalUs = 60LL * 60 * 1000 * 1000;
+    constexpr int64_t kPublishAckTimeoutUs = kRetryIntervalUs; // give up waiting for a slow PUBACK after this
     static pixels_network::NetworkSession::Message message;
     static pixels_firmware::TerminalRecord existing_terminal;
     for (;;) {
@@ -372,7 +382,21 @@ extern "C" void app_main()
         }
 
         const int64_t now_us = esp_timer_get_time();
-        if (ready && state_revision != published_state_revision && now_us >= next_state_attempt_us) {
+        if (ready && pending_state_msg_id >= 0) {
+            const auto ack = session.publishStatus(pending_state_msg_id);
+            if (ack == pixels_network::NetworkSession::PublishAck::Acknowledged) {
+                published_state_revision = pending_state_revision;
+                pending_state_sequence = 0;
+                pending_state_msg_id = -1;
+            } else if (ack == pixels_network::NetworkSession::PublishAck::Unknown ||
+                       now_us - pending_state_sent_us > kPublishAckTimeoutUs) {
+                // Lost track (disconnect/eviction) or the broker is simply
+                // slow: retry below with the SAME pending_state_sequence.
+                pending_state_msg_id = -1;
+            }
+        }
+        if (ready && state_revision != published_state_revision && pending_state_msg_id < 0 &&
+            now_us >= next_state_attempt_us) {
             if (pending_state_sequence == 0 || pending_state_revision != state_revision) {
                 pending_state_sequence = 0;
                 const esp_err_t sequence_err = telemetry_state.nextStateSequence(
@@ -410,11 +434,12 @@ extern "C" void app_main()
                     } else if (active.active) {
                         report.mode = pixels_firmware::DeviceMode::ConfigActive;
                     }
-                    err = telemetry_sink.publishState(report);
+                    int msg_id = -1;
+                    err = telemetry_sink.publishState(report, msg_id);
+                    if (err == ESP_OK) { pending_state_msg_id = msg_id; }
                 }
                 if (err == ESP_OK) {
-                    published_state_revision = pending_state_revision;
-                    pending_state_sequence = 0;
+                    pending_state_sent_us = now_us; // wait for PUBACK; see the check above
                 } else {
                     ESP_LOGW(kTag, "state publish deferred: %s", esp_err_to_name(err));
                     next_state_attempt_us = now_us + kRetryIntervalUs;
@@ -424,7 +449,19 @@ extern "C" void app_main()
             }
         }
 
-        if (ready && (capability_due || now_us >= next_capability_attempt_us)) {
+        if (ready && pending_capability_msg_id >= 0) {
+            const auto ack = session.publishStatus(pending_capability_msg_id);
+            if (ack == pixels_network::NetworkSession::PublishAck::Acknowledged) {
+                pending_capability_msg_id = -1;
+                next_capability_attempt_us = now_us + kCapabilityIntervalUs;
+            } else if (ack == pixels_network::NetworkSession::PublishAck::Unknown ||
+                       now_us - pending_capability_sent_us > kPublishAckTimeoutUs) {
+                pending_capability_msg_id = -1;
+                capability_due = true; // retry; no durable state is at stake here, just re-enqueue
+            }
+        }
+        if (ready && pending_capability_msg_id < 0 &&
+            (capability_due || now_us >= next_capability_attempt_us)) {
             char reported_at[36]{};
             timestamp_source.now(reported_at);
             pixels_firmware::CapabilityReport report{};
@@ -432,10 +469,12 @@ extern "C" void app_main()
             report.firmware_version = config.firmware_version;
             report.reported_at = reported_at;
             report.capabilities = capabilityManifest(pixel_runtime.sink());
-            err = telemetry_sink.publishCapability(report);
+            int msg_id = -1;
+            err = telemetry_sink.publishCapability(report, msg_id);
             if (err == ESP_OK) {
+                pending_capability_msg_id = msg_id;
+                pending_capability_sent_us = now_us;
                 capability_due = false;
-                next_capability_attempt_us = now_us + kCapabilityIntervalUs;
             } else {
                 ESP_LOGW(kTag, "capability publish deferred: %s", esp_err_to_name(err));
                 capability_due = true;

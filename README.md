@@ -43,14 +43,25 @@ to **1.1.0** through its component manifest.
   has supplied a plausible clock; the example starts SNTP after obtaining an IP.
 - Every MQTT connection subscribes again to one exact command topic. The session
   becomes ready after the broker grants QoS1. Rejected/downgraded subscriptions
-  request another connection attempt.
+  request another connection attempt; a SUBACK for a superseded subscribe
+  attempt (from before a disconnect/reconnect) is ignored.
 - Incoming fragments are assembled before delivery. Payloads are limited to
   1024 bytes, with a queue for two complete messages. Malformed/oversized messages,
   retained deliveries and other topics are rejected. A full queue drops the new
   message and increments `queue_overflows`; this is not durable command delivery.
 - Outgoing messages use QoS1 enqueue with a 4096-byte SDK outbox limit. A negative
-  return means the publication was not accepted. A message ID confirms enqueue,
-  not broker acknowledgement or successful command execution.
+  return means the publication was not accepted. A nonnegative message ID confirms
+  enqueue only, never broker acknowledgement or successful command execution --
+  call `publishStatus(msg_id)` for the broker's QoS1 PUBACK. It tracks the 8 most
+  recently enqueued message IDs; an older unacknowledged one can be evicted by
+  newer publishes, and any disconnect observed after an ID was enqueued also
+  surfaces it as `Unknown` from then on, even if the SDK's own outbox still holds
+  and later redelivers it. `Unknown` and `Pending` both mean "not yet confirmed
+  delivered"; the caller decides whether and how to retry. This session makes no
+  retry decision itself and consumes no second durable sequence number for a
+  retried revision. The product enables ESP-MQTT's incremental packet IDs so the
+  bounded tracker never has to disambiguate two live QoS1 publications that were
+  assigned the same random ID -- see "Integrated control runtime" below.
 - MQTT callbacks never execute product actions. The application receives complete
   bytes, including their length, and owns parsing, validation and deduplication.
   MQTT QoS1 may deliver duplicates; application acknowledgements and retry policy
@@ -188,13 +199,31 @@ complete MQTT commands and calls `Executor::execute()`; no product action runs
 inside an MQTT callback. Events are published non-retained with QoS1 through the
 configured exact event topic and timestamps come from the SNTP-derived UTC clock.
 After subscription, the runtime publishes one retained QoS1 state document on
-the exact state topic. It publishes again after each successful command and
-retries enqueue failures without consuming another sequence number. The state
+the exact state topic, and again after each successful command. A state
+revision counts as delivered only once `NetworkSession::publishStatus()`
+reports the broker's PUBACK for that exact enqueue -- not merely a nonnegative
+`esp_mqtt_client_enqueue()` return. Enqueue rejection, a disconnect before the
+PUBACK arrives, or no PUBACK within 5 seconds all leave the revision pending
+and eligible for retry on the next loop iteration, re-enqueued under a new
+message ID without allocating another `state_sequence`; a late PUBACK for a
+superseded enqueue cannot be mistaken for the current one, because tracking is
+also invalidated by any disconnect observed since that enqueue. The state
 contains durable boot/state counters, active config/preset identity and the last
 applied command. `capability_reported` uses the event topic, QoS1 without retain,
-once after subscription and every 60 minutes. Its measured heap/PSRAM and output
-topology accompany supported effect IDs 0..21, ledmap/2D/mirror/custom support and
-the 100-slot disposable local preset cache.
+once after subscription and every 60 minutes, with the same PUBACK-gated
+retry. Its measured heap/PSRAM and output topology accompany supported effect
+IDs 0..21, ledmap/2D/mirror/custom support and the 100-slot disposable local
+preset cache.
+
+This PUBACK gate proves only that *this device's* broker TCP/TLS session
+accepted the publication at the protocol level. It is not evidence that
+EasyLED's backend ever persisted or reconciled that state/capability revision,
+that a command's `command_applied`/`command_failed` event was durably
+ingested, or that the backend's own view of device state converged after a
+broker-side redelivery or an overlapping revision from the same device.
+That backend-side reconciliation is tracked separately as EasyLED issues
+#58/#59 and is unimplemented here; this firmware only tracks broker delivery
+of its own most recent publications.
 
 `TransactionalPixelActivationTarget` reparses persisted bytes on every
 activation, resolves logical output slots through an immutable local board
@@ -405,6 +434,30 @@ content type, oversize and checksum failures. It does **not** open a network
 connection or validate a live TLS peer, broker permissions or physical flash
 failure.
 
+`NetworkSession`'s connect/subscribe/publish-ack/reconnect state machine is
+exercised the same way, through its public `event()` test seam: a session is
+`init()`-ed (never `start()`-ed, so no real Wi-Fi task runs) and hand-built
+`esp_mqtt_event_t` structs are fed directly to `event()`, with
+`setSubscribeOverrideForTest()` substituting a deterministic ID generator for
+the one SDK call (`esp_mqtt_client_subscribe()`) that requires an actually
+-established broker connection to succeed. This covers, in one scripted
+lifecycle: rejected and downgraded SUBACK (not ready), a stale SUBACK from a
+superseded attempt, granted SUBACK (ready), bounded publish-ack tracking
+(a 9th publish evicts the oldest of 8 tracked IDs), command-queue overflow
+(a 3rd complete message is dropped and counted, the first two still FIFO-
+correct), enqueue-to-PUBACK for both retained state and non-retained
+capability publications (including an idempotent duplicate in-epoch PUBACK),
+disconnect before a PUBACK arrives, a late PUBACK after that disconnect still
+reporting `Unknown` rather than a false `Acknowledged`, enqueue rejection
+while disconnected, reconnect with a fresh subscribe ID that rejects a stale
+one from before the disconnect, and retrying the same state/capability
+revision after reconnect without a new sequence number. A render frame is
+produced successfully while the session sits disconnected, proving the
+render/control path has no dependency on MQTT connectivity. None of this
+opens a socket, a TLS context or a real FreeRTOS MQTT task; it does not
+exercise ESP-MQTT's own TCP/TLS reconnection timing, backoff or outbox
+persistence across a real connection loss.
+
 ```powershell
 cd validation
 idf.py -B build -D IDF_TARGET=esp32 build
@@ -414,7 +467,7 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build
 The script merges only a local emulated flash file, captures the result in
 `validation/build/qemu-validation.log`, and terminates QEMU
 after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
-marker is `NETWORK_CONTRACT_VALIDATION checks=321 failures=0 RESULT=ALL_PASS`.
+marker is `NETWORK_CONTRACT_VALIDATION checks=386 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
@@ -424,15 +477,18 @@ The validation target uses an ESP-IDF 8192 B main-task stack. Large candidates,
 fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
-Build verified with ESP-IDF 6.0.2: combined binary 1109252 B, static DRAM 73391 B
-(40.61%) and IRAM 90555 B (69.09%). The 1.5 MiB app partition retains the
+Build verified with ESP-IDF 6.0.2: combined image 1110092 B, static DRAM 73439 B
+(40.63%) and IRAM 90555 B (69.09%). The 1.5 MiB app partition retains the
 margin reported by the build's own partition check. These figures include live
-storage, executor, fixture resolver, the HTTPS payload source and Composer
-activation objects but exclude runtime Wi-Fi/TLS heap use.
-The focused binary is 701793 B and ran on Espressif QEMU 9.2.2: all 343 checks
-passed, with no assertion, watchdog or panic. Its static DRAM is 176268 B
-(97.53%, 4468 B free, dominated by `.bss` test fixtures and real-NVS transaction
-buffers) and IRAM is 47715 B (36.40%). The combined image also booted through
+storage, executor, fixture resolver, the HTTPS payload source, the bounded
+MQTT publish-ack tracking table and Composer activation objects but exclude
+runtime Wi-Fi/TLS heap use.
+The focused image is 725809 B and ran on Espressif QEMU 9.2.2: all 386 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 177740 B
+(98.34%, 2996 B free, dominated by `.bss` test fixtures and real-NVS transaction
+buffers) and IRAM is 48047 B (36.66%). DRAM headroom is now thin enough that a
+meaningfully larger validation scenario will need to trim existing static
+fixtures rather than simply add more. The combined image also booted through
 real NVS initialization with the five-entry network partition table. No broker
 or live HTTPS endpoint was accessed.
 
@@ -445,9 +501,16 @@ work tracked separately; issues #47 and #56-#61 remain open). Replace the
 laboratory board profile with the first product board's reviewed
 slot/GPIO/current limits. Replace the provisional capability object with its
 canonical schema when EasyLED closes it, then exercise command/event/state
-retain, acknowledgement and reconnect behavior with an authorized broker.
-Provisioning, heap/stack measurements under TLS load and
-broker-loss/render-continuity tests remain product work.
+retain, acknowledgement and reconnect behavior with an authorized broker --
+this firmware's PUBACK tracking (see "Integrated control runtime") has only
+been proven against synthesized events, never a real broker's TCP/TLS
+reconnect timing, backoff or outbox persistence across an actual connection
+loss. EasyLED backend-side reconciliation of delivered state/capability
+revisions and `command_applied`/`command_failed` events remains open as
+issues #58/#59; this firmware's PUBACK is evidence of broker delivery only,
+never of backend persistence. Provisioning, heap/stack measurements under TLS
+load and broker-loss/render-continuity tests against a real broker remain
+product work.
 
 Official references: [ESP-IDF 6.0.2 MQTT component migration](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32/api-reference/protocols/mqtt.html),
 [ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme),
