@@ -92,7 +92,7 @@ esp_err_t onHttpEvent(esp_http_client_event_t *event)
 bool sameOutput(const pixels_payload::OutputCandidate &left,
                 const pixels_payload::OutputCandidate &right)
 {
-    return left.gpio == right.gpio && left.pixel_count == right.pixel_count &&
+    return left.slot_index == right.slot_index && left.pixel_count == right.pixel_count &&
            left.order == right.order;
 }
 

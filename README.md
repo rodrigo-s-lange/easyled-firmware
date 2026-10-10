@@ -90,16 +90,18 @@ below supplies that policy without moving it into the framework core.
 `apply_config`/`activate_preset` payload bytes into a validated pixel
 candidate. It reuses `esp_pixels_fx::describe()` as the one effect catalog and
 `esp_pixels_composer::AtScene`/`SegmentSpec` as the one scene representation --
-never a second metadata or scene system. Supported subset: 1D segments only,
-`ledmap:null`/absent (a preset may omit `ledmap` entirely; a config payload
-must carry it), an empty `inputs`, one or two `digital_out` WS2812B outputs with
-`reversed:false`, output-capable non-reserved ESP32 GPIOs (unique across slots),
+never a second metadata or scene system. Config payloads accept 1D segments and
+version-1 ledmaps with 2D `{x,y,w,h}` regions, including effects whose work
+buffers are allocated by Composer. Presets remain 1D until activation receives
+the active canvas context. The adapter accepts an empty `inputs`, one or two
+logical `digital_out` WS2812B slots with `reversed:false`; GPIO binding belongs
+to the application board profile and is never trusted from remote JSON. It accepts
 strict `#RRGGBB` segment colors, `replace`/`add`/`alpha`
 blend names, and segments addressed by `segment_index` (0..31, mapped to
-Composer id `segment_index + 1`). Config segments must fit inside the sum of
-the configured output pixel counts. A structurally valid but not-yet-implemented
-field (`is_2d:true`, a non-null `ledmap`, a non-empty `inputs`, a physical
-output `reversed:true`, a present segment `mirror`/`reversed`/`custom`/
+Composer id `segment_index + 1`). A ledmap validates version, dimensions, map
+length, holes, physical-index range and uniqueness. Config segments must fit the
+flat output span or mapped canvas. A structurally valid but not-yet-implemented
+field (a non-empty `inputs`, a physical output `reversed:true`, a present segment `mirror`/`reversed`/`custom`/
 `color_source` field regardless of value, an unregistered/dimension-mismatched
 `effect_id`, or a preset payload's own non-empty `outputs`) is rejected as
 `SchemaError::Unsupported`, never silently ignored. Unknown JSON members
@@ -182,7 +184,7 @@ retries enqueue failures without consuming another sequence number. The state
 contains durable boot/state counters, active config/preset identity and the last
 applied command. `capability_reported` uses the event topic, QoS1 without retain,
 once after subscription and every 60 minutes. Its measured heap/PSRAM and output
-topology accompany supported effect IDs 0..20, ledmap/2D/mirror/custom support and
+topology accompany supported effect IDs 0..21, ledmap/2D/mirror/custom support and
 the 100-slot disposable local preset cache.
 
 `ComposerActivationTarget` reparses persisted bytes on every activation, checks
@@ -219,12 +221,13 @@ The backend fixture from EasyLED PR #72 is embedded verbatim as
 `validation/fixtures/sample-config-payload.canonical.json`: 537 bytes, no final
 newline, SHA-256
 `112ef822a45000a449e87b97170d5448cdfc2afbc11c33728e39a1095b4eca6f`.
-Validation downloads and verifies those exact bytes using the definitive header.
-The fixture is not activated yet: it contains a 2D ledmap and identifies output
-slot 0 without a GPIO, while this application still requires an explicit physical
-GPIO mapping. The adapter continues to reject that unsupported combination
-instead of guessing. Its supported object parsing is key-order independent,
-including `outputs[].config`, and validation exercises a reordered object.
+Validation downloads and verifies those exact bytes using the definitive header,
+then parses its logical slot, 4x4 ledmap and 2D segment without inventing a GPIO.
+The fixture is not activated yet because the current runtime owns a fixed 50-pixel
+identity Composer and cannot rebuild its physical outputs/canvas transactionally.
+That runtime reconfiguration is the next firmware integration step. Object parsing
+is key-order independent, including `outputs[].config`, and validation exercises a
+reordered object.
 
 The capability envelope/cadence follows PR #66, but the inner capability object
 is explicitly provisional schema version 1 because EasyLED has not yet closed

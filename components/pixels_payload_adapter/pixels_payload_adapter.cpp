@@ -2,10 +2,8 @@
 
 #include <cstring>
 #include "cJSON.h"
-#include "esp_bit_defs.h"
 #include "esp_pixels_fx.hpp"
 #include "esp_pixels_fx_ids.hpp"
-#include "soc/soc_caps.h"
 
 namespace pixels_payload {
 namespace {
@@ -122,12 +120,6 @@ ValueResult optionalUnsigned(const cJSON *object, const char *name, uint32_t min
     return unsignedValue(item, minimum, maximum, value);
 }
 
-bool validOutputPin(uint32_t pin)
-{
-    return pin < SOC_GPIO_PIN_COUNT && ((SOC_GPIO_VALID_OUTPUT_GPIO_MASK >> pin) & 1ULL) != 0 &&
-           !(pin >= 6 && pin <= 11) && pin != 1 && pin != 3;
-}
-
 bool strictHexColor(const char *text, comp::CRGB &out)
 {
     if (text == nullptr || std::strlen(text) != 7 || text[0] != '#') { return false; }
@@ -176,6 +168,7 @@ OutputsResult parseOutputs(const cJSON *outputs_array, Candidate &candidate)
     if (count < 0) { return OutputsResult::Malformed; }
     if (count == 0 || count > kMaxOutputs) { return OutputsResult::OutOfRange; }
     candidate.output_count = 0;
+    bool seen_slots[kMaxOutputs] = {};
     int index = 0;
     for (const cJSON *entry = outputs_array->child; entry != nullptr; entry = entry->next, ++index) {
         // Defensive bound, even though `count <= kMaxOutputs` was already
@@ -191,41 +184,110 @@ OutputsResult parseOutputs(const cJSON *outputs_array, Candidate &candidate)
         const ValueResult slot_result = unsignedValue(member(entry, "slot_index"), 0, kMaxOutputs - 1,
                                                       slot_index);
         if (slot_result == ValueResult::OutOfRange) { return OutputsResult::OutOfRange; }
-        if (slot_result != ValueResult::Ok || slot_index != static_cast<uint32_t>(index) ||
+        if (slot_result != ValueResult::Ok || seen_slots[slot_index] ||
             !copyString(member(entry, "type"), type, sizeof(type)) || !cJSON_IsObject(config)) {
             return OutputsResult::Malformed;
         }
         if (std::strcmp(type, "digital_out") != 0) { return OutputsResult::Unsupported; }
-        uint32_t gpio = 0, pixel_count = 0;
+        uint32_t pixel_count = 0;
         bool reversed = false;
-        const cJSON *reversed_item = member(config, "reversed");
-        const ValueResult gpio_result = unsignedValue(member(config, "gpio"), 0, SOC_GPIO_PIN_COUNT - 1, gpio);
+        const cJSON *reversed_item = nullptr;
+        const MemberResult reversed_result = findMember(config, "reversed", reversed_item);
         const ValueResult pixels_result = unsignedValue(member(config, "pixel_count"), 1,
-                                                        kMaxPixelsPerOutput, pixel_count);
-        if (gpio_result == ValueResult::OutOfRange || pixels_result == ValueResult::OutOfRange) {
-            return OutputsResult::OutOfRange;
-        }
-        if (gpio_result != ValueResult::Ok || pixels_result != ValueResult::Ok ||
+                                                         kMaxPixelsPerOutput, pixel_count);
+        if (pixels_result == ValueResult::OutOfRange) { return OutputsResult::OutOfRange; }
+        if (pixels_result != ValueResult::Ok ||
             !copyString(member(config, "strip_type"), strip_type, sizeof(strip_type)) ||
             !copyString(member(config, "color_order"), color_order, sizeof(color_order))) {
             return OutputsResult::Malformed;
         }
-        if (!validOutputPin(gpio)) { return OutputsResult::OutOfRange; }
-        for (int prior = 0; prior < index; ++prior) {
-            if (candidate.outputs[prior].gpio == gpio) { return OutputsResult::OutOfRange; }
+        if (reversed_result == MemberResult::Duplicate ||
+            (reversed_result == MemberResult::Found && !cJSON_IsBool(reversed_item))) {
+            return OutputsResult::Malformed;
         }
         if (std::strcmp(strip_type, "WS2812B") != 0) { return OutputsResult::Unsupported; }
-        if (!cJSON_IsBool(reversed_item)) { return OutputsResult::Malformed; }
-        reversed = cJSON_IsTrue(reversed_item);
+        reversed = reversed_result == MemberResult::Found && cJSON_IsTrue(reversed_item);
         if (reversed) { return OutputsResult::Unsupported; } // physical reversed:true, never silently ignored
         esp_pixels::PixelOrder order{};
         if (!parsePixelOrder(color_order, order)) { return OutputsResult::Unsupported; }
-        candidate.outputs[index].gpio = static_cast<uint16_t>(gpio);
+        candidate.outputs[index].slot_index = static_cast<uint8_t>(slot_index);
         candidate.outputs[index].pixel_count = static_cast<uint16_t>(pixel_count);
         candidate.outputs[index].order = order;
+        seen_slots[slot_index] = true;
         candidate.output_count = static_cast<uint8_t>(index + 1);
     }
     return OutputsResult::Ok;
+}
+
+// --- ledmap -----------------------------------------------------------------
+
+enum class LedmapResult : uint8_t { Ok, Malformed, OutOfRange };
+
+LedmapResult parseLedmap(const cJSON *ledmap, uint32_t total_pixels, Candidate &candidate)
+{
+    candidate.ledmap = LedmapCandidate{};
+    if (cJSON_IsNull(ledmap)) {
+        if (total_pixels == 0 || total_pixels > UINT16_MAX) { return LedmapResult::OutOfRange; }
+        candidate.ledmap.width = static_cast<uint16_t>(total_pixels);
+        candidate.ledmap.height = 1;
+        candidate.ledmap.entry_count = total_pixels;
+        return LedmapResult::Ok;
+    }
+    if (!cJSON_IsObject(ledmap)) { return LedmapResult::Malformed; }
+
+    uint32_t version = 0, width = 0, height = 0;
+    const ValueResult version_result = unsignedValue(member(ledmap, "version"), 1, 1, version);
+    const ValueResult width_result = unsignedValue(member(ledmap, "width"), 1, UINT16_MAX, width);
+    const ValueResult height_result = unsignedValue(member(ledmap, "height"), 1, UINT16_MAX, height);
+    if (version_result == ValueResult::OutOfRange || width_result == ValueResult::OutOfRange ||
+        height_result == ValueResult::OutOfRange) {
+        return LedmapResult::OutOfRange;
+    }
+    if (version_result != ValueResult::Ok || width_result != ValueResult::Ok ||
+        height_result != ValueResult::Ok) {
+        return LedmapResult::Malformed;
+    }
+    const uint64_t cell_count_64 = static_cast<uint64_t>(width) * height;
+    const uint32_t max_cells = static_cast<uint32_t>(kMaxOutputs) * kMaxPixelsPerOutput;
+    if (cell_count_64 == 0 || cell_count_64 > max_cells) { return LedmapResult::OutOfRange; }
+    const uint32_t cell_count = static_cast<uint32_t>(cell_count_64);
+
+    const cJSON *map = member(ledmap, "map");
+    if (!cJSON_IsArray(map)) { return LedmapResult::Malformed; }
+    const int map_count = cJSON_GetArraySize(map);
+    if (map_count < 0 || static_cast<uint32_t>(map_count) != cell_count) {
+        return LedmapResult::OutOfRange;
+    }
+    int outer_index = 0;
+    for (const cJSON *entry = map->child; entry != nullptr; entry = entry->next, ++outer_index) {
+        if (!cJSON_IsNumber(entry) || entry->valuedouble < -1.0 ||
+            entry->valuedouble >= static_cast<double>(total_pixels)) {
+            return cJSON_IsNumber(entry) ? LedmapResult::OutOfRange : LedmapResult::Malformed;
+        }
+        const int32_t value = static_cast<int32_t>(entry->valuedouble);
+        if (entry->valuedouble != static_cast<double>(value)) { return LedmapResult::OutOfRange; }
+        if (value < 0) { continue; }
+        int inner_index = 0;
+        for (const cJSON *other = map->child; other != nullptr; other = other->next, ++inner_index) {
+            if (inner_index <= outer_index) { continue; }
+            if (cJSON_IsNumber(other) && other->valuedouble == static_cast<double>(value)) {
+                return LedmapResult::OutOfRange;
+            }
+        }
+    }
+
+    char checksum[65]{};
+    if (!copyString(member(ledmap, "checksum"), checksum, sizeof(checksum))) {
+        return LedmapResult::Malformed;
+    }
+    for (size_t i = 0; i < 64; ++i) {
+        if (!isHex(checksum[i])) { return LedmapResult::Malformed; }
+    }
+    candidate.ledmap.configured = true;
+    candidate.ledmap.width = static_cast<uint16_t>(width);
+    candidate.ledmap.height = static_cast<uint16_t>(height);
+    candidate.ledmap.entry_count = cell_count;
+    return LedmapResult::Ok;
 }
 
 // --- segments[] ---------------------------------------------------------
@@ -296,15 +358,17 @@ SegmentResult parseSegmentEffectConfig(const cJSON *config, comp::SegmentSpec &s
 }
 
 // Four-way, same reasoning as OutputsResult: a structurally invalid
-// segment is Malformed; a segment this delivery does not implement
-// (is_2d:true, an unregistered/dimension-mismatched effect id, or a
-// present mirror/reversed/custom/color_source field) is Unsupported.
-SegmentResult parseSegment(const cJSON *entry, comp::SegmentSpec &segment, bool seen_index[kMaxSegments])
+// segment is Malformed; an unregistered/dimension-mismatched effect id,
+// 2D without a config-owned ledmap, or a present mirror/reversed/custom/
+// color_source field is Unsupported.
+SegmentResult parseSegment(const cJSON *entry, comp::SegmentSpec &segment,
+                           bool seen_index[kMaxSegments], const LedmapCandidate &ledmap,
+                           uint32_t total_pixels, bool allow_2d)
 {
     if (!cJSON_IsObject(entry)) { return SegmentResult::Malformed; }
     char device_id[37]{};
     bool is_2d = false;
-    uint32_t segment_index = 0, effect_id = 0, start_px = 0, stop_px = 0;
+    uint32_t segment_index = 0, effect_id = 0;
     char updated_at[36]{};
     const cJSON *is_2d_item = member(entry, "is_2d");
     const cJSON *config = member(entry, "config");
@@ -320,29 +384,53 @@ SegmentResult parseSegment(const cJSON *entry, comp::SegmentSpec &segment, bool 
     value_result = unsignedValue(member(entry, "effect_id"), 0, 255, effect_id);
     if (value_result == ValueResult::OutOfRange) { return SegmentResult::OutOfRange; }
     if (value_result != ValueResult::Ok) { return SegmentResult::Malformed; }
-    value_result = unsignedValue(member(entry, "start_px"), 0,
-                                 kMaxOutputs * kMaxPixelsPerOutput, start_px);
-    if (value_result == ValueResult::OutOfRange) { return SegmentResult::OutOfRange; }
-    if (value_result != ValueResult::Ok) { return SegmentResult::Malformed; }
-    value_result = unsignedValue(member(entry, "stop_px"), 0,
-                                 kMaxOutputs * kMaxPixelsPerOutput, stop_px);
-    if (value_result == ValueResult::OutOfRange) { return SegmentResult::OutOfRange; }
-    if (value_result != ValueResult::Ok) { return SegmentResult::Malformed; }
-    if (start_px >= stop_px) { return SegmentResult::OutOfRange; }
     is_2d = cJSON_IsTrue(is_2d_item);
-    if (is_2d) { return SegmentResult::Unsupported; } // this delivery's fixture set is 1D only
     const fx::FxInfo *info = fx::describe(static_cast<uint8_t>(effect_id));
-    if (info == nullptr || (info->dim & fx::FX_DIM_1D) == 0) {
-        return SegmentResult::Unsupported; // unregistered id, or a 2D-only effect on a 1D segment
-    }
-    if (info->work.fixed_bytes != 0 || info->work.bytes_per_cell != 0) {
-        return SegmentResult::Unsupported; // a working-buffer effect, not bound by Composer yet
-    }
+    if (info == nullptr) { return SegmentResult::Unsupported; }
     segment = comp::SegmentSpec{};
     segment.id = segment_index + 1; // Composer reserves id 0 for ephemeral segments
-    segment.start = static_cast<uint16_t>(start_px);
-    segment.stop = static_cast<uint16_t>(stop_px);
     segment.effect_id = static_cast<uint8_t>(effect_id);
+    segment.is2D = is_2d;
+    if (is_2d) {
+        if (!allow_2d || !ledmap.configured || (info->dim & fx::FX_DIM_2D) == 0) {
+            return SegmentResult::Unsupported;
+        }
+        const cJSON *region = member(entry, "region");
+        if (!cJSON_IsObject(region)) { return SegmentResult::Malformed; }
+        uint32_t x = 0, y = 0, w = 0, h = 0;
+        const ValueResult x_result = unsignedValue(member(region, "x"), 0, UINT16_MAX, x);
+        const ValueResult y_result = unsignedValue(member(region, "y"), 0, UINT16_MAX, y);
+        const ValueResult w_result = unsignedValue(member(region, "w"), 1, UINT16_MAX, w);
+        const ValueResult h_result = unsignedValue(member(region, "h"), 1, UINT16_MAX, h);
+        if (x_result == ValueResult::OutOfRange || y_result == ValueResult::OutOfRange ||
+            w_result == ValueResult::OutOfRange || h_result == ValueResult::OutOfRange ||
+            static_cast<uint64_t>(x) + w > ledmap.width ||
+            static_cast<uint64_t>(y) + h > ledmap.height || h == 1) {
+            return SegmentResult::OutOfRange;
+        }
+        if (x_result != ValueResult::Ok || y_result != ValueResult::Ok ||
+            w_result != ValueResult::Ok || h_result != ValueResult::Ok) {
+            return SegmentResult::Malformed;
+        }
+        segment.x = static_cast<uint16_t>(x);
+        segment.y = static_cast<uint16_t>(y);
+        segment.w = static_cast<uint16_t>(w);
+        segment.h = static_cast<uint16_t>(h);
+    } else {
+        if ((info->dim & fx::FX_DIM_1D) == 0) { return SegmentResult::Unsupported; }
+        uint32_t start_px = 0, stop_px = 0;
+        value_result = unsignedValue(member(entry, "start_px"), 0,
+                                     kMaxOutputs * kMaxPixelsPerOutput, start_px);
+        if (value_result == ValueResult::OutOfRange) { return SegmentResult::OutOfRange; }
+        if (value_result != ValueResult::Ok) { return SegmentResult::Malformed; }
+        value_result = unsignedValue(member(entry, "stop_px"), 0,
+                                     kMaxOutputs * kMaxPixelsPerOutput, stop_px);
+        if (value_result == ValueResult::OutOfRange) { return SegmentResult::OutOfRange; }
+        if (value_result != ValueResult::Ok) { return SegmentResult::Malformed; }
+        if (start_px >= stop_px || stop_px > total_pixels) { return SegmentResult::OutOfRange; }
+        segment.start = static_cast<uint16_t>(start_px);
+        segment.stop = static_cast<uint16_t>(stop_px);
+    }
     const SegmentResult config_result = parseSegmentEffectConfig(config, segment);
     if (config_result != SegmentResult::Ok) { return config_result; }
     seen_index[segment_index] = true;
@@ -370,19 +458,17 @@ esp_err_t parseScene(const cJSON *root, Candidate &candidate, SchemaError &error
         error = SchemaError::Malformed;
         return ESP_ERR_INVALID_ARG;
     }
-    // `ledmap` establishes physical topology, so only `apply_config` (which
-    // also owns `outputs`) must carry it at all; a preset never touches
-    // topology and may omit it entirely. When present for either payload
-    // kind, it must still be null -- no canonical 2D ledmap schema exists
-    // yet in this increment.
+    // `ledmap` establishes topology, so apply_config must carry it. Presets
+    // inherit the active topology and therefore cannot replace a real map.
     if (want_outputs && ledmap == nullptr) {
         error = SchemaError::Malformed;
         return ESP_ERR_INVALID_ARG;
     }
-    if (ledmap != nullptr && !cJSON_IsNull(ledmap)) {
+    if (!want_outputs && ledmap != nullptr && !cJSON_IsNull(ledmap)) {
         error = SchemaError::Unsupported;
         return ESP_ERR_NOT_SUPPORTED;
     }
+    uint32_t total_pixels = static_cast<uint32_t>(kMaxOutputs) * kMaxPixelsPerOutput;
     if (want_outputs) {
         if (outputs == nullptr) { error = SchemaError::Malformed; return ESP_ERR_INVALID_ARG; }
         if (inputs == nullptr || !cJSON_IsArray(inputs)) {
@@ -410,6 +496,13 @@ esp_err_t parseScene(const cJSON *root, Candidate &candidate, SchemaError &error
         if (outputs_result == OutputsResult::OutOfRange) { error = SchemaError::OutOfRange; return ESP_ERR_INVALID_ARG; }
         if (outputs_result == OutputsResult::Unsupported) { error = SchemaError::Unsupported; return ESP_ERR_NOT_SUPPORTED; }
         candidate.has_outputs = true;
+        total_pixels = 0;
+        for (uint8_t i = 0; i < candidate.output_count; ++i) {
+            total_pixels += candidate.outputs[i].pixel_count;
+        }
+        const LedmapResult ledmap_result = parseLedmap(ledmap, total_pixels, candidate);
+        if (ledmap_result == LedmapResult::Malformed) { error = SchemaError::Malformed; return ESP_ERR_INVALID_ARG; }
+        if (ledmap_result == LedmapResult::OutOfRange) { error = SchemaError::OutOfRange; return ESP_ERR_INVALID_ARG; }
     } else {
         // A preset must not redefine physical outputs -- present and
         // non-empty is rejected outright, never silently kept/ignored.
@@ -418,6 +511,7 @@ esp_err_t parseScene(const cJSON *root, Candidate &candidate, SchemaError &error
             if (cJSON_GetArraySize(outputs) != 0) { error = SchemaError::Unsupported; return ESP_ERR_NOT_SUPPORTED; }
         }
         candidate.has_outputs = false;
+        candidate.ledmap = LedmapCandidate{};
     }
     if (!cJSON_IsArray(segments)) { error = SchemaError::Malformed; return ESP_ERR_INVALID_ARG; }
     const int count = cJSON_GetArraySize(segments);
@@ -429,7 +523,8 @@ esp_err_t parseScene(const cJSON *root, Candidate &candidate, SchemaError &error
     int written = 0;
     for (const cJSON *entry = segments->child; entry != nullptr; entry = entry->next) {
         comp::SegmentSpec segment{};
-        const SegmentResult result = parseSegment(entry, segment, seen_index);
+        const SegmentResult result = parseSegment(entry, segment, seen_index, candidate.ledmap,
+                                                  total_pixels, want_outputs);
         if (result == SegmentResult::Malformed) { error = SchemaError::Malformed; return ESP_ERR_INVALID_ARG; }
         if (result == SegmentResult::OutOfRange) { error = SchemaError::OutOfRange; return ESP_ERR_INVALID_ARG; }
         if (result == SegmentResult::Unsupported) { error = SchemaError::Unsupported; return ESP_ERR_NOT_SUPPORTED; }
@@ -437,18 +532,6 @@ esp_err_t parseScene(const cJSON *root, Candidate &candidate, SchemaError &error
         ++written;
     }
     candidate.scene.count = static_cast<uint8_t>(written);
-    if (want_outputs) {
-        uint32_t total_pixels = 0;
-        for (uint8_t i = 0; i < candidate.output_count; ++i) {
-            total_pixels += candidate.outputs[i].pixel_count;
-        }
-        for (uint8_t i = 0; i < candidate.scene.count; ++i) {
-            if (candidate.scene.segments[i].stop > total_pixels) {
-                error = SchemaError::OutOfRange;
-                return ESP_ERR_INVALID_ARG;
-            }
-        }
-    }
     error = SchemaError::None;
     return ESP_OK;
 }

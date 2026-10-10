@@ -40,19 +40,31 @@ enum class SchemaError : uint8_t {
     /// the real application/Composer limit for that field.
     OutOfRange,
     /// A structurally valid member this delivery does not implement yet:
-    /// `is_2d:true`, a non-null `ledmap`, a non-empty `inputs`, a physical
-    /// output `reversed:true`, a present segment-level `mirror`/`reversed`/
+    /// a non-empty `inputs`, a physical output `reversed:true`, a present
+    /// segment-level `mirror`/`reversed`/
     /// `custom`/`color_source` field (regardless of its own value), an
     /// unregistered or dimension-mismatched `effect_id`, or a preset
-    /// payload's own non-empty `outputs`. Never silently applied/ignored.
+    /// payload's own non-empty `outputs`, or a 2D preset before the active
+    /// canvas is supplied to this adapter. Never silently applied/ignored.
     Unsupported,
 };
 
-/// One physical output slot from a config payload's own `outputs[]` entry.
+/// One logical output slot from a config payload's own `outputs[]` entry.
 struct OutputCandidate {
-    uint16_t gpio = 0;
+    /// Logical hardware slot from the platform contract. GPIO binding belongs
+    /// to the application board profile and never comes from remote JSON.
+    uint8_t slot_index = 0;
     uint16_t pixel_count = 0;
     esp_pixels::PixelOrder order = esp_pixels::PixelOrder::GRB;
+};
+
+/// Validated canvas topology summary. The raw table stays in the exact durable
+/// payload and is reparsed by the activation layer when it rebuilds Composer.
+struct LedmapCandidate {
+    bool configured = false; ///< False means Composer's flat identity canvas.
+    uint16_t width = 0;
+    uint16_t height = 0;
+    uint32_t entry_count = 0;
 };
 
 /// Fixed-capacity, application-owned candidate produced from validated
@@ -65,6 +77,7 @@ struct Candidate {
     bool has_outputs = false;
     uint8_t output_count = 0;
     OutputCandidate outputs[kMaxOutputs]{};
+    LedmapCandidate ledmap{};
     /// Segments + count + global brightness. `paused` is always left at its
     /// own default (false): pause is a separate, unrelated control this
     /// provisional contract does not expose yet.
@@ -80,15 +93,15 @@ struct Candidate {
 /// reserved for ephemeral segments). Colors are strict `#RRGGBB`; blend
 /// names map to the existing `BlendMode`; an effect parameter omitted from
 /// a segment's own `config` object keeps `FxParams`'s real default.
-/// `ledmap:null` means identity and `inputs` must be an empty array. A non-null
-/// ledmap or non-empty inputs array is unsupported; missing/wrong-type required
-/// members are malformed. `is_2d:true`, a
-/// physical output `reversed:true`, or a present segment-level `mirror`/
+/// `ledmap:null` means identity. A version-1 ledmap validates dimensions, map
+/// length, holes, physical-index range and uniqueness. `inputs` must be empty.
+/// Missing/wrong-type required members are malformed. A physical output
+/// `reversed:true`, or a present segment-level `mirror`/
 /// `reversed`/`custom`/`color_source` field are rejected the same way,
 /// never silently ignored or half-applied. Configs require one or two
-/// outputs; pins must be output-capable on the selected ESP32 SoC, must not
-/// use flash/UART-reserved pins 6..11/1/3, and must be unique. Every segment
-/// must fit inside the total configured logical pixel span.
+/// outputs. Remote configuration identifies logical `slot_index` values only;
+/// the application board profile owns GPIO binding. Every 1D segment must fit
+/// inside the configured logical span, and every 2D region must fit the ledmap.
 /// @param json UTF-8 JSON bytes; no trailing NUL required.
 /// @param size Exact byte count, at most kMaxPayloadBytes.
 /// @param candidate Receives the validated candidate (has_outputs == true) on success only.
@@ -100,9 +113,9 @@ esp_err_t parseConfigPayload(const char *json, size_t size, Candidate &candidate
 /// replacement scene only, never outputs) into `candidate`. A non-empty
 /// `outputs` member is rejected as SchemaError::Unsupported -- a preset must
 /// not redefine physical outputs. `ledmap` may be omitted entirely (a preset
-/// never touches topology); when present it must still be null, exactly as
-/// parseConfigPayload() requires. Every other field-level rule matches
-/// parseConfigPayload() exactly.
+/// never touches topology); when present it must be null. This entry point
+/// accepts 1D preset segments only because it has no active canvas argument;
+/// 2D preset activation remains fail-closed until that context is wired.
 /// @param json UTF-8 JSON bytes; no trailing NUL required.
 /// @param size Exact byte count, at most kMaxPayloadBytes.
 /// @param candidate Receives the validated candidate (has_outputs == false) on success only.

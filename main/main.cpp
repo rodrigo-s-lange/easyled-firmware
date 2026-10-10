@@ -181,7 +181,7 @@ extern "C" void app_main()
     vTaskDelay(1);
 
     static constexpr pixels_payload::OutputCandidate fixed_outputs[] = {
-        {.gpio = 16, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
+        {.slot_index = 0, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
     };
     static pixels_control::ComposerActivationTarget activation_target(
         composer, fixed_outputs, sizeof(fixed_outputs) / sizeof(fixed_outputs[0]));
