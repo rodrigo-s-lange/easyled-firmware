@@ -921,15 +921,15 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(composer.build(sink) == ESP_OK);
     CHECK(composer.start(2) == ESP_OK);
     static constexpr pixels_payload::OutputCandidate topology[] = {
-        {.gpio = 16, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
+        {.slot_index = 0, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
     };
     static pixels_control::ComposerActivationTarget target(composer, topology, 1);
     const size_t config_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
     std::memcpy(resolved, FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json), config_size);
     resolved[config_size] = '\0';
-    char *gpio = std::strstr(resolved, "\"gpio\":16");
-    CHECK(gpio != nullptr);
-    if (gpio != nullptr) { gpio[8] = '7'; }
+    char *pixel_count = std::strstr(resolved, "\"pixel_count\":50");
+    CHECK(pixel_count != nullptr);
+    if (pixel_count != nullptr) { pixel_count[15] = '1'; }
     CHECK(target.activateAtFrameBoundary(
               pixels_firmware::CommandType::ApplyConfig,
               resolved, config_size) == ESP_ERR_NOT_SUPPORTED);
@@ -1160,7 +1160,8 @@ extern "C" void app_main()
         CHECK(pixels_payload::parseConfigPayload(FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
                                                  FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json),
                                                  payload_candidate, schema_error) == ESP_OK);
-        CHECK(payload_candidate.has_outputs && payload_candidate.output_count == 1 && payload_candidate.outputs[0].gpio == 16 &&
+        CHECK(payload_candidate.has_outputs && payload_candidate.output_count == 1 &&
+              payload_candidate.outputs[0].slot_index == 0 &&
               payload_candidate.outputs[0].pixel_count == 50 &&
               payload_candidate.outputs[0].order == esp_pixels::PixelOrder::GRB);
         CHECK(payload_candidate.scene.brightness == 255 && payload_candidate.scene.count == 1);
@@ -1170,6 +1171,27 @@ extern "C" void app_main()
               payload_candidate.scene.segments[0].params.intensity == 128 && payload_candidate.scene.segments[0].brightness == 255 &&
               payload_candidate.scene.segments[0].blend == esp_pixels_composer::BlendMode::Replace &&
               payload_candidate.scene.segments[0].opacity == 255);
+
+        CHECK(FIXTURE_SIZE(sample_config_payload_canonical_json) == 537);
+        CHECK(pixels_payload::parseConfigPayload(FIXTURE_BYTES(sample_config_payload_canonical_json),
+                                                 FIXTURE_SIZE(sample_config_payload_canonical_json),
+                                                 payload_candidate, schema_error) == ESP_OK);
+        CHECK(payload_candidate.output_count == 1 &&
+              payload_candidate.outputs[0].slot_index == 0 &&
+              payload_candidate.outputs[0].pixel_count == 16 &&
+              payload_candidate.outputs[0].order == esp_pixels::PixelOrder::GRB);
+        CHECK(payload_candidate.ledmap.configured && payload_candidate.ledmap.width == 4 &&
+              payload_candidate.ledmap.height == 4 && payload_candidate.ledmap.entry_count == 16);
+        CHECK(payload_candidate.scene.count == 1 && payload_candidate.scene.segments[0].is2D &&
+              payload_candidate.scene.segments[0].x == 0 && payload_candidate.scene.segments[0].y == 0 &&
+              payload_candidate.scene.segments[0].w == 4 && payload_candidate.scene.segments[0].h == 4 &&
+              payload_candidate.scene.segments[0].effect_id == esp_pixels_fx::FX_SOLID);
+
+        static constexpr char kWorkBuffer2D[] =
+            "{\"ledmap\":{\"version\":1,\"width\":2,\"height\":2,\"map\":[0,1,2,3],\"checksum\":\"f2f991d74dfbb2edf7f4475dcb7d82989de00a71e44bb11d4a6fbb49442577b6\"},\"outputs\":[{\"slot_index\":0,\"type\":\"digital_out\",\"config\":{\"pixel_count\":4,\"strip_type\":\"WS2812B\",\"color_order\":\"GRB\"}}],\"inputs\":[],\"segments\":[{\"device_id\":\"11111111-1111-4111-8111-111111111111\",\"segment_index\":0,\"effect_id\":21,\"is_2d\":true,\"region\":{\"x\":0,\"y\":0,\"w\":2,\"h\":2},\"config\":{},\"updated_at\":\"2026-10-10T00:00:00Z\"}],\"global_brightness\":255}";
+        CHECK(pixels_payload::parseConfigPayload(kWorkBuffer2D, sizeof(kWorkBuffer2D) - 1,
+                                                 payload_candidate, schema_error) == ESP_OK &&
+              payload_candidate.scene.segments[0].effect_id == esp_pixels_fx::FX_TETRIS);
         // future_field-style forward compatibility: an unrelated unknown
         // member anywhere must never be rejected.
         static constexpr char kWithUnknown[] =
@@ -1186,7 +1208,7 @@ extern "C" void app_main()
                                                   sizeof(kReorderedOutputConfig) - 1,
                                                   payload_candidate, schema_error) == ESP_OK &&
               payload_candidate.output_count == 1 &&
-              payload_candidate.outputs[0].gpio == 16 &&
+              payload_candidate.outputs[0].slot_index == 0 &&
               payload_candidate.outputs[0].pixel_count == 50 &&
               payload_candidate.outputs[0].order == esp_pixels::PixelOrder::GRB);
 
@@ -1217,8 +1239,8 @@ extern "C" void app_main()
              pixels_payload::SchemaError::OutOfRange, "config requires at least one output"},
             {"{\"ledmap\":null,\"global_brightness\":1,\"outputs\":[],\"outputs\":[],\"inputs\":[],\"segments\":[]}",
              pixels_payload::SchemaError::Malformed, "duplicate outputs member"},
-            {"{\"ledmap\":{},\"outputs\":[],\"inputs\":[],\"segments\":[],\"global_brightness\":1}",
-             pixels_payload::SchemaError::Unsupported, "non-null ledmap"},
+            {"{\"ledmap\":{},\"outputs\":" VALID_OUTPUT_JSON ",\"inputs\":[],\"segments\":[],\"global_brightness\":1}",
+             pixels_payload::SchemaError::Malformed, "incomplete ledmap"},
             {"{\"ledmap\":null,\"outputs\":[],\"inputs\":[1],\"segments\":[],\"global_brightness\":1}",
              pixels_payload::SchemaError::Unsupported, "non-empty inputs"},
             {"{\"ledmap\":null,\"outputs\":[{\"slot_index\":0,\"type\":\"digital_out\",\"config\":{\"gpio\":16,\"pixel_count\":50,\"strip_type\":\"WS2812B\",\"color_order\":\"GRB\",\"reversed\":true}}],\"inputs\":[],\"segments\":[],\"global_brightness\":1}",
@@ -1232,7 +1254,7 @@ extern "C" void app_main()
             {"{\"ledmap\":null,\"outputs\":" VALID_OUTPUT_JSON ",\"inputs\":[],\"segments\":[{\"device_id\":\"11111111-1111-4111-8111-111111111111\",\"segment_index\":0,\"effect_id\":250,\"is_2d\":false,\"start_px\":0,\"stop_px\":10,\"config\":{},\"updated_at\":\"2026-09-22T13:00:00Z\"}],\"global_brightness\":1}",
              pixels_payload::SchemaError::Unsupported, "unregistered effect id"},
             {"{\"ledmap\":null,\"outputs\":" VALID_OUTPUT_JSON ",\"inputs\":[],\"segments\":[{\"device_id\":\"11111111-1111-4111-8111-111111111111\",\"segment_index\":0,\"effect_id\":0,\"is_2d\":true,\"start_px\":0,\"stop_px\":10,\"config\":{},\"updated_at\":\"2026-09-22T13:00:00Z\"}],\"global_brightness\":1}",
-             pixels_payload::SchemaError::Unsupported, "is_2d:true"},
+             pixels_payload::SchemaError::Unsupported, "2D segment without a configured ledmap"},
             {"{\"ledmap\":null,\"outputs\":" VALID_OUTPUT_JSON ",\"inputs\":[],\"segments\":[{\"device_id\":\"11111111-1111-4111-8111-111111111111\",\"segment_index\":0,\"effect_id\":0,\"is_2d\":false,\"start_px\":0,\"stop_px\":10,\"config\":{\"mirror\":false},\"updated_at\":\"2026-09-22T13:00:00Z\"}],\"global_brightness\":1}",
              pixels_payload::SchemaError::Unsupported, "present segment mirror field, even false"},
             {"{\"ledmap\":null,\"outputs\":" VALID_OUTPUT_JSON ",\"inputs\":[],\"segments\":[{\"device_id\":\"11111111-1111-4111-8111-111111111111\",\"segment_index\":0,\"effect_id\":0,\"is_2d\":false,\"start_px\":0,\"stop_px\":10,\"config\":{\"colors\":[\"0040FF\"]},\"updated_at\":\"2026-09-22T13:00:00Z\"}],\"global_brightness\":1}",
@@ -1245,8 +1267,8 @@ extern "C" void app_main()
              pixels_payload::SchemaError::Malformed, "duplicate optional speed"},
             {"{\"ledmap\":null,\"outputs\":" VALID_OUTPUT_JSON ",\"inputs\":[],\"segments\":[{\"device_id\":\"11111111-1111-4111-8111-111111111111\",\"segment_index\":0,\"effect_id\":0,\"is_2d\":false,\"start_px\":0,\"stop_px\":51,\"config\":{},\"updated_at\":\"2026-09-22T13:00:00Z\"}],\"global_brightness\":1}",
              pixels_payload::SchemaError::OutOfRange, "segment exceeds configured topology"},
-            {"{\"ledmap\":null,\"outputs\":[{\"slot_index\":0,\"type\":\"digital_out\",\"config\":{\"gpio\":34,\"pixel_count\":50,\"strip_type\":\"WS2812B\",\"color_order\":\"GRB\",\"reversed\":false}}],\"inputs\":[],\"segments\":[],\"global_brightness\":1}",
-             pixels_payload::SchemaError::OutOfRange, "input-only GPIO"},
+            {"{\"ledmap\":{\"version\":1,\"width\":2,\"height\":2,\"map\":[0,1,1,3],\"checksum\":\"f2f991d74dfbb2edf7f4475dcb7d82989de00a71e44bb11d4a6fbb49442577b6\"},\"outputs\":[{\"slot_index\":0,\"type\":\"digital_out\",\"config\":{\"pixel_count\":4,\"strip_type\":\"WS2812B\",\"color_order\":\"GRB\"}}],\"inputs\":[],\"segments\":[],\"global_brightness\":1}",
+             pixels_payload::SchemaError::OutOfRange, "duplicate ledmap physical index"},
         };
         for (const Case &c : cases) {
             pixels_payload::SchemaError schema_error = pixels_payload::SchemaError::None;
