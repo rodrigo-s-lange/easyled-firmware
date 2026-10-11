@@ -135,7 +135,9 @@ checksum-verify, and schema-validate -- all before touching durable/live state.
 For `apply_config`, the envelope checksum is authoritative and cannot be
 replaced by resolver metadata; for `activate_preset`, the resolver supplies the
 digest because the provisional envelope has none. `reboot`/`ota` stop here as
-`command_rejected`/`not_implemented`, parsed but never executed. An
+`command_rejected`/`unsupported_command` -- the same reason code
+`pixels_firmware::parseErrorCode()` returns for an unrecognized envelope
+type -- parsed but never executed. An
 `activate_preset` already matching the live target emits `command_accepted`
 and a successful terminal result without staging or restarting the animation.
 Other accepted pixel commands continue through `staging.begin()` -> `append()`
@@ -150,7 +152,7 @@ rather than hidden. "Applied but not saved" is forbidden.
 Reason codes beyond `pixels_firmware::parseErrorCode()`/
 `pixels_payload::schemaErrorCode()`: `checksum_mismatch`, `resolve_failed`,
 `staging_failed`, `activation_failed`, `terminal_store_failed`,
-`rollback_failed`, `not_implemented`. `Executor` owns its fixed-capacity
+`rollback_failed`. `Executor` owns its fixed-capacity
 scratch (command, payload buffer, candidate, event buffers) as class members,
 never task-stack
 locals or function-local statics, so it is safe to place on a small FreeRTOS
@@ -211,9 +213,16 @@ also invalidated by any disconnect observed since that enqueue. The state
 contains durable boot/state counters, active config/preset identity and the last
 applied command. `capability_reported` uses the event topic, QoS1 without retain,
 once after subscription and every 60 minutes, with the same PUBACK-gated
-retry. Its measured heap/PSRAM and output topology accompany supported effect
-IDs 0..21, ledmap/2D/mirror/custom support and the 100-slot disposable local
-preset cache.
+retry. At the event level it carries `device_id`, `hardware_binding_id`
+(the same UUID as the current boot's `StateReport`), `generation` (the same
+value as that same boot's state, never a second identity scheme),
+`fw_version`, `capabilities` and `reported_at`. Inside `capabilities`, its
+measured heap/PSRAM and output topology accompany supported effect IDs 0..21,
+ledmap/2D/mirror/custom support, the 100-slot disposable local preset cache,
+and `max_payload_bytes` -- the exact command-payload byte limit this firmware
+build enforces (`pixels_payload::kMaxPayloadBytes`), not yet a safe
+`max_ledmap_cells` figure, which still needs a heap-under-TLS measurement and
+remains a separate task.
 
 This PUBACK gate proves only that *this device's* broker TCP/TLS session
 accepted the publication at the protocol level. It is not evidence that
@@ -410,12 +419,16 @@ state) live as inspectable files
 under `validation/fixtures/`, embedded into the binary via
 `EMBED_TXTFILES` rather than duplicated as string literals. It checks the two
 exact provisional fixture hashes, command parsing, event/state/capability
-serialization, terminal replay, the payload adapter's happy paths and a representative
+serialization (including `capability_reported`'s `hardware_binding_id`/
+`generation`/`max_payload_bytes` boundaries: absent/invalid binding,
+zero generation, and a zero/correct payload limit), terminal replay, the
+payload adapter's happy paths and a representative
 type/range/duplicate/unsupported failure table, and the executor's full
 scenario table (happy-path apply_config, duplicate replay, preset cache-miss/
 already-active no-op, checksum-mismatch rejection, staging/activation-failure
 rollback, terminal-store-failure rollback, terminal-publish-failure survival,
-reboot/ota rejection, and 20 repeated commands with no leak) through a real
+reboot and ota rejection as `unsupported_command`, and 20 repeated commands
+with no leak) through a real
 `Composer`/`FakeSink` pair, proving a fixture's own bytes reach rendered pixels.
 It also executes the concrete eight-entry journal, immutable duplicates and
 oldest eviction; A/B recovery and rollback across simulated reboot; an actual

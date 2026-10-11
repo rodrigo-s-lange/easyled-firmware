@@ -1314,6 +1314,8 @@ void runNetworkSessionChecks(pixels_network::NetworkSession &session)
     static constexpr uint8_t kLocalEffectIds[] = {0, 2};
     pixels_firmware::CapabilityReport capability1{};
     capability1.device_id = kDeviceId;
+    capability1.hardware_binding_id = kHardwareBindingId;
+    capability1.generation = 1;
     capability1.firmware_version = "0.1.0-dev";
     capability1.reported_at = "2026-10-10T12:00:01Z";
     capability1.capabilities.free_internal_heap_bytes = 100000;
@@ -1323,6 +1325,7 @@ void runNetworkSessionChecks(pixels_network::NetworkSession &session)
     capability1.capabilities.configured_output_count = 1;
     capability1.capabilities.configured_total_pixels = 50;
     capability1.capabilities.max_segments = 32;
+    capability1.capabilities.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
     capability1.capabilities.effect_ids = kLocalEffectIds;
     capability1.capabilities.effect_count = sizeof(kLocalEffectIds);
     capability1.capabilities.supports_ledmap = true;
@@ -1544,6 +1547,8 @@ extern "C" void app_main()
     static constexpr uint8_t kEffectIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
     CapabilityReport capability{};
     capability.device_id = kDeviceId;
+    capability.hardware_binding_id = kHardwareBindingId;
+    capability.generation = 1; // same generation as the StateReport fixture above, same boot
     capability.firmware_version = "0.1.0-dev";
     capability.reported_at = "2026-09-22T12:00:06Z";
     capability.capabilities.free_internal_heap_bytes = 120000;
@@ -1553,6 +1558,7 @@ extern "C" void app_main()
     capability.capabilities.configured_output_count = 1;
     capability.capabilities.configured_total_pixels = 50;
     capability.capabilities.max_segments = 32;
+    capability.capabilities.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
     capability.capabilities.effect_ids = kEffectIds;
     capability.capabilities.effect_count = sizeof(kEffectIds);
     capability.capabilities.supports_ledmap = true;
@@ -1571,6 +1577,26 @@ extern "C" void app_main()
     capability.capabilities.largest_internal_heap_block_bytes = 120001;
     CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
                                     capability_size) == ESP_ERR_INVALID_ARG);
+    capability.capabilities.largest_internal_heap_block_bytes = 64000;
+
+    // --- M0 telemetry contract: hardware_binding_id/generation/max_payload_bytes ---
+    capability.hardware_binding_id = nullptr; // absent
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
+    capability.hardware_binding_id = "not-a-uuid"; // invalid
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
+    capability.hardware_binding_id = kHardwareBindingId;
+    capability.generation = 0;
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
+    capability.generation = 1;
+    capability.capabilities.max_payload_bytes = 0; // declared limit missing
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
+    capability.capabilities.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_OK);
 
     static OneRecordJournal journal;
     static TerminalRecord terminal{};
@@ -1920,7 +1946,18 @@ extern "C" void app_main()
         const int activate_before4 = staging.activateCalls();
         CHECK(reboot_executor.execute(kReboot, sizeof(kReboot) - 1) == ESP_OK);
         CHECK(staging.activateCalls() == activate_before4);
-        CHECK(event_sink6.anyContains("command_rejected") && event_sink6.anyContains("not_implemented"));
+        CHECK(event_sink6.anyContains("command_rejected") && event_sink6.anyContains("unsupported_command"));
+
+        // Same rejection path for `ota`, reusing reboot_executor/journal7 --
+        // a fresh Executor instance would duplicate its 8 KiB payload_buffer_
+        // for no reason, and this path never reaches payload resolution.
+        event_sink6.reset();
+        static constexpr char kOta[] =
+            "{\"command_id\":\"88888888-8888-4888-8888-888888888888\",\"type\":\"ota\",\"requested_at\":\"2026-09-22T12:06:01Z\",\"requested_by\":{\"actor_type\":\"tenant-operator\",\"actor_id\":\"33333333-3333-4333-8333-333333333333\"},\"idempotency_key\":\"y\",\"payload\":{\"firmware_version\":\"0.2.0\",\"artifact_url\":\"https://example.invalid/fw/0.2.0.bin\",\"checksum\":\"b62868aef25369d8b00db8dbc6af34c7c82b060b5570b0b7b24859a7d5547c5a\"}}";
+        const int activate_before5 = staging.activateCalls();
+        CHECK(reboot_executor.execute(kOta, sizeof(kOta) - 1) == ESP_OK);
+        CHECK(staging.activateCalls() == activate_before5);
+        CHECK(event_sink6.anyContains("command_rejected") && event_sink6.anyContains("unsupported_command"));
 
         // --- No assertion/panic/leak across repeated commands --------------
         for (int i = 0; i < 20; ++i) {

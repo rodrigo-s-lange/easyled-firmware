@@ -154,6 +154,7 @@ pixels_firmware::CapabilityManifest capabilityManifest(
     manifest.configured_output_count = sink.outputCount();
     manifest.configured_total_pixels = static_cast<uint16_t>(total_pixels);
     manifest.max_segments = esp_pixels_composer::MAX_SEGMENTS;
+    manifest.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
     manifest.effect_ids = kEffectIds;
     manifest.effect_count = sizeof(kEffectIds);
     manifest.supports_ledmap = true;
@@ -466,6 +467,8 @@ extern "C" void app_main()
             timestamp_source.now(reported_at);
             pixels_firmware::CapabilityReport report{};
             report.device_id = config.device_id;
+            report.hardware_binding_id = config.hardware_binding_id;
+            report.generation = config.generation;
             report.firmware_version = config.firmware_version;
             report.reported_at = reported_at;
             report.capabilities = capabilityManifest(pixel_runtime.sink());

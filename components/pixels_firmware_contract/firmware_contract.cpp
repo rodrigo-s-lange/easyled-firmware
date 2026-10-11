@@ -414,14 +414,15 @@ esp_err_t serializeCapabilityReport(const CapabilityReport &report, char *output
     size = 0;
     const CapabilityManifest &caps = report.capabilities;
     if (output == nullptr || capacity == 0 || !uuid(report.device_id) ||
+        !uuid(report.hardware_binding_id) || report.generation == 0 ||
         !boundedText(report.firmware_version, 32) || !timestamp(report.reported_at) ||
         caps.free_internal_heap_bytes == 0 || caps.largest_internal_heap_block_bytes == 0 ||
         caps.largest_internal_heap_block_bytes > caps.free_internal_heap_bytes ||
         caps.max_output_slots == 0 || caps.max_pixels_per_output == 0 ||
         caps.configured_output_count == 0 ||
         caps.configured_output_count > caps.max_output_slots || caps.configured_total_pixels == 0 ||
-        caps.max_segments == 0 || caps.custom_param_slots > 3 || caps.effect_count == 0 ||
-        caps.effect_count > 32 || caps.effect_ids == nullptr) {
+        caps.max_segments == 0 || caps.max_payload_bytes == 0 || caps.custom_param_slots > 3 ||
+        caps.effect_count == 0 || caps.effect_count > 32 || caps.effect_ids == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     cJSON *root = cJSON_CreateObject();
@@ -435,6 +436,8 @@ esp_err_t serializeCapabilityReport(const CapabilityReport &report, char *output
     }
     bool ok = cJSON_AddStringToObject(root, "event_type", "capability_reported") != nullptr &&
         cJSON_AddStringToObject(root, "device_id", report.device_id) != nullptr &&
+        cJSON_AddStringToObject(root, "hardware_binding_id", report.hardware_binding_id) != nullptr &&
+        cJSON_AddNumberToObject(root, "generation", report.generation) != nullptr &&
         cJSON_AddStringToObject(root, "fw_version", report.firmware_version) != nullptr &&
         cJSON_AddNumberToObject(manifest, "schema_version", 1) != nullptr &&
         cJSON_AddNumberToObject(manifest, "free_internal_heap_bytes",
@@ -451,7 +454,8 @@ esp_err_t serializeCapabilityReport(const CapabilityReport &report, char *output
                                caps.configured_output_count) != nullptr &&
         cJSON_AddNumberToObject(manifest, "configured_total_pixels",
                                caps.configured_total_pixels) != nullptr &&
-        cJSON_AddNumberToObject(manifest, "max_segments", caps.max_segments) != nullptr;
+        cJSON_AddNumberToObject(manifest, "max_segments", caps.max_segments) != nullptr &&
+        cJSON_AddNumberToObject(manifest, "max_payload_bytes", caps.max_payload_bytes) != nullptr;
     for (size_t i = 0; ok && i < caps.effect_count; ++i) {
         cJSON *id = cJSON_CreateNumber(caps.effect_ids[i]);
         if (id == nullptr) { ok = false; break; }
