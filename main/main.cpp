@@ -38,6 +38,22 @@ struct ApplicationConfig {
     const char *firmware_version = nullptr;
     const char *event_topic = nullptr;
     const char *state_topic = nullptr;
+    /// A non-null token is this profile's claim to provisioned/production
+    /// mode: apply_config then resolves over HTTPS exclusively, with no
+    /// embedded fallback on any failure. Null selects laboratory mode
+    /// instead, where apply_config resolves from the embedded fixture --
+    /// never a silent downgrade, only ever this device's own explicit choice.
+    const char *https_bearer_token = nullptr;
+    /// Null selects the ESP-IDF certificate bundle (the default for a
+    /// platform-issued server certificate); set only for a pinned/private CA.
+    /// Ignored in laboratory mode.
+    const char *https_server_ca_pem = nullptr;
+    /// Zero selects HttpsPayloadSource::Config's own default (10 s). Ignored
+    /// in laboratory mode.
+    uint32_t https_timeout_ms = 0;
+    /// Zero selects HttpsPayloadSource::Config's own default
+    /// (pixels_payload::kMaxPayloadBytes). Ignored in laboratory mode.
+    size_t https_max_payload_bytes = 0;
 };
 
 // An optional, gitignored application profile supplies applicationConfig().
@@ -98,6 +114,24 @@ uint32_t boundedU32(size_t value)
     return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value);
 }
 
+enum class HttpsProfileState {
+    Absent,     // no bearer token -- laboratory mode, not an error
+    Incomplete, // a token is present (claims provisioned mode) but the rest is malformed
+    Complete,   // provisioned mode, ready to construct HttpsPayloadSource
+};
+
+HttpsProfileState httpsProfileState(const ApplicationConfig &config,
+                                    pixels_control::HttpsPayloadSource::Config &out)
+{
+    if (config.https_bearer_token == nullptr) { return HttpsProfileState::Absent; }
+    out.bearer_token = config.https_bearer_token;
+    out.server_ca_pem = config.https_server_ca_pem;
+    if (config.https_timeout_ms != 0) { out.timeout_ms = config.https_timeout_ms; }
+    if (config.https_max_payload_bytes != 0) { out.max_payload_bytes = config.https_max_payload_bytes; }
+    return pixels_control::validHttpsConfig(out) ? HttpsProfileState::Complete
+                                                  : HttpsProfileState::Incomplete;
+}
+
 pixels_firmware::CapabilityManifest capabilityManifest(
     const esp_pixels_composer_adapter_esp_pixels::EspPixelsSink &sink)
 {
@@ -120,6 +154,7 @@ pixels_firmware::CapabilityManifest capabilityManifest(
     manifest.configured_output_count = sink.outputCount();
     manifest.configured_total_pixels = static_cast<uint16_t>(total_pixels);
     manifest.max_segments = esp_pixels_composer::MAX_SEGMENTS;
+    manifest.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
     manifest.effect_ids = kEffectIds;
     manifest.effect_count = sizeof(kEffectIds);
     manifest.supports_ledmap = true;
@@ -135,13 +170,6 @@ bool terminalApplied(const pixels_storage::NvsTerminalJournal &journal, const ch
 {
     return journal.find(command_id, record) == ESP_OK &&
            std::strstr(record.event_json, "\"event_type\":\"command_applied\"") != nullptr;
-}
-
-void stopRenderer(esp_pixels_composer::Composer &composer,
-                  esp_pixels_composer_adapter_esp_pixels::EspPixelsSink &sink)
-{
-    (void)composer.end();
-    (void)sink.end();
 }
 
 } // namespace
@@ -162,17 +190,27 @@ extern "C" void app_main()
         return;
     }
 
-    // Product-bench topology for this cut: the currently connected 50-pixel
-    // GRB WS2812B strip on GPIO16. Payload topology must match this exactly.
-    static esp_pixels::Pixels pixels;
-    static esp_pixels_composer_adapter_esp_pixels::EspPixelsSink sink;
-    static esp_pixels_composer::Composer composer;
-    esp_err_t err = sink.init(pixels, 16, 50, esp_pixels::PixelOrder::GRB);
-    if (err == ESP_OK) { err = composer.build(sink); }
-    if (err == ESP_OK) { err = composer.start(); }
+    // Lab-board wiring is firmware-owned. Remote configuration selects only
+    // logical slots and can never redirect a signal to another GPIO. The safe
+    // boot count covers the currently connected 31x12 matrix on GPIO16 so an
+    // empty store can actively clear every physical pixel.
+    static constexpr pixels_control::BoardOutputBinding board_outputs[] = {
+        {.slot_index = 0, .gpio = 16, .max_pixels = pixels_payload::kMaxPixelsPerOutput,
+         .safe_pixel_count = 372, .safe_order = esp_pixels::PixelOrder::GRB},
+        {.slot_index = 1, .gpio = 17, .max_pixels = pixels_payload::kMaxPixelsPerOutput,
+         .safe_pixel_count = 0, .safe_order = esp_pixels::PixelOrder::GRB},
+    };
+    static constexpr pixels_control::BoardProfile board_profile{
+        .outputs = board_outputs,
+        .output_count = sizeof(board_outputs) / sizeof(board_outputs[0]),
+    };
+    static pixels_control::EspPixelRuntimeBackend pixel_runtime;
+    static pixels_control::TransactionalPixelActivationTarget activation_target(
+        pixel_runtime, board_profile);
+    esp_err_t err = activation_target.beginSafeBlank();
     if (err != ESP_OK) {
         ESP_LOGE(kTag, "pixel runtime startup failed: %s", esp_err_to_name(err));
-        stopRenderer(composer, sink);
+        (void)pixel_runtime.shutdown();
         return;
     }
     // Boot performs several independent driver/NVS initialization phases.
@@ -180,11 +218,6 @@ extern "C" void app_main()
     // the default task watchdog meaningful on slow emulators and slow flash.
     vTaskDelay(1);
 
-    static constexpr pixels_payload::OutputCandidate fixed_outputs[] = {
-        {.slot_index = 0, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
-    };
-    static pixels_control::ComposerActivationTarget activation_target(
-        composer, fixed_outputs, sizeof(fixed_outputs) / sizeof(fixed_outputs[0]));
     static pixels_storage::NvsTerminalJournal journal;
     static pixels_storage::NvsDurableStaging staging;
     static pixels_storage::NvsTelemetryState telemetry_state;
@@ -205,7 +238,7 @@ extern "C" void app_main()
         telemetry_state.end();
         staging.end();
         journal.end();
-        stopRenderer(composer, sink);
+        (void)pixel_runtime.shutdown();
         return;
     }
 
@@ -216,6 +249,10 @@ extern "C" void app_main()
         ESP_LOGE(kTag, "embedded resource digest is invalid");
         return;
     }
+    // Always available: the embedded apply_config fixture backs laboratory
+    // mode (no HTTPS credential configured), and the preset fixture backs
+    // activate_preset in every mode until the platform publishes its second
+    // download contract package.
     static const pixels_control::EmbeddedResource resources[] = {
         {pixels_firmware::CommandType::ApplyConfig, kFixtureConfigUrl,
          fixtureBytes(config_payload_bench_gpio16_50_provisional_json_start),
@@ -228,7 +265,7 @@ extern "C" void app_main()
                      preset_payload_provisional_json_end),
          preset_digest},
     };
-    static pixels_control::EmbeddedPayloadSource payload_source(
+    static pixels_control::EmbeddedPayloadSource embedded_source(
         resources, sizeof(resources) / sizeof(resources[0]));
     static pixels_control::DurableActiveProbe active_probe(staging);
 
@@ -244,6 +281,24 @@ extern "C" void app_main()
         ESP_LOGE(kTag, "local control identity/topic is invalid");
         return;
     }
+
+    static pixels_control::HttpsPayloadSource::Config https_config{};
+    const HttpsProfileState https_state = httpsProfileState(config, https_config);
+    if (https_state == HttpsProfileState::Incomplete) {
+        // Rendering/local recovery stay independent of network availability
+        // (AGENTS.md): restored pixels remain active, only networking (and
+        // therefore any config/preset delivery) is refused.
+        ESP_LOGE(kTag, "HTTPS profile claims provisioned mode but is incomplete; refusing to start"
+                       " networking (never silently downgrading a claimed-production device to"
+                       " laboratory mode)");
+        return;
+    }
+    static pixels_control::EspHttpPayloadClient http_client;
+    static pixels_control::HttpsPayloadSource https_source(http_client, https_config);
+    const bool provisioned = https_state == HttpsProfileState::Complete;
+    ESP_LOGI(kTag, "apply_config mode: %s", provisioned ? "provisioned (HTTPS)" : "laboratory (embedded)");
+    static pixels_control::RoutedPayloadSource payload_source(
+        provisioned ? &https_source : nullptr, embedded_source);
 
     static pixels_control::MqttEventSink event_sink(session, config.event_topic);
     static pixels_control::MqttTelemetrySink telemetry_sink(
@@ -270,8 +325,18 @@ extern "C" void app_main()
     int64_t next_state_attempt_us = 0;
     int64_t next_capability_attempt_us = 0;
     bool capability_due = false;
+    // An enqueue (ESP_OK from publishState/publishCapability) starts
+    // tracking, not completion: these stay set until NetworkSession::
+    // publishStatus() reports the broker's PUBACK (success) or Unknown
+    // (disconnect/eviction -- retry the *same* pending sequence/report, no
+    // new durable state sequence is allocated for an unacknowledged resend).
+    int pending_state_msg_id = -1;
+    int64_t pending_state_sent_us = 0;
+    int pending_capability_msg_id = -1;
+    int64_t pending_capability_sent_us = 0;
     constexpr int64_t kRetryIntervalUs = 5LL * 1000 * 1000;
     constexpr int64_t kCapabilityIntervalUs = 60LL * 60 * 1000 * 1000;
+    constexpr int64_t kPublishAckTimeoutUs = kRetryIntervalUs; // give up waiting for a slow PUBACK after this
     static pixels_network::NetworkSession::Message message;
     static pixels_firmware::TerminalRecord existing_terminal;
     for (;;) {
@@ -318,7 +383,21 @@ extern "C" void app_main()
         }
 
         const int64_t now_us = esp_timer_get_time();
-        if (ready && state_revision != published_state_revision && now_us >= next_state_attempt_us) {
+        if (ready && pending_state_msg_id >= 0) {
+            const auto ack = session.publishStatus(pending_state_msg_id);
+            if (ack == pixels_network::NetworkSession::PublishAck::Acknowledged) {
+                published_state_revision = pending_state_revision;
+                pending_state_sequence = 0;
+                pending_state_msg_id = -1;
+            } else if (ack == pixels_network::NetworkSession::PublishAck::Unknown ||
+                       now_us - pending_state_sent_us > kPublishAckTimeoutUs) {
+                // Lost track (disconnect/eviction) or the broker is simply
+                // slow: retry below with the SAME pending_state_sequence.
+                pending_state_msg_id = -1;
+            }
+        }
+        if (ready && state_revision != published_state_revision && pending_state_msg_id < 0 &&
+            now_us >= next_state_attempt_us) {
             if (pending_state_sequence == 0 || pending_state_revision != state_revision) {
                 pending_state_sequence = 0;
                 const esp_err_t sequence_err = telemetry_state.nextStateSequence(
@@ -356,11 +435,12 @@ extern "C" void app_main()
                     } else if (active.active) {
                         report.mode = pixels_firmware::DeviceMode::ConfigActive;
                     }
-                    err = telemetry_sink.publishState(report);
+                    int msg_id = -1;
+                    err = telemetry_sink.publishState(report, msg_id);
+                    if (err == ESP_OK) { pending_state_msg_id = msg_id; }
                 }
                 if (err == ESP_OK) {
-                    published_state_revision = pending_state_revision;
-                    pending_state_sequence = 0;
+                    pending_state_sent_us = now_us; // wait for PUBACK; see the check above
                 } else {
                     ESP_LOGW(kTag, "state publish deferred: %s", esp_err_to_name(err));
                     next_state_attempt_us = now_us + kRetryIntervalUs;
@@ -370,18 +450,34 @@ extern "C" void app_main()
             }
         }
 
-        if (ready && (capability_due || now_us >= next_capability_attempt_us)) {
+        if (ready && pending_capability_msg_id >= 0) {
+            const auto ack = session.publishStatus(pending_capability_msg_id);
+            if (ack == pixels_network::NetworkSession::PublishAck::Acknowledged) {
+                pending_capability_msg_id = -1;
+                next_capability_attempt_us = now_us + kCapabilityIntervalUs;
+            } else if (ack == pixels_network::NetworkSession::PublishAck::Unknown ||
+                       now_us - pending_capability_sent_us > kPublishAckTimeoutUs) {
+                pending_capability_msg_id = -1;
+                capability_due = true; // retry; no durable state is at stake here, just re-enqueue
+            }
+        }
+        if (ready && pending_capability_msg_id < 0 &&
+            (capability_due || now_us >= next_capability_attempt_us)) {
             char reported_at[36]{};
             timestamp_source.now(reported_at);
             pixels_firmware::CapabilityReport report{};
             report.device_id = config.device_id;
+            report.hardware_binding_id = config.hardware_binding_id;
+            report.generation = config.generation;
             report.firmware_version = config.firmware_version;
             report.reported_at = reported_at;
-            report.capabilities = capabilityManifest(sink);
-            err = telemetry_sink.publishCapability(report);
+            report.capabilities = capabilityManifest(pixel_runtime.sink());
+            int msg_id = -1;
+            err = telemetry_sink.publishCapability(report, msg_id);
             if (err == ESP_OK) {
+                pending_capability_msg_id = msg_id;
+                pending_capability_sent_us = now_us;
                 capability_due = false;
-                next_capability_attempt_us = now_us + kCapabilityIntervalUs;
             } else {
                 ESP_LOGW(kTag, "capability publish deferred: %s", esp_err_to_name(err));
                 capability_due = true;

@@ -88,7 +88,6 @@ constexpr const char *kStagingFailed = "staging_failed";
 constexpr const char *kActivationFailed = "activation_failed";
 constexpr const char *kTerminalStoreFailed = "terminal_store_failed";
 constexpr const char *kRollbackFailed = "rollback_failed";
-constexpr const char *kNotImplemented = "not_implemented"; // reboot/ota
 } // namespace ReasonCode
 
 /// Synchronous command executor. Owns no task, no queue, no MQTT/HTTP
@@ -119,7 +118,9 @@ public:
     /// 4. Resolve exact payload bytes, verify SHA-256, and validate the
     ///    complete candidate (`pixels_payload::parse*Payload()`) -- all
     ///    before touching durable/live state. `reboot`/`ota` stop here with
-    ///    `command_rejected`/`kNotImplemented` (parsed, never executed).
+    ///    `command_rejected`/`unsupported_command` (the same reason code
+    ///    `parseErrorCode(ParseError::UnsupportedCommand)` returns for an
+    ///    unrecognized envelope type -- parsed, never executed).
     ///    `activate_preset` already matching the live target stops here
     ///    with `command_accepted` followed by a successful terminal result
     ///    -- no staging/activation and no restarted animation.

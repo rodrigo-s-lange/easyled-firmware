@@ -159,6 +159,11 @@ struct CapabilityManifest {
     uint8_t max_output_slots = 0;
     uint8_t configured_output_count = 0;
     uint8_t max_segments = 0;
+    /// The exact command-payload byte limit this firmware build enforces
+    /// (currently `pixels_payload::kMaxPayloadBytes`). This component stays
+    /// independent of that layer, so the application supplies the number;
+    /// this struct only requires it to be declared (nonzero).
+    uint32_t max_payload_bytes = 0;
     bool synchronized_start = false;
     bool supports_ledmap = false;
     bool supports_2d = false;
@@ -172,6 +177,10 @@ struct CapabilityManifest {
 /// Values used to serialize one `capability_reported` event.
 struct CapabilityReport {
     const char *device_id = nullptr;
+    /// Required; same validation and identity as StateReport's own field.
+    const char *hardware_binding_id = nullptr;
+    /// Required, nonzero; must equal the current boot's StateReport::generation.
+    uint32_t generation = 0;
     const char *firmware_version = nullptr;
     const char *reported_at = nullptr;
     CapabilityManifest capabilities{};

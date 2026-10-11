@@ -6,8 +6,13 @@ rendering. This repository owns the application and product lifecycle; hardware
 access and pixel behavior remain versioned dependencies. The firmware restores
 and activates durable pixel configuration and
 executes the two versioned starter-pack resources end to end. It also publishes
-retained device state and boot/hourly capability telemetry; authenticated HTTPS
-credential provisioning and the live backend pipeline are still pending.
+retained device state and boot/hourly capability telemetry. At boot,
+`apply_config` selects either the explicit laboratory mode backed by the
+embedded fixture or provisioned mode backed exclusively by authenticated
+HTTPS; it never falls back from HTTPS after a request failure.
+`activate_preset` remains an embedded fixture until the platform publishes its
+second download contract package. The live backend pipeline (the platform side
+issuing commands and credentials) is still pending.
 
 ## Repository boundaries
 
@@ -38,14 +43,25 @@ to **1.1.0** through its component manifest.
   has supplied a plausible clock; the example starts SNTP after obtaining an IP.
 - Every MQTT connection subscribes again to one exact command topic. The session
   becomes ready after the broker grants QoS1. Rejected/downgraded subscriptions
-  request another connection attempt.
+  request another connection attempt; a SUBACK for a superseded subscribe
+  attempt (from before a disconnect/reconnect) is ignored.
 - Incoming fragments are assembled before delivery. Payloads are limited to
   1024 bytes, with a queue for two complete messages. Malformed/oversized messages,
   retained deliveries and other topics are rejected. A full queue drops the new
   message and increments `queue_overflows`; this is not durable command delivery.
 - Outgoing messages use QoS1 enqueue with a 4096-byte SDK outbox limit. A negative
-  return means the publication was not accepted. A message ID confirms enqueue,
-  not broker acknowledgement or successful command execution.
+  return means the publication was not accepted. A nonnegative message ID confirms
+  enqueue only, never broker acknowledgement or successful command execution --
+  call `publishStatus(msg_id)` for the broker's QoS1 PUBACK. It tracks the 8 most
+  recently enqueued message IDs; an older unacknowledged one can be evicted by
+  newer publishes, and any disconnect observed after an ID was enqueued also
+  surfaces it as `Unknown` from then on, even if the SDK's own outbox still holds
+  and later redelivers it. `Unknown` and `Pending` both mean "not yet confirmed
+  delivered"; the caller decides whether and how to retry. This session makes no
+  retry decision itself and consumes no second durable sequence number for a
+  retried revision. The product enables ESP-MQTT's incremental packet IDs so the
+  bounded tracker never has to disambiguate two live QoS1 publications that were
+  assigned the same random ID -- see "Integrated control runtime" below.
 - MQTT callbacks never execute product actions. The application receives complete
   bytes, including their length, and owns parsing, validation and deduplication.
   MQTT QoS1 may deliver duplicates; application acknowledgements and retry policy
@@ -119,7 +135,9 @@ checksum-verify, and schema-validate -- all before touching durable/live state.
 For `apply_config`, the envelope checksum is authoritative and cannot be
 replaced by resolver metadata; for `activate_preset`, the resolver supplies the
 digest because the provisional envelope has none. `reboot`/`ota` stop here as
-`command_rejected`/`not_implemented`, parsed but never executed. An
+`command_rejected`/`unsupported_command` -- the same reason code
+`pixels_firmware::parseErrorCode()` returns for an unrecognized envelope
+type -- parsed but never executed. An
 `activate_preset` already matching the live target emits `command_accepted`
 and a successful terminal result without staging or restarting the animation.
 Other accepted pixel commands continue through `staging.begin()` -> `append()`
@@ -134,7 +152,7 @@ rather than hidden. "Applied but not saved" is forbidden.
 Reason codes beyond `pixels_firmware::parseErrorCode()`/
 `pixels_payload::schemaErrorCode()`: `checksum_mismatch`, `resolve_failed`,
 `staging_failed`, `activation_failed`, `terminal_store_failed`,
-`rollback_failed`, `not_implemented`. `Executor` owns its fixed-capacity
+`rollback_failed`. `Executor` owns its fixed-capacity
 scratch (command, payload buffer, candidate, event buffers) as class members,
 never task-stack
 locals or function-local statics, so it is safe to place on a small FreeRTOS
@@ -154,6 +172,10 @@ intended for a single application control task.
 - `NvsDurableStaging` accepts at most 8192 exact payload bytes and uses a pending
   record plus A/B active records. Every record has schema, bounds, CRC32 and NVS
   commit/readback checks; payload activation additionally requires exact SHA-256.
+- The last successful `apply_config` is retained separately as the base topology
+  and canvas. Because a preset is scene-only, boot and rollback restore this base
+  configuration before applying an active preset. A preset without a recoverable
+  base configuration fails closed.
 - On boot, the newest valid active record is reapplied at a render-frame boundary.
   A pending candidate is reconciled against its command's terminal journal
   entry: durable success keeps it; a missing result restores the prior A/B slot.
@@ -171,28 +193,57 @@ intended for a single application control task.
 ## Integrated control runtime
 
 `components/pixels_control_runtime` supplies the concrete application adapters
-and `main.cpp` now owns their lifecycle. Boot initializes the real GPIO16/50 GRB
-pixel output, starts Composer's managed render task, opens the terminal journal,
-and restores the newest durable payload before networking starts. With a local
+and `main.cpp` now owns their lifecycle. Boot first builds a safe black topology,
+opens the terminal journal, and reconstructs the newest durable output topology,
+ledmap and scene before networking starts. With a local
 profile, the same application task that calls `NetworkSession::poll()` dequeues
 complete MQTT commands and calls `Executor::execute()`; no product action runs
 inside an MQTT callback. Events are published non-retained with QoS1 through the
 configured exact event topic and timestamps come from the SNTP-derived UTC clock.
 After subscription, the runtime publishes one retained QoS1 state document on
-the exact state topic. It publishes again after each successful command and
-retries enqueue failures without consuming another sequence number. The state
+the exact state topic, and again after each successful command. A state
+revision counts as delivered only once `NetworkSession::publishStatus()`
+reports the broker's PUBACK for that exact enqueue -- not merely a nonnegative
+`esp_mqtt_client_enqueue()` return. Enqueue rejection, a disconnect before the
+PUBACK arrives, or no PUBACK within 5 seconds all leave the revision pending
+and eligible for retry on the next loop iteration, re-enqueued under a new
+message ID without allocating another `state_sequence`; a late PUBACK for a
+superseded enqueue cannot be mistaken for the current one, because tracking is
+also invalidated by any disconnect observed since that enqueue. The state
 contains durable boot/state counters, active config/preset identity and the last
 applied command. `capability_reported` uses the event topic, QoS1 without retain,
-once after subscription and every 60 minutes. Its measured heap/PSRAM and output
-topology accompany supported effect IDs 0..21, ledmap/2D/mirror/custom support and
-the 100-slot disposable local preset cache.
+once after subscription and every 60 minutes, with the same PUBACK-gated
+retry. At the event level it carries `device_id`, `hardware_binding_id`
+(the same UUID as the current boot's `StateReport`), `generation` (the same
+value as that same boot's state, never a second identity scheme),
+`fw_version`, `capabilities` and `reported_at`. Inside `capabilities`, its
+measured heap/PSRAM and output topology accompany supported effect IDs 0..21,
+ledmap/2D/mirror/custom support, the 100-slot disposable local preset cache,
+and `max_payload_bytes` -- the exact command-payload byte limit this firmware
+build enforces (`pixels_payload::kMaxPayloadBytes`), not yet a safe
+`max_ledmap_cells` figure, which still needs a heap-under-TLS measurement and
+remains a separate task.
 
-`ComposerActivationTarget` reparses persisted bytes on every activation, checks
-an `apply_config` payload's topology against the already-built physical sink,
-publishes its scene, and reports success only after `Composer::reclaim()` directly
-proves frame-boundary adoption. The physical topology in this cut is exactly one
-WS2812B/GRB output with 50 pixels on GPIO16. A config asking for another topology
-fails activation and rolls back; a preset inherits the active topology.
+This PUBACK gate proves only that *this device's* broker TCP/TLS session
+accepted the publication at the protocol level. It is not evidence that
+EasyLED's backend ever persisted or reconciled that state/capability revision,
+that a command's `command_applied`/`command_failed` event was durably
+ingested, or that the backend's own view of device state converged after a
+broker-side redelivery or an overlapping revision from the same device.
+That backend-side reconciliation is tracked separately as EasyLED issues
+#58/#59 and is unimplemented here; this firmware only tracks broker delivery
+of its own most recent publications.
+
+`TransactionalPixelActivationTarget` reparses persisted bytes on every
+activation, resolves logical output slots through an immutable local board
+profile, installs the ledmap before the scene, and reports success only after
+`Composer::reclaim()` proves frame-boundary adoption. Remote JSON cannot choose
+GPIOs. The current laboratory profile binds slot 0 to GPIO16 and slot 1 to
+GPIO17, permits up to 2048 pixels per slot, and clears 372 GRB pixels on GPIO16
+when no durable configuration exists. A failed rebuild or scene adoption restores
+the prior confirmed topology, canvas and scene before returning the error. A
+preset inherits the last confirmed base configuration; reboot restores that base
+before the scene-only preset.
 
 `EmbeddedPayloadSource` resolves only the starter pack's exact config URL and
 preset UUID to the versioned fixture bytes embedded from `validation/fixtures`.
@@ -222,20 +273,45 @@ The backend fixture from EasyLED PR #72 is embedded verbatim as
 newline, SHA-256
 `112ef822a45000a449e87b97170d5448cdfc2afbc11c33728e39a1095b4eca6f`.
 Validation downloads and verifies those exact bytes using the definitive header,
-then parses its logical slot, 4x4 ledmap and 2D segment without inventing a GPIO.
-The fixture is not activated yet because the current runtime owns a fixed 50-pixel
-identity Composer and cannot rebuild its physical outputs/canvas transactionally.
-That runtime reconfiguration is the next firmware integration step. Object parsing
-is key-order independent, including `outputs[].config`, and validation exercises a
-reordered object.
+then activates its logical slot through the local GPIO16 binding, materializes
+the 4x4 ledmap and adopts its 2D segment. Validation also injects a post-rebuild
+failure and proves restoration of the previous topology, canvas and scene. Object
+parsing is key-order independent, including `outputs[].config`, and validation
+exercises a reordered object.
 
 The capability envelope/cadence follows PR #66, but the inner capability object
 is explicitly provisional schema version 1 because EasyLED has not yet closed
-that canonical schema. The HTTPS source is not wired into `main.cpp` until device
-credential provisioning and capability-manifest ingestion are available; the
-offline application therefore keeps `EmbeddedPayloadSource`. Also not implemented:
-final MQTT topic/provisioning policy, OTA execution, runtime physical-output
-reconfiguration, and live broker-loss tests.
+that canonical schema. `main.cpp` now routes `apply_config` through
+`HttpsPayloadSource` whenever a device bearer token is configured (see
+"Two apply_config modes" below); capability-manifest ingestion from a live
+backend is still not implemented. Also not implemented: final MQTT
+topic/provisioning policy, OTA execution, and live broker-loss tests.
+
+### Two apply_config modes
+
+`main.cpp` selects between them once at boot, from the local profile alone --
+never from a request outcome:
+
+- **Laboratory mode** (no `https_bearer_token` in the profile): `apply_config`
+  resolves from the same embedded fixture as `activate_preset`, for
+  offline/broker-integration testing. This is the default with no profile at
+  all, and remains available on a provisioned build that simply omits the
+  token.
+- **Provisioned mode** (`https_bearer_token` set): `apply_config` resolves
+  over authenticated HTTPS exclusively -- see `HttpsPayloadSource` above. Any
+  transport, status, size or checksum failure returns to the executor as-is;
+  there is no fallback to the embedded fixture. `activate_preset` still
+  resolves from the embedded fixture in this mode too, until EasyLED
+  publishes the second #60 contract package.
+
+A profile that sets a bearer token is read as an explicit claim of
+provisioned mode. If that token is empty or over
+`HttpsPayloadSource::kMaxBearerTokenBytes`, or a supplied CA is an empty
+string, or an explicitly set timeout/max-payload-bytes is out of
+`HttpsPayloadSource`'s supported bounds, startup logs the rejection and refuses
+to start networking -- it never silently drops back to
+laboratory mode for a device that claimed to be provisioned. Rendering and
+durable-state restoration are unaffected; only networking is refused.
 
 ## Checkout, build and local profile
 
@@ -265,7 +341,8 @@ for example `-D ESP_PIXELS_FX_DIR=C:/work/esp_pixels_fx`.
 
 Without `main/network_credentials.hpp`, startup still initializes pixels and
 restores durable local state, then leaves networking disabled. An optional,
-gitignored profile has this shape:
+gitignored profile has this shape (omit `.https_bearer_token` entirely for
+laboratory mode; see "Two apply_config modes" above):
 
 ```cpp
 #pragma once
@@ -288,6 +365,13 @@ static ApplicationConfig applicationConfig()
         .firmware_version = "0.1.0-dev",
         .event_topic = "YOUR_EXACT_EVENT_TOPIC",
         .state_topic = "YOUR_EXACT_STATE_TOPIC",
+        .https_bearer_token = "YOUR_DEVICE_HTTPS_BEARER_TOKEN", // provisioned mode; omit for laboratory mode
+        // Omit server_ca_pem to use the ESP-IDF certificate bundle (the
+        // default for a platform-issued certificate); set it only to pin a
+        // private/self-signed CA.
+        // .https_timeout_ms and .https_max_payload_bytes default to
+        // HttpsPayloadSource::Config's own values (10 s / the component's
+        // max payload) when left at zero; set either only to override it.
     };
 }
 ```
@@ -296,6 +380,14 @@ These are placeholders, not an EasyLED provisioning contract. Supply credentials
 only for an authorized development device. The example does not print payloads or
 credentials. The firmware does not erase NVS automatically on initialization
 failure.
+
+`apply_config`'s `command.resource_url` (from the parsed command itself, never a
+compiled-in endpoint) is fetched over HTTPS with this bearer token and TLS
+verification always enabled; a download, status, content-type or checksum
+failure is returned to the executor as-is -- the active durable configuration
+is preserved exactly like any other resolve failure, never silently replaced by
+a cached or embedded payload. An incomplete provisioned profile is rejected
+before networking ever starts; see "Two apply_config modes" above.
 
 The current product target uses a 4 MiB partition table with a 1.5 MiB factory application,
 128 KiB dedicated `easyled` NVS and 64 KiB coredump partition. It differs from
@@ -327,12 +419,16 @@ state) live as inspectable files
 under `validation/fixtures/`, embedded into the binary via
 `EMBED_TXTFILES` rather than duplicated as string literals. It checks the two
 exact provisional fixture hashes, command parsing, event/state/capability
-serialization, terminal replay, the payload adapter's happy paths and a representative
+serialization (including `capability_reported`'s `hardware_binding_id`/
+`generation`/`max_payload_bytes` boundaries: absent/invalid binding,
+zero generation, and a zero/correct payload limit), terminal replay, the
+payload adapter's happy paths and a representative
 type/range/duplicate/unsupported failure table, and the executor's full
 scenario table (happy-path apply_config, duplicate replay, preset cache-miss/
 already-active no-op, checksum-mismatch rejection, staging/activation-failure
 rollback, terminal-store-failure rollback, terminal-publish-failure survival,
-reboot/ota rejection, and 20 repeated commands with no leak) through a real
+reboot and ota rejection as `unsupported_command`, and 20 repeated commands
+with no leak) through a real
 `Composer`/`FakeSink` pair, proving a fixture's own bytes reach rendered pixels.
 It also executes the concrete eight-entry journal, immutable duplicates and
 oldest eviction; A/B recovery and rollback across simulated reboot; an actual
@@ -340,14 +436,40 @@ oldest eviction; A/B recovery and rollback across simulated reboot; an actual
 The telemetry store is rebooted in place to prove durable boot-counter,
 state-sequence and last-applied-command behavior, while active snapshots prove
 that config version survives preset activation.
-It also covers exact embedded-resource lookup, timestamp format, physical
-topology mismatch rejection, and the production activation adapter over a real
-managed Composer/FakeSink pair through config, preset and clear adoption.
+It also covers exact embedded-resource lookup, timestamp format, logical-slot
+rejection, transactional runtime reconstruction, canonical 4x4 activation,
+scene-only preset inheritance, and restoration after an injected activation
+failure. Durable-storage checks prove rebooting an active preset restores its
+base configuration before the preset scene.
 An injected fake HTTP client verifies exact config-byte delivery, URL/token/CA/
 timeout/limit forwarding, non-HTTPS rejection, transport failure, HTTP status,
 content type, oversize and checksum failures. It does **not** open a network
 connection or validate a live TLS peer, broker permissions or physical flash
 failure.
+
+`NetworkSession`'s connect/subscribe/publish-ack/reconnect state machine is
+exercised the same way, through its public `event()` test seam: a session is
+`init()`-ed (never `start()`-ed, so no real Wi-Fi task runs) and hand-built
+`esp_mqtt_event_t` structs are fed directly to `event()`, with
+`setSubscribeOverrideForTest()` substituting a deterministic ID generator for
+the one SDK call (`esp_mqtt_client_subscribe()`) that requires an actually
+-established broker connection to succeed. This covers, in one scripted
+lifecycle: rejected and downgraded SUBACK (not ready), a stale SUBACK from a
+superseded attempt, granted SUBACK (ready), bounded publish-ack tracking
+(a 9th publish evicts the oldest of 8 tracked IDs), command-queue overflow
+(a 3rd complete message is dropped and counted, the first two still FIFO-
+correct), enqueue-to-PUBACK for both retained state and non-retained
+capability publications (including an idempotent duplicate in-epoch PUBACK),
+disconnect before a PUBACK arrives, a late PUBACK after that disconnect still
+reporting `Unknown` rather than a false `Acknowledged`, enqueue rejection
+while disconnected, reconnect with a fresh subscribe ID that rejects a stale
+one from before the disconnect, and retrying the same state/capability
+revision after reconnect without a new sequence number. A render frame is
+produced successfully while the session sits disconnected, proving the
+render/control path has no dependency on MQTT connectivity. None of this
+opens a socket, a TLS context or a real FreeRTOS MQTT task; it does not
+exercise ESP-MQTT's own TCP/TLS reconnection timing, backoff or outbox
+persistence across a real connection loss.
 
 ```powershell
 cd validation
@@ -358,37 +480,50 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build
 The script merges only a local emulated flash file, captures the result in
 `validation/build/qemu-validation.log`, and terminates QEMU
 after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
-marker is `NETWORK_CONTRACT_VALIDATION checks=312 failures=0 RESULT=ALL_PASS`.
+marker is `NETWORK_CONTRACT_VALIDATION checks=386 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
 shell's `PATH` before invoking the script (no machine-wide configuration change).
 
-The validation target uses the ESP-IDF 4096 B main-task stack. Large candidates,
+The validation target uses an ESP-IDF 8192 B main-task stack. Large candidates,
 fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
-Build verified with ESP-IDF 6.0.0: combined image 1044096 B, static DRAM 70795 B
-(39.17%) and IRAM 89615 B (68.37%). The 1.5 MiB app partition retains 528768 B
-(34%) after the build. These figures include live storage, executor, fixture
-resolver and Composer activation objects but exclude runtime Wi-Fi/TLS heap use.
-The focused image is 680560 B and ran on Espressif QEMU 9.2.2: all 308 checks
-passed, with no assertion, watchdog or panic. Its static DRAM is 172324 B (95.35%,
-8412 B free, dominated by `.bss` test fixtures and real-NVS transaction buffers)
-and IRAM is 47511 B (36.25%). The combined image also booted through real NVS
-initialization with the five-entry network partition table. No broker was accessed.
+Build verified with ESP-IDF 6.0.2: combined image 1110092 B, static DRAM 73439 B
+(40.63%) and IRAM 90555 B (69.09%). The 1.5 MiB app partition retains the
+margin reported by the build's own partition check. These figures include live
+storage, executor, fixture resolver, the HTTPS payload source, the bounded
+MQTT publish-ack tracking table and Composer activation objects but exclude
+runtime Wi-Fi/TLS heap use.
+The focused image is 725809 B and ran on Espressif QEMU 9.2.2: all 386 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 177740 B
+(98.34%, 2996 B free, dominated by `.bss` test fixtures and real-NVS transaction
+buffers) and IRAM is 48047 B (36.66%). DRAM headroom is now thin enough that a
+meaningfully larger validation scenario will need to trim existing static
+fixtures rather than simply add more. The combined image also booted through
+real NVS initialization with the five-entry network partition table. No broker
+or live HTTPS endpoint was accessed.
 
 ## Next integration step
 
-Provision a real device credential and capability-manifest ingestion, then route
-`apply_config` through `HttpsPayloadSource` while retaining
-`EmbeddedPayloadSource` for preset/offline tests. Close the platform-to-hardware
-output-slot mapping before accepting the canonical fixture's slot-only topology.
-Replace the provisional capability object with its canonical schema when EasyLED
-closes it, then exercise command/event/state retain, acknowledgement and reconnect
-behavior with an authorized broker.
-Runtime `PixelFrameSink` output rebuild, provisioning, heap/stack measurements
-under TLS load and broker-loss/render-continuity tests remain product work.
+Provision a real device credential through platform flow #47, then exercise
+provisioned-mode `apply_config` against the deployed backend's own URL once
+that environment and its definitive MQTT topics/credentials exist (backend
+work tracked separately; issues #47 and #56-#61 remain open). Replace the
+laboratory board profile with the first product board's reviewed
+slot/GPIO/current limits. Replace the provisional capability object with its
+canonical schema when EasyLED closes it, then exercise command/event/state
+retain, acknowledgement and reconnect behavior with an authorized broker --
+this firmware's PUBACK tracking (see "Integrated control runtime") has only
+been proven against synthesized events, never a real broker's TCP/TLS
+reconnect timing, backoff or outbox persistence across an actual connection
+loss. EasyLED backend-side reconciliation of delivered state/capability
+revisions and `command_applied`/`command_failed` events remains open as
+issues #58/#59; this firmware's PUBACK is evidence of broker delivery only,
+never of backend persistence. Provisioning, heap/stack measurements under TLS
+load and broker-loss/render-continuity tests against a real broker remain
+product work.
 
 Official references: [ESP-IDF 6.0.2 MQTT component migration](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32/api-reference/protocols/mqtt.html),
 [ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme),

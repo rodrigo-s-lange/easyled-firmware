@@ -15,6 +15,7 @@ constexpr const char *kStagingNamespace = "easyled_stage";
 constexpr const char *kTelemetryNamespace = "easyled_state";
 constexpr const char *kPendingKey = "pending";
 constexpr const char *kActiveKeys[] = {"active_a", "active_b"};
+constexpr const char *kBaseConfigKey = "base_cfg";
 
 uint32_t crc32(const uint8_t *bytes, size_t size)
 {
@@ -465,8 +466,41 @@ esp_err_t NvsDurableStaging::init(ActivationTarget &target,
         err = loadSlot(active_slot_, type, payload, size, sequence, command_id,
                        config_version, preset_id, checksum);
         if (err != ESP_OK) { end(); return err; }
-        err = target_->activateAtFrameBoundary(type, payload, size);
+        const size_t active_record_size = kRecordHeaderBytes + size + 4;
+        if (type == pixels_firmware::CommandType::ActivatePreset) {
+            size_t base_size = sizeof(record_);
+            err = nvs_get_blob(handle_, kBaseConfigKey, record_, &base_size);
+            if (err == ESP_OK) {
+                pixels_firmware::CommandType base_type{};
+                const char *base_payload = nullptr;
+                size_t base_payload_size = 0;
+                uint64_t base_sequence = 0;
+                char base_command_id[37]{};
+                uint32_t base_version = 0;
+                char base_preset_id[37]{};
+                uint8_t base_checksum[32]{};
+                err = decodeStaging(record_, base_size, base_type, base_payload,
+                                    base_payload_size, base_sequence, base_command_id,
+                                    base_version, base_preset_id, base_checksum);
+                if (err == ESP_OK && base_type != pixels_firmware::CommandType::ApplyConfig) {
+                    err = ESP_ERR_INVALID_RESPONSE;
+                }
+                if (err == ESP_OK) {
+                    err = target_->activateAtFrameBoundary(base_type, base_payload,
+                                                           base_payload_size);
+                }
+            }
+            if (err == ESP_OK) {
+                err = loadSlot(active_slot_, type, payload, size, sequence, command_id,
+                               config_version, preset_id, checksum);
+            }
+        }
+        if (err == ESP_OK) { err = target_->activateAtFrameBoundary(type, payload, size); }
         if (err != ESP_OK) { end(); return err; }
+        if (type == pixels_firmware::CommandType::ApplyConfig) {
+            err = commitAndVerify(kBaseConfigKey, record_, active_record_size);
+            if (err != ESP_OK) { end(); return err; }
+        }
         const int old_slot = active_slot_ == 0 ? 1 : 0;
         err = eraseKey(kActiveKeys[old_slot]);
         if (err != ESP_OK) { end(); return err; }
@@ -536,7 +570,26 @@ esp_err_t NvsDurableStaging::finalizePrevious()
         if (pending == ESP_OK) { return nvs_commit(handle_); }
         return pending;
     }
-    esp_err_t err = eraseKey(kPendingKey);
+    esp_err_t err = ESP_OK;
+    if (active_type_ == pixels_firmware::CommandType::ApplyConfig && active_slot_ >= 0) {
+        pixels_firmware::CommandType type{};
+        const char *payload = nullptr;
+        size_t size = 0;
+        uint64_t sequence = 0;
+        char command_id[37]{};
+        uint32_t config_version = 0;
+        char preset_id[37]{};
+        uint8_t checksum[32]{};
+        err = loadSlot(active_slot_, type, payload, size, sequence, command_id,
+                       config_version, preset_id, checksum);
+        if (err == ESP_OK && type != pixels_firmware::CommandType::ApplyConfig) {
+            err = ESP_ERR_INVALID_RESPONSE;
+        }
+        if (err == ESP_OK) {
+            err = commitAndVerify(kBaseConfigKey, record_, kRecordHeaderBytes + size + 4);
+        }
+    }
+    if (err == ESP_OK) { err = eraseKey(kPendingKey); }
     if (err == ESP_OK && prior_slot_ >= 0 && prior_slot_ != active_slot_) {
         err = eraseKey(kActiveKeys[prior_slot_]);
     }
@@ -679,6 +732,34 @@ esp_err_t NvsDurableStaging::rollback()
             uint8_t checksum[32]{};
             err = loadSlot(prior_slot_, type, payload, size, sequence, command_id,
                            config_version, preset_id, checksum);
+            if (err == ESP_OK && type == pixels_firmware::CommandType::ActivatePreset) {
+                size_t base_size = sizeof(record_);
+                err = nvs_get_blob(handle_, kBaseConfigKey, record_, &base_size);
+                if (err == ESP_OK) {
+                    pixels_firmware::CommandType base_type{};
+                    const char *base_payload = nullptr;
+                    size_t base_payload_size = 0;
+                    uint64_t base_sequence = 0;
+                    char base_command_id[37]{};
+                    uint32_t base_version = 0;
+                    char base_preset_id[37]{};
+                    uint8_t base_checksum[32]{};
+                    err = decodeStaging(record_, base_size, base_type, base_payload,
+                                        base_payload_size, base_sequence, base_command_id,
+                                        base_version, base_preset_id, base_checksum);
+                    if (err == ESP_OK && base_type != pixels_firmware::CommandType::ApplyConfig) {
+                        err = ESP_ERR_INVALID_RESPONSE;
+                    }
+                    if (err == ESP_OK) {
+                        err = target_->activateAtFrameBoundary(base_type, base_payload,
+                                                               base_payload_size);
+                    }
+                    if (err == ESP_OK) {
+                        err = loadSlot(prior_slot_, type, payload, size, sequence, command_id,
+                                       config_version, preset_id, checksum);
+                    }
+                }
+            }
             if (err == ESP_OK) { err = target_->activateAtFrameBoundary(type, payload, size); }
             if (err != ESP_OK) { return err; }
         } else {

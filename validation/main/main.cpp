@@ -382,6 +382,67 @@ private:
     esp_pixels_composer::CRGB frame_[50]{};
 };
 
+class RecordingPixelRuntimeBackend final : public pixels_control::PixelRuntimeBackend {
+public:
+    esp_err_t rebuild(const pixels_control::PhysicalOutput *outputs, uint8_t output_count,
+                      const pixels_payload::LedmapCandidate &ledmap,
+                      const int32_t *entries) override
+    {
+        ++rebuild_calls_;
+        if (outputs == nullptr || output_count == 0 ||
+            output_count > pixels_payload::kMaxOutputs ||
+            (ledmap.configured && (entries == nullptr || ledmap.entry_count > kMapCapacity))) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        output_count_ = output_count;
+        for (uint8_t i = 0; i < output_count_; ++i) { outputs_[i] = outputs[i]; }
+        ledmap_ = ledmap;
+        if (ledmap.configured) {
+            std::memcpy(entries_, entries, ledmap.entry_count * sizeof(entries_[0]));
+        }
+        running_ = true;
+        return ESP_OK;
+    }
+
+    esp_err_t apply(const esp_pixels_composer::AtScene &scene) override
+    {
+        ++apply_calls_;
+        if (!running_) { return ESP_ERR_INVALID_STATE; }
+        if (fail_next_apply_) {
+            fail_next_apply_ = false;
+            return ESP_FAIL;
+        }
+        scene_ = scene;
+        return ESP_OK;
+    }
+
+    esp_err_t shutdown() override
+    {
+        running_ = false;
+        return ESP_OK;
+    }
+
+    void failNextApply() { fail_next_apply_ = true; }
+    uint8_t outputCount() const { return output_count_; }
+    const pixels_control::PhysicalOutput &output(uint8_t index) const { return outputs_[index]; }
+    const pixels_payload::LedmapCandidate &ledmap() const { return ledmap_; }
+    int32_t mapEntry(uint32_t index) const { return entries_[index]; }
+    const esp_pixels_composer::AtScene &scene() const { return scene_; }
+    int rebuildCalls() const { return rebuild_calls_; }
+
+private:
+    static constexpr uint32_t kMapCapacity = 64;
+    pixels_control::PhysicalOutput outputs_[pixels_payload::kMaxOutputs]{};
+    uint8_t output_count_ = 0;
+    pixels_payload::LedmapCandidate ledmap_{};
+    int32_t entries_[kMapCapacity]{};
+    esp_pixels_composer::AtScene scene_{};
+    bool running_ = false;
+    bool fail_next_apply_ = false;
+    int rebuild_calls_ = 0;
+    int apply_calls_ = 0;
+};
+
 // The one DurableStaging implementation these gates use: stages raw bytes
 // (append-only, exactly like a reboot-recoverable implementation would),
 // then on activateAtFrameBoundary() re-parses those staged bytes through
@@ -521,6 +582,7 @@ public:
     esp_err_t activateAtFrameBoundary(pixels_firmware::CommandType type,
                                       const char *payload, size_t size) override
     {
+        if (activate_calls_ == 0) { first_type_ = type; }
         ++activate_calls_;
         if (payload == nullptr || size == 0 || size > pixels_payload::kMaxPayloadBytes) {
             return ESP_ERR_INVALID_SIZE;
@@ -540,12 +602,18 @@ public:
         return ESP_OK;
     }
 
-    void resetObservation() { activate_calls_ = 0; clear_calls_ = 0; }
+    void resetObservation()
+    {
+        activate_calls_ = 0;
+        clear_calls_ = 0;
+        first_type_ = pixels_firmware::CommandType::ApplyConfig;
+    }
     bool matches(pixels_firmware::CommandType type, const char *payload, size_t size) const
     {
         return active_ && type_ == type && size_ == size && fingerprint_ == fingerprint(payload, size);
     }
     int activateCalls() const { return activate_calls_; }
+    pixels_firmware::CommandType firstType() const { return first_type_; }
 
 private:
     static uint32_t fingerprint(const char *bytes, size_t size)
@@ -560,6 +628,7 @@ private:
 
     bool active_ = false;
     pixels_firmware::CommandType type_ = pixels_firmware::CommandType::ApplyConfig;
+    pixels_firmware::CommandType first_type_ = pixels_firmware::CommandType::ApplyConfig;
     size_t size_ = 0;
     uint32_t fingerprint_ = 0;
     int activate_calls_ = 0;
@@ -713,7 +782,10 @@ void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t pres
     staging.end();
     target.resetObservation();
     CHECK(staging.init(target, journal) == ESP_OK);
-    CHECK(target.activateCalls() == 1 && target.matches(CommandType::ActivatePreset, preset, preset_size));
+    // A preset is scene-only. Boot first restores the separately retained
+    // base configuration (outputs + canvas), then the newest preset scene.
+    CHECK(target.activateCalls() == 2 && target.firstType() == CommandType::ApplyConfig &&
+          target.matches(CommandType::ActivatePreset, preset, preset_size));
     CHECK(staging.activePresetMatches(kPresetId, preset_digest));
     CHECK(staging.activeSnapshot(active_snapshot) == ESP_OK && active_snapshot.active &&
           active_snapshot.type == CommandType::ActivatePreset &&
@@ -907,29 +979,140 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
     pixels_control::HttpPayloadResult invalid_result{};
     CHECK(idf_http.download(invalid_request, invalid_result) == ESP_ERR_INVALID_ARG);
 
+    // RoutedPayloadSource, provisioned mode: apply_config must reach HTTPS
+    // (never the embedded table, even though `source` above also has an
+    // apply_config entry of its own), and every other type must reach the
+    // embedded table without ever touching the HTTP fake -- the product's
+    // fixed, non-fallback routing.
+    static pixels_control::RoutedPayloadSource routed(&https_source, source);
+    CHECK(routed.provisioned());
+    const int routed_calls_before = http.calls;
+    command = pixels_firmware::Command{};
+    command.type = pixels_firmware::CommandType::ApplyConfig;
+    command.has_checksum = true;
+    std::strncpy(command.resource_url,
+                 "https://example.invalid/api/v1/devices/33333333-3333-3333-3333-333333333333/config/1",
+                 sizeof(command.resource_url) - 1);
+    std::memcpy(command.checksum, canonical_config_digest, sizeof(command.checksum));
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_OK &&
+          resolved_size == http.body_size && std::memcmp(resolved, http.body, http.body_size) == 0 &&
+          http.calls == routed_calls_before + 1);
+
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(activate_preset_command_provisional_json),
+                                        FIXTURE_SIZE(activate_preset_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_OK &&
+          resolved_size == FIXTURE_SIZE(preset_payload_provisional_json) &&
+          std::memcmp(resolved_digest, preset_digest, sizeof(resolved_digest)) == 0 &&
+          http.calls == routed_calls_before + 1); // unchanged -- the embedded table handled this, not HTTPS
+
+    // Provisioned mode, transport/403/checksum failure: the failure returns
+    // as-is and the embedded apply_config fixture is never substituted.
+    command = pixels_firmware::Command{};
+    command.type = pixels_firmware::CommandType::ApplyConfig;
+    command.has_checksum = true;
+    std::strncpy(command.resource_url,
+                 "https://example.invalid/api/v1/devices/33333333-3333-3333-3333-333333333333/config/1",
+                 sizeof(command.resource_url) - 1);
+    std::memcpy(command.checksum, canonical_config_digest, sizeof(command.checksum));
+    http.status_code = 403;
+    resolved_size = 99;
+    std::memset(resolved_digest, 0xa5, sizeof(resolved_digest));
+    // ESP_FAIL (not ESP_OK with substituted bytes) is itself the proof that
+    // this did not quietly succeed via the embedded table instead.
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) == ESP_FAIL &&
+          resolved_size == 0 && resolved_digest[0] == 0);
+    http.error = ESP_ERR_TIMEOUT;
+    http.status_code = 200;
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_ERR_TIMEOUT && resolved_size == 0);
+    http.error = ESP_OK;
+    std::memcpy(command.checksum, canonical_config_digest, sizeof(command.checksum));
+    command.checksum[0] = static_cast<uint8_t>(command.checksum[0] ^ 0xff); // force a mismatch
+    CHECK(routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_ERR_INVALID_CRC && resolved_size == 0);
+
+    // Laboratory mode: a null HTTPS source means apply_config also resolves
+    // from the embedded table, and the HTTP fake is never touched.
+    static pixels_control::RoutedPayloadSource lab_routed(nullptr, source);
+    CHECK(!lab_routed.provisioned());
+    const int lab_calls_before = http.calls;
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(apply_config_command_provisional_json),
+                                        FIXTURE_SIZE(apply_config_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(lab_routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_OK &&
+          resolved_size == FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json) &&
+          std::memcmp(resolved, FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
+                      resolved_size) == 0 &&
+          http.calls == lab_calls_before);
+    CHECK(pixels_firmware::parseCommand(FIXTURE_BYTES(activate_preset_command_provisional_json),
+                                        FIXTURE_SIZE(activate_preset_command_provisional_json),
+                                        command, parse_error) == ESP_OK);
+    CHECK(lab_routed.resolve(command, resolved, sizeof(resolved), resolved_size, resolved_digest) ==
+          ESP_OK && http.calls == lab_calls_before);
+
+    // validHttpsConfig: boot-time rejection of a profile that claims
+    // provisioned mode (a non-null token) but is otherwise malformed, before
+    // any command is ever received.
+    pixels_control::HttpsPayloadSource::Config candidate{};
+    candidate.bearer_token = kTestToken;
+    candidate.server_ca_pem = kTestCa;
+    CHECK(pixels_control::validHttpsConfig(candidate)); // complete: the baseline for every mutation below
+    candidate.bearer_token = nullptr;
+    // validHttpsConfig itself does not distinguish null from empty -- both
+    // fail. The application layer draws that line (null = laboratory mode,
+    // never even reaching this check; empty = an incomplete claimed profile).
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.bearer_token = "";
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    static char oversized_token[pixels_control::HttpsPayloadSource::kMaxBearerTokenBytes + 2];
+    std::memset(oversized_token, 'a', sizeof(oversized_token) - 1);
+    oversized_token[sizeof(oversized_token) - 1] = '\0';
+    candidate.bearer_token = oversized_token;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.bearer_token = kTestToken;
+    candidate.server_ca_pem = "";
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.server_ca_pem = kTestCa;
+    candidate.timeout_ms = 0;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.timeout_ms = 60001;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.timeout_ms = 10000;
+    candidate.max_payload_bytes = 0;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.max_payload_bytes = pixels_payload::kMaxPayloadBytes + 1;
+    CHECK(!pixels_control::validHttpsConfig(candidate));
+    candidate.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
+    CHECK(pixels_control::validHttpsConfig(candidate)); // every mutation reverted -- complete again
+
     char timestamp[36]{};
     pixels_control::UtcTimestampSource timestamps;
     timestamps.now(timestamp);
     CHECK(std::strlen(timestamp) == 20 && timestamp[4] == '-' && timestamp[10] == 'T' &&
           timestamp[19] == 'Z');
 
-    // This is the production activation adapter over a real managed Composer,
-    // with only the hardware transport replaced by FakeSink. Confirmation is
-    // obtained from reclaim(), not from a timing guess.
-    static FakeSink sink;
-    static esp_pixels_composer::Composer composer;
-    CHECK(composer.build(sink) == ESP_OK);
-    CHECK(composer.start(2) == ESP_OK);
-    static constexpr pixels_payload::OutputCandidate topology[] = {
-        {.slot_index = 0, .pixel_count = 50, .order = esp_pixels::PixelOrder::GRB},
+    static constexpr pixels_control::BoardOutputBinding bindings[] = {
+        {.slot_index = 0, .gpio = 16, .max_pixels = 372,
+         .safe_pixel_count = 50, .safe_order = esp_pixels::PixelOrder::GRB},
     };
-    static pixels_control::ComposerActivationTarget target(composer, topology, 1);
+    static constexpr pixels_control::BoardProfile profile{
+        .outputs = bindings,
+        .output_count = 1,
+    };
+    static RecordingPixelRuntimeBackend pixel_runtime;
+    static pixels_control::TransactionalPixelActivationTarget target(pixel_runtime, profile);
+    CHECK(target.beginSafeBlank() == ESP_OK && pixel_runtime.outputCount() == 1 &&
+          pixel_runtime.output(0).gpio == 16 && pixel_runtime.output(0).pixel_count == 50 &&
+          pixel_runtime.scene().brightness == 0);
+
     const size_t config_size = FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json);
     std::memcpy(resolved, FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json), config_size);
     resolved[config_size] = '\0';
-    char *pixel_count = std::strstr(resolved, "\"pixel_count\":50");
-    CHECK(pixel_count != nullptr);
-    if (pixel_count != nullptr) { pixel_count[15] = '1'; }
+    char *slot_index = std::strstr(resolved, "\"slot_index\":0");
+    CHECK(slot_index != nullptr);
+    if (slot_index != nullptr) { slot_index[std::strlen("\"slot_index\":")] = '1'; }
     CHECK(target.activateAtFrameBoundary(
               pixels_firmware::CommandType::ApplyConfig,
               resolved, config_size) == ESP_ERR_NOT_SUPPORTED);
@@ -937,22 +1120,293 @@ void runControlRuntimeChecks(const uint8_t config_digest[32], const uint8_t pres
               pixels_firmware::CommandType::ApplyConfig,
               FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
               FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json)) == ESP_OK);
+    CHECK(pixel_runtime.outputCount() == 1 && pixel_runtime.output(0).slot_index == 0 &&
+          pixel_runtime.output(0).gpio == 16 && pixel_runtime.output(0).pixel_count == 50 &&
+          !pixel_runtime.ledmap().configured && pixel_runtime.scene().count == 1 &&
+          pixel_runtime.scene().segments[0].effect_id == 2);
     CHECK(target.activateAtFrameBoundary(
               pixels_firmware::CommandType::ActivatePreset,
               FIXTURE_BYTES(preset_payload_provisional_json),
               FIXTURE_SIZE(preset_payload_provisional_json)) == ESP_OK);
-    bool preset_pushed = false;
-    const TickType_t push_started = xTaskGetTickCount();
-    while (xTaskGetTickCount() - push_started < pdMS_TO_TICKS(150)) {
-        if (sink.pixel(0).r == 0x00 && sink.pixel(0).g == 0x37 && sink.pixel(0).b == 0xDC) {
-            preset_pushed = true;
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
+    CHECK(pixel_runtime.scene().count == 1 && pixel_runtime.scene().segments[0].effect_id == 0 &&
+          pixel_runtime.scene().segments[0].params.color[0].b == 0xff);
+
+    // The canonical PR #72 bytes now cross the complete activation boundary:
+    // logical slot -> board GPIO, 4x4 table materialization and 2D scene.
+    CHECK(target.activateAtFrameBoundary(
+              pixels_firmware::CommandType::ApplyConfig,
+              FIXTURE_BYTES(sample_config_payload_canonical_json),
+              FIXTURE_SIZE(sample_config_payload_canonical_json)) == ESP_OK);
+    CHECK(pixel_runtime.output(0).gpio == 16 && pixel_runtime.output(0).pixel_count == 16 &&
+          pixel_runtime.ledmap().configured && pixel_runtime.ledmap().width == 4 &&
+          pixel_runtime.ledmap().height == 4 && pixel_runtime.mapEntry(0) == 0 &&
+          pixel_runtime.mapEntry(15) == 15 && pixel_runtime.scene().count == 1 &&
+          pixel_runtime.scene().segments[0].is2D);
+
+    // A failure after the transport was rebuilt restores the last confirmed
+    // canonical topology and scene before reporting the candidate failure.
+    const int rebuilds_before_failure = pixel_runtime.rebuildCalls();
+    pixel_runtime.failNextApply();
+    CHECK(target.activateAtFrameBoundary(
+              pixels_firmware::CommandType::ApplyConfig,
+              FIXTURE_BYTES(config_payload_bench_gpio16_50_provisional_json),
+              FIXTURE_SIZE(config_payload_bench_gpio16_50_provisional_json)) == ESP_FAIL);
+    CHECK(pixel_runtime.rebuildCalls() == rebuilds_before_failure + 2 &&
+          pixel_runtime.output(0).pixel_count == 16 && pixel_runtime.ledmap().configured &&
+          pixel_runtime.scene().segments[0].is2D);
+
+    CHECK(target.clearAtFrameBoundary() == ESP_OK && pixel_runtime.output(0).pixel_count == 50 &&
+          !pixel_runtime.ledmap().configured && pixel_runtime.scene().brightness == 0);
+}
+
+// =========================================================================
+// NetworkSession: deterministic MQTT connect/subscribe/publish-ack/reconnect
+// lifecycle, driven entirely through the public event() test seam (see its
+// own doc comment in network_session.hpp). No real Wi-Fi, broker or MQTT
+// task exists anywhere below -- init() is called and start() never is, and
+// every esp_mqtt_event_t is hand-built. esp_mqtt_client_subscribe() itself
+// requires a real completed broker handshake to return a valid id, which
+// this fake transport cannot provide, so setSubscribeOverrideForTest()
+// substitutes a deterministic id generator for the SUBSCRIBE call only;
+// esp_mqtt_client_enqueue() (publish()'s own SDK call) has no such gate and
+// runs for real, unmodified.
+// =========================================================================
+int g_fake_subscribe_next_id = 100;
+int fakeSubscribe(const char *, int) { return g_fake_subscribe_next_id++; }
+
+esp_mqtt_event_t subackEvent(int msg_id, uint8_t &grant_byte)
+{
+    esp_mqtt_event_t ev{};
+    ev.msg_id = msg_id;
+    ev.data = reinterpret_cast<char *>(&grant_byte);
+    ev.data_len = 1;
+    return ev;
+}
+
+esp_mqtt_event_t publishedEvent(int msg_id)
+{
+    esp_mqtt_event_t ev{};
+    ev.msg_id = msg_id;
+    return ev;
+}
+
+esp_mqtt_event_t dataEvent(const char *topic, const char *payload, bool retain = false)
+{
+    esp_mqtt_event_t ev{};
+    ev.topic = const_cast<char *>(topic);
+    ev.topic_len = static_cast<int>(std::strlen(topic));
+    ev.data = const_cast<char *>(payload);
+    ev.data_len = static_cast<int>(std::strlen(payload));
+    ev.current_data_offset = 0;
+    ev.total_data_len = ev.data_len;
+    ev.retain = retain;
+    return ev;
+}
+
+void runNetworkSessionChecks(pixels_network::NetworkSession &session)
+{
+    using Ack = pixels_network::NetworkSession::PublishAck;
+    static constexpr char kCommandTopic[] =
+        "devices/11111111-1111-4111-8111-111111111111/commands";
+    static constexpr char kStateTopic[] =
+        "devices/11111111-1111-4111-8111-111111111111/state";
+    static constexpr char kEventTopic[] =
+        "devices/11111111-1111-4111-8111-111111111111/events";
+    pixels_network::NetworkSession::Config cfg{};
+    cfg.ssid = "validation-ssid";
+    cfg.wifi_password = "validation-password";
+    cfg.broker_uri = "wss://broker.invalid/mqtt";
+    cfg.client_id = "validation-client";
+    cfg.username = "validation-user";
+    cfg.password = "validation-password";
+    cfg.command_topic = kCommandTopic;
+
+    CHECK(session.init(cfg) == ESP_OK);
+    session.setSubscribeOverrideForTest(fakeSubscribe);
+    static pixels_control::MqttTelemetrySink telemetry(session, kStateTopic, kEventTopic);
+
+    // --- CONNECTED -> rejected SUBACK, then downgraded SUBACK: neither
+    // leaves the session ready to publish or receive commands. -----------
+    esp_mqtt_event_t connected_event{};
+    session.event(MQTT_EVENT_CONNECTED, connected_event);
+    const int subscribe_id_1 = g_fake_subscribe_next_id - 1;
+    uint8_t rejected = 0x80;
+    auto suback_rejected = subackEvent(subscribe_id_1, rejected);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_rejected);
+    CHECK(!session.status().subscribed && session.status().connections == 1 &&
+          session.status().transport_errors == 1);
+
+    session.event(MQTT_EVENT_CONNECTED, connected_event);
+    const int subscribe_id_2 = g_fake_subscribe_next_id - 1;
+    uint8_t downgraded = 0; // granted qos0, not the requested qos1
+    auto suback_downgraded = subackEvent(subscribe_id_2, downgraded);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_downgraded);
+    CHECK(!session.status().subscribed && session.status().connections == 2 &&
+          session.status().transport_errors == 2);
+    // A late SUBACK from the first, already-superseded subscribe attempt
+    // must not retroactively grant readiness.
+    uint8_t late_grant = 1;
+    auto suback_stale = subackEvent(subscribe_id_1, late_grant);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_stale);
+    CHECK(!session.status().subscribed);
+
+    // --- CONNECTED -> SUBACK granted -> ready. ---------------------------
+    session.event(MQTT_EVENT_CONNECTED, connected_event);
+    const int subscribe_id_3 = g_fake_subscribe_next_id - 1;
+    uint8_t granted = 1;
+    auto suback_granted = subackEvent(subscribe_id_3, granted);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_granted);
+    CHECK(session.status().subscribed && session.status().connections == 3);
+
+    // --- Bounded publish-ack tracking: a 9th publish evicts the oldest of
+    // 8 tracked slots, which then surfaces as Unknown. ---------------------
+    int ring_ids[9];
+    for (int i = 0; i < 9; ++i) {
+        ring_ids[i] = session.publish(kStateTopic, "x", 1);
+        CHECK(ring_ids[i] >= 0);
     }
-    CHECK(preset_pushed);
-    CHECK(target.clearAtFrameBoundary() == ESP_OK);
-    CHECK(composer.end() == ESP_OK);
+    CHECK(session.publishStatus(ring_ids[0]) == Ack::Unknown);
+    CHECK(session.publishStatus(ring_ids[8]) == Ack::Pending);
+
+    // --- Queue overflow: kQueueLength (2) complete command messages fill
+    // the bounded queue; a 3rd is dropped and counted, never blocking. -----
+    auto data1 = dataEvent(kCommandTopic, "{\"a\":1}");
+    auto data2 = dataEvent(kCommandTopic, "{\"a\":2}");
+    auto data3 = dataEvent(kCommandTopic, "{\"a\":3}");
+    session.event(MQTT_EVENT_DATA, data1);
+    session.event(MQTT_EVENT_DATA, data2);
+    CHECK(session.status().queue_overflows == 0);
+    session.event(MQTT_EVENT_DATA, data3);
+    CHECK(session.status().queue_overflows == 1);
+    pixels_network::NetworkSession::Message drained{};
+    CHECK(session.receive(drained) && drained.size == 7 &&
+          std::memcmp(drained.data, "{\"a\":1}", 7) == 0);
+    CHECK(session.receive(drained) && std::memcmp(drained.data, "{\"a\":2}", 7) == 0);
+    CHECK(!session.receive(drained)); // the dropped 3rd message was never queued
+
+    // --- enqueue -> PUBACK for a retained state publication, including a
+    // duplicate in-epoch PUBACK staying idempotently Acknowledged. ---------
+    pixels_firmware::StateReport state1{};
+    state1.device_id = kDeviceId;
+    state1.hardware_binding_id = kHardwareBindingId;
+    state1.generation = 1;
+    state1.boot_counter = 1;
+    state1.state_sequence = 1;
+    state1.reported_at = "2026-10-10T12:00:00Z";
+    state1.firmware_version = "0.1.0-dev";
+    state1.mode = pixels_firmware::DeviceMode::ConfigActive;
+    state1.config_version = 1;
+    state1.last_applied_command_id = kApplyCommandId;
+    int msg_id_state = -1;
+    CHECK(telemetry.publishState(state1, msg_id_state) == ESP_OK && msg_id_state >= 0);
+    CHECK(session.publishStatus(msg_id_state) == Ack::Pending);
+    const uint32_t acks_before_state = session.status().publish_acks;
+    auto published_state = publishedEvent(msg_id_state);
+    session.event(MQTT_EVENT_PUBLISHED, published_state);
+    CHECK(session.publishStatus(msg_id_state) == Ack::Acknowledged &&
+          session.status().publish_acks == acks_before_state + 1);
+    session.event(MQTT_EVENT_PUBLISHED, published_state); // duplicate, same epoch
+    CHECK(session.publishStatus(msg_id_state) == Ack::Acknowledged &&
+          session.status().publish_acks == acks_before_state + 1);
+
+    // --- enqueue -> PUBACK for a non-retained capability report, left
+    // Pending so the next step can exercise disconnect-before-PUBACK. ------
+    static constexpr uint8_t kLocalEffectIds[] = {0, 2};
+    pixels_firmware::CapabilityReport capability1{};
+    capability1.device_id = kDeviceId;
+    capability1.hardware_binding_id = kHardwareBindingId;
+    capability1.generation = 1;
+    capability1.firmware_version = "0.1.0-dev";
+    capability1.reported_at = "2026-10-10T12:00:01Z";
+    capability1.capabilities.free_internal_heap_bytes = 100000;
+    capability1.capabilities.largest_internal_heap_block_bytes = 60000;
+    capability1.capabilities.max_output_slots = 2;
+    capability1.capabilities.max_pixels_per_output = 50;
+    capability1.capabilities.configured_output_count = 1;
+    capability1.capabilities.configured_total_pixels = 50;
+    capability1.capabilities.max_segments = 32;
+    capability1.capabilities.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
+    capability1.capabilities.effect_ids = kLocalEffectIds;
+    capability1.capabilities.effect_count = sizeof(kLocalEffectIds);
+    capability1.capabilities.supports_ledmap = true;
+    capability1.capabilities.supports_2d = true;
+    capability1.capabilities.supports_mirror = true;
+    capability1.capabilities.custom_param_slots = 3;
+    capability1.capabilities.preset_cache_slots = 100;
+    int msg_id_cap = -1;
+    CHECK(telemetry.publishCapability(capability1, msg_id_cap) == ESP_OK && msg_id_cap >= 0);
+    CHECK(session.publishStatus(msg_id_cap) == Ack::Pending);
+
+    // --- Disconnect before that PUBACK arrives: the pending capability
+    // publication (and any further status lookup for it) becomes Unknown,
+    // never a false Acknowledged. ------------------------------------------
+    esp_mqtt_event_t disconnected_event{};
+    session.event(MQTT_EVENT_DISCONNECTED, disconnected_event);
+    CHECK(session.publishStatus(msg_id_cap) == Ack::Unknown);
+
+    // --- The render/control runtime has no dependency on MQTT connectivity:
+    // a scene renders correctly while this session sits disconnected. ------
+    {
+        static FakeSink disconnected_sink;
+        static esp_pixels_composer::Composer disconnected_composer;
+        esp_pixels_fx::FxParams parameters{};
+        parameters.color[0] = {9, 10, 11};
+        CHECK(disconnected_composer.build(disconnected_sink) == ESP_OK);
+        CHECK(disconnected_composer.addSegment(0, 50, esp_pixels_fx::FX_SOLID, parameters) == ESP_OK);
+        CHECK(disconnected_composer.renderFrame(2000) == ESP_OK);
+        CHECK(disconnected_sink.pixel(0).r == 9 && disconnected_sink.pixel(0).g == 10 &&
+              disconnected_sink.pixel(0).b == 11);
+        CHECK(disconnected_composer.end() == ESP_OK);
+    }
+
+    // --- A late PUBACK for that same pre-disconnect message id, arriving
+    // only now, must still not resurrect it as Acknowledged (stale epoch). -
+    auto late_published_cap = publishedEvent(msg_id_cap);
+    const uint32_t acks_before_late = session.status().publish_acks;
+    session.event(MQTT_EVENT_PUBLISHED, late_published_cap);
+    CHECK(session.publishStatus(msg_id_cap) == Ack::Unknown &&
+          session.status().publish_acks == acks_before_late);
+
+    // --- Enqueue rejection while disconnected (not yet resubscribed): the
+    // telemetry sink fails closed, consuming no message id, leaving the
+    // caller free to retry the identical state/capability revision. --------
+    int msg_id_rejected = -1;
+    CHECK(telemetry.publishState(state1, msg_id_rejected) == ESP_FAIL && msg_id_rejected == -1);
+
+    // --- Reconnect and resubscribe: a fresh CONNECTED/SUBACK cycle restores
+    // readiness with a new subscribe id; the superseded one from before the
+    // disconnect cannot leak through. --------------------------------------
+    session.event(MQTT_EVENT_CONNECTED, connected_event);
+    const int subscribe_id_4 = g_fake_subscribe_next_id - 1;
+    CHECK(subscribe_id_4 != subscribe_id_3);
+    uint8_t stale_grant = 1;
+    auto suback_stale_after_reconnect = subackEvent(subscribe_id_3, stale_grant);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_stale_after_reconnect);
+    CHECK(!session.status().subscribed);
+    uint8_t granted_again = 1;
+    auto suback_granted_again = subackEvent(subscribe_id_4, granted_again);
+    session.event(MQTT_EVENT_SUBSCRIBED, suback_granted_again);
+    CHECK(session.status().subscribed && session.status().connections == 4);
+
+    // --- State/capability retry after reconnect: the SAME revision (same
+    // state_sequence, same capability content) is re-enqueued under a new
+    // message id and now reaches Acknowledged -- no second durable sequence
+    // was needed to make it eligible for retry. -----------------------------
+    int msg_id_cap_retry = -1;
+    CHECK(telemetry.publishCapability(capability1, msg_id_cap_retry) == ESP_OK &&
+          msg_id_cap_retry >= 0 && msg_id_cap_retry != msg_id_cap);
+    auto published_cap_retry = publishedEvent(msg_id_cap_retry);
+    session.event(MQTT_EVENT_PUBLISHED, published_cap_retry);
+    CHECK(session.publishStatus(msg_id_cap_retry) == Ack::Acknowledged);
+
+    pixels_firmware::StateReport state1_retry = state1;
+    CHECK(state1_retry.state_sequence == state1.state_sequence);
+    int msg_id_state_retry = -1;
+    CHECK(telemetry.publishState(state1_retry, msg_id_state_retry) == ESP_OK &&
+          msg_id_state_retry >= 0 && msg_id_state_retry != msg_id_state);
+    auto published_state_retry = publishedEvent(msg_id_state_retry);
+    session.event(MQTT_EVENT_PUBLISHED, published_state_retry);
+    CHECK(session.publishStatus(msg_id_state_retry) == Ack::Acknowledged);
 }
 
 } // namespace
@@ -1093,6 +1547,8 @@ extern "C" void app_main()
     static constexpr uint8_t kEffectIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
     CapabilityReport capability{};
     capability.device_id = kDeviceId;
+    capability.hardware_binding_id = kHardwareBindingId;
+    capability.generation = 1; // same generation as the StateReport fixture above, same boot
     capability.firmware_version = "0.1.0-dev";
     capability.reported_at = "2026-09-22T12:00:06Z";
     capability.capabilities.free_internal_heap_bytes = 120000;
@@ -1102,6 +1558,7 @@ extern "C" void app_main()
     capability.capabilities.configured_output_count = 1;
     capability.capabilities.configured_total_pixels = 50;
     capability.capabilities.max_segments = 32;
+    capability.capabilities.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
     capability.capabilities.effect_ids = kEffectIds;
     capability.capabilities.effect_count = sizeof(kEffectIds);
     capability.capabilities.supports_ledmap = true;
@@ -1120,6 +1577,26 @@ extern "C" void app_main()
     capability.capabilities.largest_internal_heap_block_bytes = 120001;
     CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
                                     capability_size) == ESP_ERR_INVALID_ARG);
+    capability.capabilities.largest_internal_heap_block_bytes = 64000;
+
+    // --- M0 telemetry contract: hardware_binding_id/generation/max_payload_bytes ---
+    capability.hardware_binding_id = nullptr; // absent
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
+    capability.hardware_binding_id = "not-a-uuid"; // invalid
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
+    capability.hardware_binding_id = kHardwareBindingId;
+    capability.generation = 0;
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
+    capability.generation = 1;
+    capability.capabilities.max_payload_bytes = 0; // declared limit missing
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_ERR_INVALID_ARG);
+    capability.capabilities.max_payload_bytes = pixels_payload::kMaxPayloadBytes;
+    CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
+                                    capability_size) == ESP_OK);
 
     static OneRecordJournal journal;
     static TerminalRecord terminal{};
@@ -1135,6 +1612,7 @@ extern "C" void app_main()
 
     static pixels_network::NetworkSession network_probe;
     CHECK(!network_probe.status().running && !network_probe.status().wifi_connected);
+    runNetworkSessionChecks(network_probe);
     static_assert(esp_pixels_composer_adapter_esp_pixels::EspPixelsSink::kMaxOutputs == 2);
     CHECK(esp_pixels_fx::describe(esp_pixels_fx::FX_RAINBOW) != nullptr);
 
@@ -1468,7 +1946,18 @@ extern "C" void app_main()
         const int activate_before4 = staging.activateCalls();
         CHECK(reboot_executor.execute(kReboot, sizeof(kReboot) - 1) == ESP_OK);
         CHECK(staging.activateCalls() == activate_before4);
-        CHECK(event_sink6.anyContains("command_rejected") && event_sink6.anyContains("not_implemented"));
+        CHECK(event_sink6.anyContains("command_rejected") && event_sink6.anyContains("unsupported_command"));
+
+        // Same rejection path for `ota`, reusing reboot_executor/journal7 --
+        // a fresh Executor instance would duplicate its 8 KiB payload_buffer_
+        // for no reason, and this path never reaches payload resolution.
+        event_sink6.reset();
+        static constexpr char kOta[] =
+            "{\"command_id\":\"88888888-8888-4888-8888-888888888888\",\"type\":\"ota\",\"requested_at\":\"2026-09-22T12:06:01Z\",\"requested_by\":{\"actor_type\":\"tenant-operator\",\"actor_id\":\"33333333-3333-4333-8333-333333333333\"},\"idempotency_key\":\"y\",\"payload\":{\"firmware_version\":\"0.2.0\",\"artifact_url\":\"https://example.invalid/fw/0.2.0.bin\",\"checksum\":\"b62868aef25369d8b00db8dbc6af34c7c82b060b5570b0b7b24859a7d5547c5a\"}}";
+        const int activate_before5 = staging.activateCalls();
+        CHECK(reboot_executor.execute(kOta, sizeof(kOta) - 1) == ESP_OK);
+        CHECK(staging.activateCalls() == activate_before5);
+        CHECK(event_sink6.anyContains("command_rejected") && event_sink6.anyContains("unsupported_command"));
 
         // --- No assertion/panic/leak across repeated commands --------------
         for (int i = 0; i < 20; ++i) {

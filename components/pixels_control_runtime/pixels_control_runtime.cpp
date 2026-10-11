@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <new>
 
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -87,13 +88,6 @@ esp_err_t onHttpEvent(esp_http_client_event_t *event)
     std::memcpy(context.destination + context.size, event->data, incoming);
     context.size += incoming;
     return ESP_OK;
-}
-
-bool sameOutput(const pixels_payload::OutputCandidate &left,
-                const pixels_payload::OutputCandidate &right)
-{
-    return left.slot_index == right.slot_index && left.pixel_count == right.pixel_count &&
-           left.order == right.order;
 }
 
 bool pollReclaimUntil(esp_pixels_composer::Composer &composer, uint32_t timeout_ms)
@@ -208,6 +202,20 @@ esp_err_t EspHttpPayloadClient::download(const HttpPayloadRequest &request,
     return cleanup;
 }
 
+bool validHttpsConfig(const HttpsPayloadSource::Config &config)
+{
+    const size_t token_size = config.bearer_token == nullptr ? 0 :
+        strnlen(config.bearer_token, HttpsPayloadSource::kMaxBearerTokenBytes + 1);
+    if (token_size == 0 || token_size > HttpsPayloadSource::kMaxBearerTokenBytes) { return false; }
+    if (config.server_ca_pem != nullptr && config.server_ca_pem[0] == '\0') { return false; }
+    if (config.timeout_ms == 0 || config.timeout_ms > kMaximumHttpTimeoutMs) { return false; }
+    if (config.max_payload_bytes == 0 ||
+        config.max_payload_bytes > pixels_payload::kMaxPayloadBytes) {
+        return false;
+    }
+    return true;
+}
+
 HttpsPayloadSource::HttpsPayloadSource(HttpPayloadClient &client, const Config &config)
     : client_(client), config_(config)
 {
@@ -225,12 +233,8 @@ esp_err_t HttpsPayloadSource::resolve(
     if (command.type != pixels_firmware::CommandType::ApplyConfig) {
         return ESP_ERR_NOT_SUPPORTED;
     }
-    const size_t token_size = config_.bearer_token == nullptr ? 0 :
-        strnlen(config_.bearer_token, kMaxBearerTokenBytes + 1);
-    if (!command.has_checksum || !httpsUrl(command.resource_url) || token_size == 0 ||
-        token_size > kMaxBearerTokenBytes || config_.timeout_ms == 0 ||
-        config_.timeout_ms > kMaximumHttpTimeoutMs || config_.max_payload_bytes == 0 ||
-        config_.max_payload_bytes > pixels_payload::kMaxPayloadBytes || capacity == 0) {
+    if (!command.has_checksum || !httpsUrl(command.resource_url) || capacity == 0 ||
+        !validHttpsConfig(config_)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -261,6 +265,22 @@ esp_err_t HttpsPayloadSource::resolve(
     return ESP_OK;
 }
 
+RoutedPayloadSource::RoutedPayloadSource(HttpsPayloadSource *https_source,
+                                         EmbeddedPayloadSource &embedded_source)
+    : https_source_(https_source), embedded_source_(embedded_source)
+{
+}
+
+esp_err_t RoutedPayloadSource::resolve(
+    const pixels_firmware::Command &command, char *buffer, size_t capacity,
+    size_t &size, uint8_t expected_checksum[pixels_firmware::kSha256Bytes])
+{
+    if (https_source_ != nullptr && command.type == pixels_firmware::CommandType::ApplyConfig) {
+        return https_source_->resolve(command, buffer, capacity, size, expected_checksum);
+    }
+    return embedded_source_.resolve(command, buffer, capacity, size, expected_checksum);
+}
+
 MqttEventSink::MqttEventSink(pixels_network::NetworkSession &session, const char *topic)
     : session_(session), topic_(topic)
 {
@@ -277,22 +297,26 @@ MqttTelemetrySink::MqttTelemetrySink(pixels_network::NetworkSession &session,
 {
 }
 
-esp_err_t MqttTelemetrySink::publishState(const pixels_firmware::StateReport &state)
+esp_err_t MqttTelemetrySink::publishState(const pixels_firmware::StateReport &state, int &msg_id)
 {
+    msg_id = -1;
     size_t size = 0;
     esp_err_t err = pixels_firmware::serializeState(state, buffer_, sizeof(buffer_), size);
     if (err != ESP_OK) { return err; }
-    return session_.publish(state_topic_, buffer_, size, true) >= 0 ? ESP_OK : ESP_FAIL;
+    msg_id = session_.publish(state_topic_, buffer_, size, true);
+    return msg_id >= 0 ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t MqttTelemetrySink::publishCapability(
-    const pixels_firmware::CapabilityReport &report)
+    const pixels_firmware::CapabilityReport &report, int &msg_id)
 {
+    msg_id = -1;
     size_t size = 0;
     esp_err_t err = pixels_firmware::serializeCapabilityReport(
         report, buffer_, sizeof(buffer_), size);
     if (err != ESP_OK) { return err; }
-    return session_.publish(event_topic_, buffer_, size, false) >= 0 ? ESP_OK : ESP_FAIL;
+    msg_id = session_.publish(event_topic_, buffer_, size, false);
+    return msg_id >= 0 ? ESP_OK : ESP_FAIL;
 }
 
 void UtcTimestampSource::now(char out[36])
@@ -318,31 +342,35 @@ bool DurableActiveProbe::alreadyActive(
     return staging_.activePresetMatches(preset_id, checksum);
 }
 
-ComposerActivationTarget::ComposerActivationTarget(
-    esp_pixels_composer::Composer &composer,
-    const pixels_payload::OutputCandidate *outputs, uint8_t output_count)
-    : composer_(composer)
+EspPixelRuntimeBackend::~EspPixelRuntimeBackend() { (void)shutdown(); }
+
+esp_err_t EspPixelRuntimeBackend::rebuild(
+    const PhysicalOutput *outputs, uint8_t output_count,
+    const pixels_payload::LedmapCandidate &ledmap, const int32_t *entries)
 {
-    if (outputs == nullptr || output_count == 0 || output_count > pixels_payload::kMaxOutputs) {
-        return;
+    if (outputs == nullptr || output_count == 0 || output_count > pixels_payload::kMaxOutputs ||
+        (ledmap.configured && (entries == nullptr || ledmap.entry_count == 0))) {
+        return ESP_ERR_INVALID_ARG;
     }
-    output_count_ = output_count;
-    for (uint8_t i = 0; i < output_count_; ++i) { outputs_[i] = outputs[i]; }
+    esp_err_t err = shutdown();
+    if (err != ESP_OK) { return err; }
+    err = sink_.init(pixels_[0], outputs[0].gpio, outputs[0].pixel_count, outputs[0].order);
+    for (uint8_t i = 1; err == ESP_OK && i < output_count; ++i) {
+        err = sink_.addOutput(pixels_[i], outputs[i].gpio, outputs[i].pixel_count,
+                              outputs[i].order);
+    }
+    if (err == ESP_OK) { err = composer_.build(sink_); }
+    if (err == ESP_OK && ledmap.configured) {
+        err = composer_.setLedmap(ledmap.width, ledmap.height, entries, ledmap.entry_count);
+    }
+    if (err == ESP_OK) { err = composer_.start(); }
+    if (err != ESP_OK) { (void)shutdown(); }
+    return err;
 }
 
-bool ComposerActivationTarget::topologyMatches(const pixels_payload::Candidate &candidate) const
+esp_err_t EspPixelRuntimeBackend::apply(const esp_pixels_composer::AtScene &scene)
 {
-    if (!candidate.has_outputs) { return true; }
-    if (candidate.output_count != output_count_ || output_count_ == 0) { return false; }
-    for (uint8_t i = 0; i < output_count_; ++i) {
-        if (!sameOutput(candidate.outputs[i], outputs_[i])) { return false; }
-    }
-    return true;
-}
-
-esp_err_t ComposerActivationTarget::applyAndConfirm(const esp_pixels_composer::AtScene &scene)
-{
-    if (output_count_ == 0 || !composer_.running()) { return ESP_ERR_INVALID_STATE; }
+    if (!composer_.running()) { return ESP_ERR_INVALID_STATE; }
     esp_err_t err = composer_.applyConfig(scene.segments, scene.count);
     if (err != ESP_OK) { return err; }
     if (pollReclaimUntil(composer_, kAdoptTimeoutMs)) {
@@ -355,7 +383,126 @@ esp_err_t ComposerActivationTarget::applyAndConfirm(const esp_pixels_composer::A
     return scene.paused ? composer_.pause() : composer_.resume();
 }
 
-esp_err_t ComposerActivationTarget::activateAtFrameBoundary(
+esp_err_t EspPixelRuntimeBackend::shutdown()
+{
+    const esp_err_t composer_err = composer_.end();
+    if (composer_err != ESP_OK) { return composer_err; }
+    return sink_.end();
+}
+
+TransactionalPixelActivationTarget::TransactionalPixelActivationTarget(
+    PixelRuntimeBackend &backend, const BoardProfile &profile)
+    : backend_(backend)
+{
+    if (profile.outputs != nullptr && profile.output_count > 0 &&
+        profile.output_count <= pixels_payload::kMaxOutputs) {
+        binding_count_ = profile.output_count;
+        for (uint8_t i = 0; i < binding_count_; ++i) { bindings_[i] = profile.outputs[i]; }
+    }
+    profile_valid_ = validProfile();
+}
+
+TransactionalPixelActivationTarget::~TransactionalPixelActivationTarget()
+{
+    delete[] base_ledmap_entries_;
+}
+
+bool TransactionalPixelActivationTarget::validProfile() const
+{
+    if (binding_count_ == 0 || binding_count_ > pixels_payload::kMaxOutputs) { return false; }
+    bool has_safe_output = false;
+    for (uint8_t i = 0; i < binding_count_; ++i) {
+        const auto &binding = bindings_[i];
+        if (binding.slot_index >= pixels_payload::kMaxOutputs || binding.gpio < 0 ||
+            binding.max_pixels == 0 || binding.max_pixels > pixels_payload::kMaxPixelsPerOutput ||
+            binding.safe_pixel_count > binding.max_pixels) {
+            return false;
+        }
+        has_safe_output = has_safe_output || binding.safe_pixel_count != 0;
+        for (uint8_t j = 0; j < i; ++j) {
+            if (bindings_[j].slot_index == binding.slot_index || bindings_[j].gpio == binding.gpio) {
+                return false;
+            }
+        }
+    }
+    return has_safe_output;
+}
+
+esp_err_t TransactionalPixelActivationTarget::resolveOutputs(
+    const pixels_payload::Candidate &candidate,
+    PhysicalOutput outputs[pixels_payload::kMaxOutputs]) const
+{
+    if (!profile_valid_ || !candidate.has_outputs || candidate.output_count == 0 ||
+        candidate.output_count > pixels_payload::kMaxOutputs || outputs == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (uint8_t i = 0; i < candidate.output_count; ++i) {
+        const auto &requested = candidate.outputs[i];
+        const BoardOutputBinding *binding = nullptr;
+        for (uint8_t j = 0; j < binding_count_; ++j) {
+            if (bindings_[j].slot_index == requested.slot_index) { binding = &bindings_[j]; break; }
+        }
+        if (binding == nullptr || requested.pixel_count > binding->max_pixels) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        outputs[i] = {
+            .slot_index = requested.slot_index,
+            .gpio = binding->gpio,
+            .pixel_count = requested.pixel_count,
+            .order = requested.order,
+        };
+    }
+    return ESP_OK;
+}
+
+esp_err_t TransactionalPixelActivationTarget::buildSafeBlank()
+{
+    if (!profile_valid_) { return ESP_ERR_INVALID_ARG; }
+    PhysicalOutput safe[pixels_payload::kMaxOutputs]{};
+    uint8_t count = 0;
+    uint32_t total = 0;
+    for (uint8_t i = 0; i < binding_count_; ++i) {
+        if (bindings_[i].safe_pixel_count == 0) { continue; }
+        safe[count++] = {
+            .slot_index = bindings_[i].slot_index,
+            .gpio = bindings_[i].gpio,
+            .pixel_count = bindings_[i].safe_pixel_count,
+            .order = bindings_[i].safe_order,
+        };
+        total += bindings_[i].safe_pixel_count;
+    }
+    pixels_payload::LedmapCandidate identity{};
+    identity.width = static_cast<uint16_t>(total);
+    identity.height = 1;
+    identity.entry_count = total;
+    esp_err_t err = backend_.rebuild(safe, count, identity, nullptr);
+    if (err != ESP_OK) { return err; }
+    esp_pixels_composer::AtScene black{};
+    black.brightness = 0;
+    return backend_.apply(black);
+}
+
+esp_err_t TransactionalPixelActivationTarget::beginSafeBlank()
+{
+    delete[] base_ledmap_entries_;
+    base_ledmap_entries_ = nullptr;
+    base_confirmed_ = false;
+    base_output_count_ = 0;
+    base_ledmap_ = pixels_payload::LedmapCandidate{};
+    active_scene_ = esp_pixels_composer::AtScene{};
+    return buildSafeBlank();
+}
+
+esp_err_t TransactionalPixelActivationTarget::restoreConfirmed()
+{
+    if (!base_confirmed_) { return buildSafeBlank(); }
+    esp_err_t err = backend_.rebuild(base_outputs_, base_output_count_, base_ledmap_,
+                                     base_ledmap_entries_);
+    if (err == ESP_OK) { err = backend_.apply(active_scene_); }
+    return err;
+}
+
+esp_err_t TransactionalPixelActivationTarget::activateAtFrameBoundary(
     pixels_firmware::CommandType type, const char *payload, size_t size)
 {
     if (payload == nullptr || size == 0 || size > pixels_payload::kMaxPayloadBytes) {
@@ -370,15 +517,49 @@ esp_err_t ComposerActivationTarget::activateAtFrameBoundary(
         err = pixels_payload::parsePresetPayload(payload, size, candidate_, schema_error);
     }
     if (err != ESP_OK) { return err; }
-    if (!topologyMatches(candidate_)) { return ESP_ERR_NOT_SUPPORTED; }
-    return applyAndConfirm(candidate_.scene);
+    if (type == pixels_firmware::CommandType::ActivatePreset) {
+        if (!base_confirmed_) { return ESP_ERR_INVALID_STATE; }
+        err = backend_.apply(candidate_.scene);
+        if (err == ESP_OK) {
+            active_scene_ = candidate_.scene;
+            return ESP_OK;
+        }
+        const esp_err_t restored = restoreConfirmed();
+        return restored == ESP_OK ? err : restored;
+    }
+
+    PhysicalOutput resolved[pixels_payload::kMaxOutputs]{};
+    err = resolveOutputs(candidate_, resolved);
+    if (err != ESP_OK) { return err; }
+    int32_t *entries = nullptr;
+    if (candidate_.ledmap.configured) {
+        entries = new (std::nothrow) int32_t[candidate_.ledmap.entry_count];
+        if (entries == nullptr) { return ESP_ERR_NO_MEM; }
+        err = pixels_payload::materializeLedmap(payload, size, candidate_.ledmap, entries,
+                                                candidate_.ledmap.entry_count);
+        if (err != ESP_OK) { delete[] entries; return err; }
+    }
+    err = backend_.rebuild(resolved, candidate_.output_count, candidate_.ledmap, entries);
+    if (err == ESP_OK) { err = backend_.apply(candidate_.scene); }
+    if (err != ESP_OK) {
+        delete[] entries;
+        const esp_err_t restored = restoreConfirmed();
+        return restored == ESP_OK ? err : restored;
+    }
+
+    delete[] base_ledmap_entries_;
+    base_ledmap_entries_ = entries;
+    base_output_count_ = candidate_.output_count;
+    for (uint8_t i = 0; i < base_output_count_; ++i) { base_outputs_[i] = resolved[i]; }
+    base_ledmap_ = candidate_.ledmap;
+    active_scene_ = candidate_.scene;
+    base_confirmed_ = true;
+    return ESP_OK;
 }
 
-esp_err_t ComposerActivationTarget::clearAtFrameBoundary()
+esp_err_t TransactionalPixelActivationTarget::clearAtFrameBoundary()
 {
-    esp_pixels_composer::AtScene empty{};
-    empty.brightness = 0;
-    return applyAndConfirm(empty);
+    return beginSafeBlank();
 }
 
 } // namespace pixels_control

@@ -83,7 +83,8 @@ esp_err_t Executor::execute(const char *json, size_t size)
     publishIntermediate(EventType::CommandReceived, command_id);
 
     if (command_.type == CommandType::Reboot || command_.type == CommandType::Ota) {
-        return storeAndPublishTerminal(EventType::CommandRejected, command_id, ReasonCode::kNotImplemented,
+        return storeAndPublishTerminal(EventType::CommandRejected, command_id,
+                                       parseErrorCode(ParseError::UnsupportedCommand),
                                        "reboot/ota are parsed but not executed by this delivery");
     }
 

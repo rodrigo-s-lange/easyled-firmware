@@ -81,8 +81,9 @@ private:
 
 /// NVS-backed implementation of the command executor's durable staging
 /// transaction. It stores exact payload bytes, retains the prior A/B active
-/// record until the executor has durably journaled success, and restores the
-/// newest valid active record during init(). Single control-task use only.
+/// record until the executor has durably journaled success, and keeps the last
+/// successful base configuration separately so a scene-only preset can recover
+/// its output topology and canvas after reboot. Single control-task use only.
 class NvsDurableStaging final : public pixels_firmware::DurableStaging {
 public:
     /// Closes an open NVS namespace; persisted active data remains.
@@ -90,6 +91,7 @@ public:
 
     /// Opens storage, restores the newest valid active payload through target,
     /// and discards an unactivated pending candidate from an interrupted boot.
+    /// An active preset restores the retained base configuration first.
     /// No partition erase or format migration is attempted.
     /// Pending activation is reconciled against the terminal journal: completed
     /// commands stay active; missing terminal results restore the prior state.

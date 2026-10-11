@@ -580,6 +580,54 @@ esp_err_t parsePresetPayload(const char *json, size_t size, Candidate &candidate
     return ESP_OK;
 }
 
+esp_err_t materializeLedmap(const char *json, size_t size, const LedmapCandidate &ledmap,
+                            int32_t *entries, uint32_t capacity)
+{
+    if (json == nullptr || size == 0 || size > kMaxPayloadBytes || !ledmap.configured ||
+        ledmap.width == 0 || ledmap.height == 0 || ledmap.entry_count == 0 ||
+        entries == nullptr || capacity < ledmap.entry_count) {
+        return size > kMaxPayloadBytes ? ESP_ERR_INVALID_SIZE : ESP_ERR_INVALID_ARG;
+    }
+    const char *end = nullptr;
+    cJSON *root = cJSON_ParseWithLengthOpts(json, size, &end, false);
+    if (root == nullptr || end != json + size || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const cJSON *ledmap_object = nullptr;
+    if (findMember(root, "ledmap", ledmap_object) != MemberResult::Found ||
+        !cJSON_IsObject(ledmap_object)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint32_t width = 0;
+    uint32_t height = 0;
+    const cJSON *map = member(ledmap_object, "map");
+    if (unsignedValue(member(ledmap_object, "width"), 1, UINT16_MAX, width) != ValueResult::Ok ||
+        unsignedValue(member(ledmap_object, "height"), 1, UINT16_MAX, height) != ValueResult::Ok ||
+        width != ledmap.width || height != ledmap.height || !cJSON_IsArray(map) ||
+        cJSON_GetArraySize(map) != static_cast<int>(ledmap.entry_count)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint32_t index = 0;
+    for (const cJSON *entry = map->child; entry != nullptr; entry = entry->next, ++index) {
+        if (index >= ledmap.entry_count || !cJSON_IsNumber(entry) || entry->valuedouble < -1.0 ||
+            entry->valuedouble > static_cast<double>(INT32_MAX)) {
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_ARG;
+        }
+        const int32_t value = static_cast<int32_t>(entry->valuedouble);
+        if (entry->valuedouble != static_cast<double>(value)) {
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_ARG;
+        }
+        entries[index] = value;
+    }
+    cJSON_Delete(root);
+    return index == ledmap.entry_count ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
 const char *schemaErrorCode(SchemaError error)
 {
     switch (error) {
