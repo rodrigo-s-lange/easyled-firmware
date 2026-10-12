@@ -11,8 +11,9 @@ isolado, sem rede real, sem hardware, sem broker, sem backend, sem Docker.
    divergência, sem outro worktree concorrente.
 2. **Resultado final**: todas as tarefas (T1–T5) concluídas. Nenhum gate
    falhou. Nenhuma mudança em código produtivo.
-3. **Contagem de checks**: baseline QEMU `394/394 ALL_PASS` → após T1,
-   `398/398 ALL_PASS` (4 checks novos: 2 fixtures × {ESP_OK, bytes exatos}).
+3. **Contagem de checks**: baseline QEMU `394/394 ALL_PASS` → após a revisão
+   independente do Codex, `405/405 ALL_PASS` (4 checks de serializer/bytes
+   para as 2 fixtures novas e 7 checks de SHA-256 para o conjunto congelado).
    Zero falhas, zero panic, zero watchdog nas duas rodadas.
 4. **Arquivos adicionados/modificados** (ver lista completa na seção
    "Commits locais"): 2 fixtures novas, 1 CMakeLists de validação, 1
@@ -30,7 +31,7 @@ isolado, sem rede real, sem hardware, sem broker, sem backend, sem Docker.
 
 ## Fixtures
 
-Todos os bytes abaixo vieram dos serializers reais (`pixels_firmware::serializeEvent/serializeState/serializeCapabilityReport`, em `components/pixels_firmware_contract/firmware_contract.cpp`), capturados por um gerador temporário removido antes do commit (ver histórico do commit 1, SHA abaixo). As 5 fixtures marcadas "já existia" foram comparadas byte a byte contra a saída atual do serializer pela suíte de validação já existente, que passou (394/394 no baseline, 398/398 após T1) — ou seja, estão confirmadas, não apenas assumidas.
+Todos os bytes abaixo vieram dos serializers reais (`pixels_firmware::serializeEvent/serializeState/serializeCapabilityReport`, em `components/pixels_firmware_contract/firmware_contract.cpp`), capturados por um gerador temporário removido antes do commit (ver histórico do commit 1, SHA abaixo). As 5 fixtures marcadas "já existia" foram comparadas byte a byte contra a saída atual do serializer pela suíte de validação. A revisão independente acrescentou a conferência permanente dos sete hashes e passou com 405/405 — portanto, os bytes e digests estão confirmados, não apenas assumidos.
 
 | Mensagem | Arquivo | Bytes | SHA-256 | Newline final | Serializer | Commit que congelou |
 |---|---|---|---|---|---|---|
@@ -42,19 +43,13 @@ Todos os bytes abaixo vieram dos serializers reais (`pixels_firmware::serializeE
 | capability_reported | `validation/fixtures/event-capability-reported.provisional.json` | 739 | `d31dc7622ba59281f4a96f8616fc3fb4f84ff43baee4d0809dd1af4e439cb46d` | não | `serializeCapabilityReport()` | já existia; reconfirmada |
 | state | `validation/fixtures/state-config-active.provisional.json` | 353 | `fd5aa1045a6c32911585633da0af7779a5f7c4894260978d07d235c3020b8e4c` | não | `serializeState()` | já existia; reconfirmada |
 
-**Nota de método sobre SHA-256**: o cálculo acima foi feito no host
-(`sha256sum` sobre o arquivo no checkout), não dentro do firmware/QEMU. A
-suíte de validação permanente compara **bytes exatos** (`memcmp`) entre o
-serializer real e o arquivo incorporado via `EMBED_TXTFILES` — o mesmo
-padrão já usado pelas 5 fixtures que já existiam antes desta rodada. Não
-introduzi um segundo mecanismo (um hash SHA-256 calculado dentro do
-firmware) só para estas duas novas fixtures, porque isso quebraria a
-convenção já estabelecida: SHA-256 dentro do firmware é reservado para o
-contrato real de payload (`apply_config`/`activate_preset`, verificado via
-PSA crypto), não para igualdade de fixtures de teste. O `NUL` final que o
-`EMBED_TXTFILES` acrescenta é descontado por `fixtureSize()`
-(`end - start - 1`), seguindo o padrão já existente — nenhuma fixture nova
-precisou de tratamento especial aqui.
+**Nota de método sobre SHA-256**: os valores acima foram conferidos no host
+(`sha256sum` sobre o arquivo no checkout) e também pela suíte permanente. A
+validação incorpora as fixtures com `EMBED_TXTFILES`, compara a saída dos
+serializers byte a byte e recalcula o SHA-256 dos sete documentos congelados
+com a implementação real de `verifySha256()`. O `NUL` acrescentado por
+`EMBED_TXTFILES` é descontado por `fixtureSize()` (`end - start - 1`) e não
+participa do digest.
 
 ## Campos de correlação
 
@@ -102,7 +97,7 @@ comando MQTT (esse tem seu próprio limite, ver abaixo) nem o tamanho do
 comando JSON (`apply_config`/`activate_preset` em si, que só carrega
 metadados como URL/checksum, não o payload).
 
-**Onde o limite é aplicado** (confirmado lendo o código, não suposto):
+**Onde o limite é aplicado** (quatro travas confirmadas no código):
 
 1. **Buffer do executor** — `pixels_command_executor.hpp:173`:
    `char payload_buffer_[pixels_payload::kMaxPayloadBytes]{};` é o destino
@@ -129,17 +124,17 @@ metadados como URL/checksum, não o payload).
    **própria** constante `kMaxPayloadBytes = 8192` (mesmo valor, constante
    separada, não a mesma do `pixels_payload_adapter`) usada em
    `kWireBytes` e verificada em `pixels_durable_storage.cpp:604`
-   (`total_size > kMaxPayloadBytes` → erro). Ou seja, há **três** travas
+   (`total_size > kMaxPayloadBytes` → erro). Ou seja, há **quatro** travas
    independentes pinadas no mesmo valor (8192), não uma única constante
    compartilhada ponta a ponta — isso é uma coincidência de valor
    deliberada, não uma garantia estrutural de que mudar uma muda as outras.
 
-**Payload vazio ou excedente**: vazio (`payload_size == 0`) é rejeitado no
-executor (`command_rejected`/`resolve_failed`) e também no download HTTPS
+**Payload vazio ou excedente**: vazio (`payload_size == 0`) produz
+`command_failed`/`resolve_failed` no executor e também é rejeitado no download HTTPS
 (`result.size == 0` → `ESP_ERR_INVALID_SIZE`) e no parser
 (`SchemaError::Malformed`). Excedente nunca chega a existir como bytes
 completos no buffer do executor — é cortado/rejeitado antes de completar,
-em qualquer uma das três camadas acima.
+em qualquer uma das quatro camadas acima.
 
 **Hipótese do brief — confirmada**: é o limite dos bytes exatos do payload
 resolvido (config ou preset), não do envelope MQTT. Não alterei o valor.
@@ -235,7 +230,7 @@ Confirmado com o teste **já existente** em
 reutilizado para `kOta` (para não duplicar o buffer de 8 KiB de um segundo
 `Executor`) resultam ambos em
 `event_sink6.anyContains("command_rejected") && event_sink6.anyContains("unsupported_command")`
-— confirmado passando no baseline G0 (394/394) e em G1 (398/398) desta
+— confirmado passando no baseline G0 (394/394) e após revisão (405/405) desta
 rodada, sem nenhuma mudança nesse teste. `reason_code` vem de
 `parseErrorCode(ParseError::UnsupportedCommand)`, o mesmo código usado para
 um tipo de envelope desconhecido — não um código próprio de "não
@@ -545,10 +540,11 @@ para o trabalho **futuro** já descrito acima:
 - **Baseline**: `main` = `origin/main` = HEAD = `0dbc37e8cda71ccdaacd0ae5e896f742a5f08e36` (sem divergência)
 - **Builds**: produto `idf.py -B build -D IDF_TARGET=esp32 build` — sucesso
   (`0x10f150` bytes = 1.110.352 B; DRAM 73.439 B/40,63%; IRAM 90.555 B/69,09%).
-  Validação — sucesso (`0xb1a60` bytes após T1).
-- **QEMU**: baseline `394/394 ALL_PASS`; após T1, `398/398 ALL_PASS`. Zero
+  Validação — sucesso (`0xb1d80` bytes após revisão; DRAM 177.740 B/98,34%,
+  2.996 B livres; IRAM 48.047 B/36,66%).
+- **QEMU**: baseline `394/394 ALL_PASS`; após revisão, `405/405 ALL_PASS`. Zero
   falhas, zero panic, zero watchdog nas duas rodadas.
-- **Contagem**: 394 → 398 (+4, todos de T1).
+- **Contagem**: 394 → 405 (+4 de serializer/bytes e +7 de SHA-256).
 - **Fixtures criadas/confirmadas**: 2 novas (`command_received`,
   `command_accepted`), 5 reconfirmadas byte a byte (`state`,
   `capability_reported`, `command_rejected`, `command_applied`,
@@ -559,7 +555,7 @@ para o trabalho **futuro** já descrito acima:
   `capability_reported` não carrega contadores; os 5 ACKs não carregam
   nenhum dos três, correlacionando só por `device_id`+`command_id`.
 - **`max_payload_bytes`**: confirmado como o limite do payload resolvido
-  (config/preset), aplicado em três camadas independentes (buffer do
+  (config/preset), aplicado em quatro travas (buffer do
   executor, download HTTPS, parser, staging durável), nunca o envelope MQTT.
 - **Mensagem MQTT excedente**: confirmado — rejeitada antes de qualquer
   extração de `command_id`; só `rejected_` sobe; nenhum ACK correlacionável

@@ -1593,6 +1593,42 @@ extern "C" void app_main()
           std::memcmp(capability_json,
                       FIXTURE_BYTES(event_capability_reported_provisional_json),
                       capability_size) == 0);
+    // Freeze the exact on-disk bytes as well as the serializer output. This
+    // catches an intentional or accidental fixture edit even when no matching
+    // serializer expectation is changed in the same patch.
+    struct FrozenFixtureHash {
+        const char *bytes;
+        size_t size;
+        const char *sha256;
+    };
+    const FrozenFixtureHash frozen_fixture_hashes[] = {
+        {FIXTURE_BYTES(event_command_received_provisional_json),
+         FIXTURE_SIZE(event_command_received_provisional_json),
+         "a270d90e3061a4ef81ec844d1f6ca4fb8501aa9f9fd4f515e28038705455d147"},
+        {FIXTURE_BYTES(event_command_accepted_provisional_json),
+         FIXTURE_SIZE(event_command_accepted_provisional_json),
+         "9d997f83443213304e3d854eed5e390c0733744fd39eb45de9e52169d0ff38f9"},
+        {FIXTURE_BYTES(event_checksum_mismatch_rejected_provisional_json),
+         FIXTURE_SIZE(event_checksum_mismatch_rejected_provisional_json),
+         "be5f6e0f094be7ad708dad31dc859e6db5fc95bcb494f674d1e3676a6aee39d4"},
+        {FIXTURE_BYTES(event_command_applied_provisional_json),
+         FIXTURE_SIZE(event_command_applied_provisional_json),
+         "1e5a888f6dbcc86a77bfddde2c0f63a838bc4c78148d3278cb52b458f007942a"},
+        {FIXTURE_BYTES(event_command_failed_provisional_json),
+         FIXTURE_SIZE(event_command_failed_provisional_json),
+         "ca583c8ff4d1cd1073b2a1e34e18315dbfaa33964820caf03d684b251b58fd48"},
+        {FIXTURE_BYTES(event_capability_reported_provisional_json),
+         FIXTURE_SIZE(event_capability_reported_provisional_json),
+         "d31dc7622ba59281f4a96f8616fc3fb4f84ff43baee4d0809dd1af4e439cb46d"},
+        {FIXTURE_BYTES(state_config_active_provisional_json),
+         FIXTURE_SIZE(state_config_active_provisional_json),
+         "fd5aa1045a6c32911585633da0af7779a5f7c4894260978d07d235c3020b8e4c"},
+    };
+    for (const auto &fixture : frozen_fixture_hashes) {
+        uint8_t digest[kSha256Bytes]{};
+        CHECK(parseSha256(fixture.sha256, digest) == ESP_OK &&
+              verifySha256(fixture.bytes, fixture.size, digest) == ESP_OK);
+    }
     capability.capabilities.largest_internal_heap_block_bytes = 120001;
     CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
                                     capability_size) == ESP_ERR_INVALID_ARG);
