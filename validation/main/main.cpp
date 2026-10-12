@@ -44,6 +44,14 @@ extern const uint8_t preset_payload_provisional_json_start[] asm(
     "_binary_preset_payload_provisional_json_start");
 extern const uint8_t preset_payload_provisional_json_end[] asm(
     "_binary_preset_payload_provisional_json_end");
+extern const uint8_t event_command_received_provisional_json_start[] asm(
+    "_binary_event_command_received_provisional_json_start");
+extern const uint8_t event_command_received_provisional_json_end[] asm(
+    "_binary_event_command_received_provisional_json_end");
+extern const uint8_t event_command_accepted_provisional_json_start[] asm(
+    "_binary_event_command_accepted_provisional_json_start");
+extern const uint8_t event_command_accepted_provisional_json_end[] asm(
+    "_binary_event_command_accepted_provisional_json_end");
 extern const uint8_t event_command_applied_provisional_json_start[] asm(
     "_binary_event_command_applied_provisional_json_start");
 extern const uint8_t event_command_applied_provisional_json_end[] asm(
@@ -1512,6 +1520,17 @@ extern "C" void app_main()
     static char short_event[32]{};
     CHECK(serializeEvent(applied, short_event, sizeof(short_event), event_size) == ESP_ERR_INVALID_SIZE &&
           event_size == 0);
+    // command_received/command_accepted: frozen T1 fixtures (M0 firmware
+    // prep, 2026-10-11). Never emitted with a reason_code/message
+    // (terminalReason() is false for both), so payload is always {}.
+    Event received{EventType::CommandReceived, "2026-09-22T12:00:01Z", kDeviceId, kApplyCommandId};
+    CHECK(serializeEvent(received, event_json, sizeof(event_json), event_size) == ESP_OK);
+    CHECK(event_size == FIXTURE_SIZE(event_command_received_provisional_json) &&
+          std::memcmp(event_json, FIXTURE_BYTES(event_command_received_provisional_json), event_size) == 0);
+    Event accepted{EventType::CommandAccepted, "2026-09-22T12:00:02Z", kDeviceId, kApplyCommandId};
+    CHECK(serializeEvent(accepted, event_json, sizeof(event_json), event_size) == ESP_OK);
+    CHECK(event_size == FIXTURE_SIZE(event_command_accepted_provisional_json) &&
+          std::memcmp(event_json, FIXTURE_BYTES(event_command_accepted_provisional_json), event_size) == 0);
     Event mismatch{EventType::CommandRejected, "2026-09-22T12:00:03Z", kDeviceId, kApplyCommandId,
                    "checksum_mismatch", "downloaded payload checksum mismatch"};
     CHECK(serializeEvent(mismatch, event_json, sizeof(event_json), event_size) == ESP_OK);
