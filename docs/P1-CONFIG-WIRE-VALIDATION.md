@@ -3,9 +3,14 @@
 ## Resumo executivo
 
 1. **Baseline**: branch `main`, commit `4e56c37378bf166c8a7a547dcf378cd69bfcf850` — exatamente o
-   esperado, sem divergência. QEMU baseline: **405/405 ALL_PASS**, sem panic/watchdog.
+   esperado, sem divergência. QEMU baseline: **405/405 ALL_PASS**, sem panic/watchdog. **O parser
+   produtivo validado nesta rodada é este commit, `4e56c37`** — nenhum componente em `components/`
+   ou `main/` foi alterado em nenhum momento.
 2. **Resultado final**: todos os 9 vetores P1 comportam-se exatamente como documentado contra o
-   firmware atual. **Nenhuma mudança em código produtivo** foi necessária.
+   firmware atual. **Nenhuma mudança em código produtivo** foi necessária. **O commit que contém a
+   suíte/evidência (fixtures + testes + esta documentação) é `a3664bc31e46c1f38fa8798dfe1a6a11245a3b4b`**,
+   confirmado como `App version: a3664bc` (sem `-dirty`) no banner de boot do QEMU após uma
+   recompilação limpa a partir dele.
 3. **Contagem de checks**: 405 → **468/468 ALL_PASS** (+63), zero falhas, zero panic/watchdog.
 4. **Arquivos adicionados/modificados**: 9 fixtures novas em `validation/fixtures/p1-config-download/`,
    `validation/main/CMakeLists.txt` (wiring `EMBED_TXTFILES`), `validation/main/main.cpp` (testes),
@@ -102,15 +107,16 @@ Três conceitos diferentes que este pacote P1 deixa claros pela primeira vez com
   valor fixo usado no envelope sintético; é um conceito totalmente separado do `ledmap.version` do
   payload — nenhuma correlação entre os dois deve ser assumida.
 
-## Topologia: achado a reportar (não é bug de firmware)
+## Topologia: esclarecido — vetores de compatibilidade, não a bancada física
 
-O documento `docs/M0-FIRMWARE-NOITE.md` (rodada anterior) registrou um vetor **hipotético** de
-canto esperado para a bancada 31×12, escrito antes de este fixture real existir:
-`pixel 11 → canto superior esquerdo`, `pixel 371 → canto superior direito`, etc., assumindo
-`índice de array = y*width+x` com Y crescendo para cima e coluna = X.
+**`bench-31x12-config-v1.json` e `bench-31x12-config-v2.json` são vetores de compatibilidade do
+wire** (nome e dimensões 31×12/372 escolhidos para exercitar o mesmo tamanho da bancada, mas o
+conteúdo do `map` não é a fiação física real). O documento `docs/M0-FIRMWARE-NOITE.md` (rodada
+anterior) registrou um vetor **hipotético** de canto para a bancada física, escrito antes de este
+fixture existir, assumindo serpentina **por colunas** de 12 (a fiação real de Rodrigo: GPIO16,
+372 pixels, 31 colunas de 12, coluna 0 sobe, coluna 1 desce, ...).
 
-Com o fixture real `bench-31x12-config-v2.json` em mãos, extraí os valores reais (via parser JSON,
-não de cabeça):
+Extraindo os valores reais de `bench-31x12-config-v2.json` (via parser JSON, não de cabeça):
 
 ```
 índice 0   = 0      índice 11  = 11     índice 12  = 12     índice 23  = 23
@@ -118,17 +124,20 @@ não de cabeça):
 índice 359 = 353     índice 360 = 352    índice 371 = 341
 ```
 
-A linha 0 (índices 0-30) é identidade pura em v2 — só diverge de v1 a partir da linha 1
-(índice 31 em diante). O valor físico 371 (o "último pixel") aparece no índice 341, não no
-índice 371 — ou seja, a hipótese de canto do M0 **não corresponde** a este fixture real sob a
-convenção de coordenadas que assumi lá (Y crescendo para cima, X=coluna). Isso não foi corrigido
-nem forçado a bater aqui: é provável que minha convenção de eixo esteja invertida (Y crescendo
-para baixo, ou X/Y trocados), não que o fixture esteja errado — mas não adivinhei qual. Registrado
-como pendência explícita para Rodrigo/plataforma esclarecer antes de qualquer teste futuro que
-dependa de "qual canto é qual pixel" — o fixture em si (holes, bijeção, `ledmap.version=1`, 372
-células) está correto e totalmente verificado independente dessa questão de orientação.
+A linha 0 (índices 0-30) é identidade pura; a partir da linha 1 (índice 31), cada linha de 31
+inverte de sentido alternadamente — isto é **serpentina por linhas de 31**, não por colunas de 12.
+**Esclarecido**: isso não é um erro meu de convenção de eixo nem um erro do fixture — os dois
+vetores deliberadamente usam uma serpentina diferente da bancada física, porque seu único
+propósito é exercitar a mecânica do wire (bijeção real, não identidade; `ledmap.version=1` como
+revisão de autoria; substituição durável v1→v2) e não representar nem ser aplicado na bancada real
+de Rodrigo. **Nenhuma aplicação física de `bench-31x12-config-v1.json` ou
+`bench-31x12-config-v2.json` foi realizada nesta rodada nem está prevista** — a sequência v1→v2
+descrita acima é inteiramente QEMU, contra armazenamento NVS real emulado, nunca contra pixels
+físicos.
 
-O procedimento de bancada física (GPIO16, 372 pixels, 31×12, serpentina por colunas) continua
+O vetor de canto físico do M0 (coluna-serpentina de 12) permanece correto para a bancada real;
+ele só não deve ser comparado a estes dois fixtures, que nunca pretenderam representá-la. O
+procedimento de bancada física (GPIO16, 372 pixels, 31×12, serpentina por colunas) continua
 documentado em `docs/M0-FIRMWARE-NOITE.md` — não duplicado aqui.
 
 ## Limites
@@ -174,6 +183,12 @@ um runner focado em vez de remover cobertura"), **nenhuma cobertura foi removida
   (`schemaErrorCode()`) é um `switch` de 4 casos puro, já lido e citado acima — os 2 casos
   exercitados no wire cobrem as duas strings distintas que esse switch pode produzir.
 
+**Este runner (`validation/`, target `easyled_firmware_validation`) fica congelado em termos de
+capacidade de crescimento**: com apenas 772 B de DRAM estática livre, não há margem para mais
+fixtures/testes relevantes aqui. Qualquer suíte nova que precise de memória estática adicional
+(novos fixtures, novos `Candidate`/`Executor`/`NvsDurableStaging`, buffers de materialização
+maiores) deve usar outro target de validação, não este.
+
 ## QEMU vs. evidência física
 
 Tudo acima é **QEMU**, nenhum hardware real. Nenhuma alegação de bancada física é feita nesta
@@ -199,10 +214,11 @@ status `NÃO EXECUTADO — requer janela coordenada de bancada`.
 
 1. **Nenhuma divergência de comportamento** entre o código real e os 9 resultados documentados —
    todos bateram exatamente.
-2. **Achado de orientação/canto da bancada 31×12** (não é divergência de código): ver seção
-   "Topologia" acima — minha própria hipótese de canto do M0, escrita antes deste fixture existir,
-   não corresponde ao fixture real sob a convenção de eixos que assumi lá. Pendente de
-   esclarecimento, não uma falha do fixture nem do firmware.
+2. **Resolvido, não é mais uma divergência aberta**: a aparente incompatibilidade entre o vetor de
+   canto hipotético do M0 (coluna-serpentina de 12, bancada física) e os valores reais de
+   `bench-31x12-config-v2.json` (linha-serpentina de 31) — ver seção "Topologia" acima. Os dois
+   fixtures são vetores de compatibilidade do wire, nunca destinados a representar a fiação física
+   de Rodrigo; não há erro de convenção de eixo nem erro no fixture.
 
 ## Impedimentos
 
