@@ -1,0 +1,32 @@
+{
+  "device_id": "5b0f2d4e-8c1a-4f3b-9d6e-2a7c1b9e4f10",
+  "hardware_binding_id": "c1d2e3f4-0a1b-4c2d-8e3f-4a5b6c7d8e9f",
+  "generation": 2,
+  "credential": {
+    "id": "0e9d8c7b-6a5f-4e3d-9c2b-1a0f9e8d7c6b",
+    "status": "pending",
+    "kind": "rotation",
+    "expires_at": "2026-10-11T12:15:00.123456Z",
+    "activation": "first_successful_mqtt_authentication"
+  },
+  "mqtt": {
+    "username": "5b0f2d4e-8c1a-4f3b-9d6e-2a7c1b9e4f10",
+    "client_id": "5b0f2d4e-8c1a-4f3b-9d6e-2a7c1b9e4f10",
+    "password": "SYNTHETIC-NOT-A-CREDENTIAL-0123456789abcdef",
+    "broker_uri": "wss://mqtt.example.invalid:8085/mqtt",
+    "tls": {
+      "trust_ref": "easyled-broker-ca-v1",
+      "verify_server": true
+    },
+    "topics": {
+      "publish": {
+        "state": "tenants/7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d/devices/5b0f2d4e-8c1a-4f3b-9d6e-2a7c1b9e4f10/state",
+        "event": "tenants/7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d/devices/5b0f2d4e-8c1a-4f3b-9d6e-2a7c1b9e4f10/event",
+        "telemetry": "tenants/7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d/devices/5b0f2d4e-8c1a-4f3b-9d6e-2a7c1b9e4f10/telemetry"
+      },
+      "subscribe": {
+        "cmd": "tenants/7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d/devices/5b0f2d4e-8c1a-4f3b-9d6e-2a7c1b9e4f10/cmd"
+      }
+    }
+  }
+}

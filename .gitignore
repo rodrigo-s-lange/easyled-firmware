@@ -1,8 +1,11 @@
 /main/network_credentials.hpp
 /build*/
 /validation/build*/
+/validation_mqtt_credentials/build*/
 /managed_components/
 /validation/managed_components/
+/validation_mqtt_credentials/managed_components/
 /sdkconfig
 /validation/sdkconfig
+/validation_mqtt_credentials/sdkconfig
 *.log
