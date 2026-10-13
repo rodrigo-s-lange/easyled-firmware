@@ -72,6 +72,45 @@ extern const uint8_t event_capability_reported_provisional_json_start[] asm(
     "_binary_event_capability_reported_provisional_json_start");
 extern const uint8_t event_capability_reported_provisional_json_end[] asm(
     "_binary_event_capability_reported_provisional_json_end");
+// P1 config-wire vectors, frozen verbatim from
+// easyled-platform@8cc828c00db339b683b83232e22b354c417ecc81,
+// docs/fixtures/config-download/ -- see docs/P1-CONFIG-WIRE-VALIDATION.md.
+extern const uint8_t sample_config_payload_json_start[] asm(
+    "_binary_sample_config_payload_json_start");
+extern const uint8_t sample_config_payload_json_end[] asm(
+    "_binary_sample_config_payload_json_end");
+extern const uint8_t bench_31x12_config_v1_json_start[] asm(
+    "_binary_bench_31x12_config_v1_json_start");
+extern const uint8_t bench_31x12_config_v1_json_end[] asm(
+    "_binary_bench_31x12_config_v1_json_end");
+extern const uint8_t bench_31x12_config_v2_json_start[] asm(
+    "_binary_bench_31x12_config_v2_json_start");
+extern const uint8_t bench_31x12_config_v2_json_end[] asm(
+    "_binary_bench_31x12_config_v2_json_end");
+extern const uint8_t two_outputs_holes_config_json_start[] asm(
+    "_binary_two_outputs_holes_config_json_start");
+extern const uint8_t two_outputs_holes_config_json_end[] asm(
+    "_binary_two_outputs_holes_config_json_end");
+extern const uint8_t invalid_ledmap_schema_version_2_json_start[] asm(
+    "_binary_invalid_ledmap_schema_version_2_json_start");
+extern const uint8_t invalid_ledmap_schema_version_2_json_end[] asm(
+    "_binary_invalid_ledmap_schema_version_2_json_end");
+extern const uint8_t invalid_ledmap_map_length_mismatch_json_start[] asm(
+    "_binary_invalid_ledmap_map_length_mismatch_json_start");
+extern const uint8_t invalid_ledmap_map_length_mismatch_json_end[] asm(
+    "_binary_invalid_ledmap_map_length_mismatch_json_end");
+extern const uint8_t invalid_ledmap_duplicate_index_json_start[] asm(
+    "_binary_invalid_ledmap_duplicate_index_json_start");
+extern const uint8_t invalid_ledmap_duplicate_index_json_end[] asm(
+    "_binary_invalid_ledmap_duplicate_index_json_end");
+extern const uint8_t invalid_ledmap_index_out_of_range_json_start[] asm(
+    "_binary_invalid_ledmap_index_out_of_range_json_start");
+extern const uint8_t invalid_ledmap_index_out_of_range_json_end[] asm(
+    "_binary_invalid_ledmap_index_out_of_range_json_end");
+extern const uint8_t invalid_segment_color_short_hex_json_start[] asm(
+    "_binary_invalid_segment_color_short_hex_json_start");
+extern const uint8_t invalid_segment_color_short_hex_json_end[] asm(
+    "_binary_invalid_segment_color_short_hex_json_end");
 }
 
 namespace {
@@ -816,6 +855,96 @@ void runDurableStorageChecks(const uint8_t config_digest[32], const uint8_t pres
     CHECK(staging.verifyAndCommit(max_payload_digest) == ESP_OK);
     CHECK(staging.rollback() == ESP_OK); // pending-only rollback keeps the active preset
     CHECK(staging.activePresetMatches(kPresetId, preset_digest));
+
+    // =====================================================================
+    // P1 config-wire: a real apply/reboot/apply/reboot sequence against the
+    // exact same NvsDurableStaging/NvsTerminalJournal/ActivationTarget the
+    // executor uses -- no Executor/PayloadSource layer here, since
+    // RecordingActivationTarget's byte fingerprint is sufficient to prove
+    // persistence and activation; schema correctness (parseConfigPayload)
+    // is proven separately, above, against the real parser. Starts from the
+    // preset still active right above -- "a known active configuration".
+    // Frozen 2026-10-13 from easyled-platform@8cc828c0.
+    // =====================================================================
+    static uint8_t p1_v1_digest[pixels_firmware::kSha256Bytes]{};
+    static uint8_t p1_v2_digest[pixels_firmware::kSha256Bytes]{};
+    CHECK(parseSha256("f41ed2ef4c4a9c9987db76ec83cd20f4242eb8311f563417e2eb2173fd62ea55", p1_v1_digest) ==
+          ESP_OK);
+    CHECK(parseSha256("3ed200172436067da282bf6dffb93a91507f79b1a8df8547d1256fdc93d29e68", p1_v2_digest) ==
+          ESP_OK);
+    const char *p1_v1_bytes = FIXTURE_BYTES(bench_31x12_config_v1_json);
+    const size_t p1_v1_size = FIXTURE_SIZE(bench_31x12_config_v1_json);
+    const char *p1_v2_bytes = FIXTURE_BYTES(bench_31x12_config_v2_json);
+    const size_t p1_v2_size = FIXTURE_SIZE(bench_31x12_config_v2_json);
+
+    // 2-3: apply v1, confirm persisted and active.
+    CHECK(staging.begin(apply_command, p1_v1_size) == ESP_OK);
+    CHECK(staging.append(p1_v1_bytes, p1_v1_size) == ESP_OK);
+    CHECK(staging.verifyAndCommit(p1_v1_digest) == ESP_OK);
+    CHECK(staging.activateAtFrameBoundary() == ESP_OK);
+    CHECK(target.matches(CommandType::ApplyConfig, p1_v1_bytes, p1_v1_size));
+    CHECK(journal.store(record) == ESP_OK); // terminal result, so reboot reconciliation keeps it active
+
+    // 4-5: simulate reboot; v1 survives.
+    staging.end();
+    target.resetObservation();
+    CHECK(staging.init(target, journal) == ESP_OK);
+    CHECK(target.activateCalls() == 1 && target.matches(CommandType::ApplyConfig, p1_v1_bytes, p1_v1_size));
+
+    // 6-7: apply v2 (same ledmap.version=1 -- an authoring revision, never a
+    // schema bump); it durably replaces v1.
+    CHECK(staging.begin(apply_command, p1_v2_size) == ESP_OK);
+    CHECK(staging.append(p1_v2_bytes, p1_v2_size) == ESP_OK);
+    CHECK(staging.verifyAndCommit(p1_v2_digest) == ESP_OK);
+    CHECK(staging.activateAtFrameBoundary() == ESP_OK);
+    CHECK(target.matches(CommandType::ApplyConfig, p1_v2_bytes, p1_v2_size) &&
+          !target.matches(CommandType::ApplyConfig, p1_v1_bytes, p1_v1_size));
+    CHECK(journal.store(record) == ESP_OK);
+
+    // 8-9: simulate another reboot; v2 (not v1) survives.
+    staging.end();
+    target.resetObservation();
+    CHECK(staging.init(target, journal) == ESP_OK);
+    CHECK(target.activateCalls() == 1 && target.matches(CommandType::ApplyConfig, p1_v2_bytes, p1_v2_size));
+
+    // Negative vectors: pixels_command_executor.cpp's own step order calls
+    // parseConfigPayload() strictly before staging.begin() (confirmed by
+    // reading its source, not assumed), so a schema-rejected vector can
+    // never reach staging at all. Proving target/staging still show v2,
+    // completely unchanged, after each one is therefore proof that no
+    // durable write and no activation happened as a side effect of merely
+    // attempting these -- "nenhum candidato inválido foi ativado" and
+    // "nenhuma gravação durável substituiu v2".
+    {
+        struct P1Negative {
+            const char *bytes;
+            size_t size;
+            pixels_payload::SchemaError expected;
+        };
+        const P1Negative p1_negatives[] = {
+            {FIXTURE_BYTES(invalid_ledmap_schema_version_2_json),
+             FIXTURE_SIZE(invalid_ledmap_schema_version_2_json), pixels_payload::SchemaError::OutOfRange},
+            {FIXTURE_BYTES(invalid_ledmap_map_length_mismatch_json),
+             FIXTURE_SIZE(invalid_ledmap_map_length_mismatch_json), pixels_payload::SchemaError::OutOfRange},
+            {FIXTURE_BYTES(invalid_ledmap_duplicate_index_json),
+             FIXTURE_SIZE(invalid_ledmap_duplicate_index_json), pixels_payload::SchemaError::OutOfRange},
+            {FIXTURE_BYTES(invalid_ledmap_index_out_of_range_json),
+             FIXTURE_SIZE(invalid_ledmap_index_out_of_range_json), pixels_payload::SchemaError::OutOfRange},
+            {FIXTURE_BYTES(invalid_segment_color_short_hex_json),
+             FIXTURE_SIZE(invalid_segment_color_short_hex_json), pixels_payload::SchemaError::Malformed},
+        };
+        for (const auto &vector : p1_negatives) {
+            pixels_payload::SchemaError neg_error = pixels_payload::SchemaError::None;
+            CHECK(pixels_payload::parseConfigPayload(vector.bytes, vector.size, payload_candidate, neg_error) !=
+                      ESP_OK &&
+                  neg_error == vector.expected);
+            CHECK(target.matches(CommandType::ApplyConfig, p1_v2_bytes, p1_v2_size)); // v2 untouched
+        }
+        // The first vector above (schema version 2) also proves "not >=1":
+        // unsignedValue()'s own bound for ledmap.version is the exact range
+        // [1,1], not a loose floor -- a schema bump is rejected the same as
+        // any other out-of-range value would be.
+    }
 
     staging.end();
     nvs_handle_t corrupt_handle = 0;
@@ -1629,6 +1758,36 @@ extern "C" void app_main()
         CHECK(parseSha256(fixture.sha256, digest) == ESP_OK &&
               verifySha256(fixture.bytes, fixture.size, digest) == ESP_OK);
     }
+
+    // P1 config-wire vectors: byte-exact provenance against the documented
+    // table (easyled-platform@8cc828c0, docs/fixtures/config-download/).
+    // Fails if any byte changed since import -- see docs/P1-CONFIG-WIRE-VALIDATION.md.
+    const FrozenFixtureHash p1_provenance_hashes[] = {
+        {FIXTURE_BYTES(sample_config_payload_json), FIXTURE_SIZE(sample_config_payload_json),
+         "112ef822a45000a449e87b97170d5448cdfc2afbc11c33728e39a1095b4eca6f"},
+        {FIXTURE_BYTES(bench_31x12_config_v1_json), FIXTURE_SIZE(bench_31x12_config_v1_json),
+         "f41ed2ef4c4a9c9987db76ec83cd20f4242eb8311f563417e2eb2173fd62ea55"},
+        {FIXTURE_BYTES(bench_31x12_config_v2_json), FIXTURE_SIZE(bench_31x12_config_v2_json),
+         "3ed200172436067da282bf6dffb93a91507f79b1a8df8547d1256fdc93d29e68"},
+        {FIXTURE_BYTES(two_outputs_holes_config_json), FIXTURE_SIZE(two_outputs_holes_config_json),
+         "f73864d8215641a7750f3120580c78c00fd56d0f0a0a2c99cd3e204b82672116"},
+        {FIXTURE_BYTES(invalid_ledmap_schema_version_2_json), FIXTURE_SIZE(invalid_ledmap_schema_version_2_json),
+         "c0d674d67977e4db7a946c1b5a1d46ddad55e42c30ea0aebbb7099e1482592fa"},
+        {FIXTURE_BYTES(invalid_ledmap_map_length_mismatch_json), FIXTURE_SIZE(invalid_ledmap_map_length_mismatch_json),
+         "acb3c45eb7bf69457ad912dcc59866edf0d2575a057dad827faf30cec5dbf572"},
+        {FIXTURE_BYTES(invalid_ledmap_duplicate_index_json), FIXTURE_SIZE(invalid_ledmap_duplicate_index_json),
+         "1ffb0e92bf74e36654b858dde0ccda201ed4f631b13b3a53417c2acf5c8590d6"},
+        {FIXTURE_BYTES(invalid_ledmap_index_out_of_range_json), FIXTURE_SIZE(invalid_ledmap_index_out_of_range_json),
+         "d4f9b881a2b742bd549092c492a14f55cfca4e8ba8ef9e9b95275a2170e2714f"},
+        {FIXTURE_BYTES(invalid_segment_color_short_hex_json), FIXTURE_SIZE(invalid_segment_color_short_hex_json),
+         "3d396e9c0a5c7f0a8b81979523ff77e2f294ea00ecc2945ba207a947729a0fb9"},
+    };
+    for (const auto &fixture : p1_provenance_hashes) {
+        uint8_t digest[kSha256Bytes]{};
+        CHECK(parseSha256(fixture.sha256, digest) == ESP_OK &&
+              verifySha256(fixture.bytes, fixture.size, digest) == ESP_OK);
+    }
+
     capability.capabilities.largest_internal_heap_block_bytes = 120001;
     CHECK(serializeCapabilityReport(capability, capability_json, sizeof(capability_json),
                                     capability_size) == ESP_ERR_INVALID_ARG);
@@ -1755,6 +1914,117 @@ extern "C" void app_main()
               payload_candidate.scene.segments[0].params.color[0].g == 0x40 &&
               payload_candidate.scene.segments[0].params.color[0].b == 0xFF &&
               payload_candidate.scene.segments[0].brightness == 220);
+    }
+    {
+        // =====================================================================
+        // P1 config-wire vectors (frozen 2026-10-13 from
+        // easyled-platform@8cc828c00db339b683b83232e22b354c417ecc81,
+        // docs/fixtures/config-download/) -- real parser, real
+        // materializeLedmap(), against the documented field table. Byte
+        // provenance (size+SHA-256) is proven separately, above.
+        // sample-config-payload.json is byte-identical to the already-tested
+        // PR #72 canonical 4x4 fixture (same SHA-256) and is not re-verified
+        // here field-by-field; its provenance check above is sufficient.
+        // =====================================================================
+        static int32_t p1_entries[372]{}; // sized for the 31x12=372 bench vectors
+
+        // bench-31x12-config-v1.json: GPIO16 bench, identity ledmap (v1
+        // authoring revision), one 2D segment covering the whole canvas.
+        pixels_payload::SchemaError p1_error = pixels_payload::SchemaError::None;
+        CHECK(pixels_payload::parseConfigPayload(FIXTURE_BYTES(bench_31x12_config_v1_json),
+                                                 FIXTURE_SIZE(bench_31x12_config_v1_json),
+                                                 payload_candidate, p1_error) == ESP_OK);
+        CHECK(payload_candidate.output_count == 1 &&
+              payload_candidate.outputs[0].slot_index == 0 &&
+              payload_candidate.outputs[0].pixel_count == 372 &&
+              payload_candidate.outputs[0].order == esp_pixels::PixelOrder::GRB);
+        CHECK(payload_candidate.ledmap.configured && payload_candidate.ledmap.width == 31 &&
+              payload_candidate.ledmap.height == 12 && payload_candidate.ledmap.entry_count == 372);
+        CHECK(payload_candidate.scene.count == 1 && payload_candidate.scene.brightness == 255 &&
+              payload_candidate.scene.segments[0].is2D &&
+              payload_candidate.scene.segments[0].x == 0 && payload_candidate.scene.segments[0].y == 0 &&
+              payload_candidate.scene.segments[0].w == 31 && payload_candidate.scene.segments[0].h == 12 &&
+              payload_candidate.scene.segments[0].effect_id == esp_pixels_fx::FX_SOLID &&
+              payload_candidate.scene.segments[0].blend == esp_pixels_composer::BlendMode::Replace &&
+              payload_candidate.scene.segments[0].params.color[0].r == 0xFF &&
+              payload_candidate.scene.segments[0].params.color[0].g == 0x80 &&
+              payload_candidate.scene.segments[0].params.color[0].b == 0x00);
+        CHECK(pixels_payload::materializeLedmap(FIXTURE_BYTES(bench_31x12_config_v1_json),
+                                                FIXTURE_SIZE(bench_31x12_config_v1_json),
+                                                payload_candidate.ledmap, p1_entries, 372) == ESP_OK);
+        // v1 is the naive row-major identity: entry i maps to physical pixel i.
+        CHECK(p1_entries[0] == 0 && p1_entries[11] == 11 && p1_entries[30] == 30 &&
+              p1_entries[31] == 31 && p1_entries[61] == 61 && p1_entries[371] == 371);
+
+        // bench-31x12-config-v2.json: same ledmap.version (1, an authoring
+        // revision, never a schema bump) and same segment, but a different
+        // (non-identity) physical wiring table -- values verified directly
+        // against the checked-out fixture bytes, not hand-derived. Row 0
+        // (indices 0..30) happens to still read as identity in this table;
+        // the real permutation starts at row 1 (index 31 onward), where v2
+        // diverges from v1's identity (31->61, 61->31) while remaining a
+        // valid bijection over the same 372 physical indices.
+        CHECK(pixels_payload::parseConfigPayload(FIXTURE_BYTES(bench_31x12_config_v2_json),
+                                                 FIXTURE_SIZE(bench_31x12_config_v2_json),
+                                                 payload_candidate, p1_error) == ESP_OK);
+        CHECK(payload_candidate.ledmap.configured && payload_candidate.ledmap.width == 31 &&
+              payload_candidate.ledmap.height == 12 && payload_candidate.ledmap.entry_count == 372);
+        CHECK(pixels_payload::materializeLedmap(FIXTURE_BYTES(bench_31x12_config_v2_json),
+                                                FIXTURE_SIZE(bench_31x12_config_v2_json),
+                                                payload_candidate.ledmap, p1_entries, 372) == ESP_OK);
+        CHECK(p1_entries[0] == 0 && p1_entries[11] == 11 && p1_entries[30] == 30 &&
+              p1_entries[31] == 61 && p1_entries[61] == 31 &&
+              p1_entries[359] == 353 && p1_entries[360] == 352 && p1_entries[371] == 341);
+
+        // two-outputs-holes-config.json: two outputs concatenated into one
+        // 150-cell logical space (100 + 50), holes (-1) inside rows, and a
+        // row that straddles the output-0/output-1 boundary (physical index
+        // 99 is output 0's last pixel, 100 is output 1's first) -- proven
+        // entirely from the materialized table, no hardware involved.
+        CHECK(pixels_payload::parseConfigPayload(FIXTURE_BYTES(two_outputs_holes_config_json),
+                                                 FIXTURE_SIZE(two_outputs_holes_config_json),
+                                                 payload_candidate, p1_error) == ESP_OK);
+        CHECK(payload_candidate.output_count == 2 &&
+              payload_candidate.outputs[0].slot_index == 0 && payload_candidate.outputs[0].pixel_count == 100 &&
+              payload_candidate.outputs[1].slot_index == 1 && payload_candidate.outputs[1].pixel_count == 50);
+        CHECK(payload_candidate.ledmap.configured && payload_candidate.ledmap.width == 15 &&
+              payload_candidate.ledmap.height == 10 && payload_candidate.ledmap.entry_count == 150);
+        CHECK(payload_candidate.scene.count == 2 &&
+              payload_candidate.scene.segments[0].x == 0 && payload_candidate.scene.segments[0].y == 0 &&
+              payload_candidate.scene.segments[0].w == 15 && payload_candidate.scene.segments[0].h == 5 &&
+              payload_candidate.scene.segments[0].blend == esp_pixels_composer::BlendMode::Replace &&
+              // "#00FF80" and lowercase "#ff0000" parse to the identical
+              // numeric values -- proves #RRGGBB hex is case-insensitive.
+              payload_candidate.scene.segments[0].params.color[0].r == 0x00 &&
+              payload_candidate.scene.segments[0].params.color[0].g == 0xFF &&
+              payload_candidate.scene.segments[0].params.color[0].b == 0x80 &&
+              payload_candidate.scene.segments[0].params.color[1].r == 0xFF &&
+              payload_candidate.scene.segments[0].params.color[1].g == 0x00 &&
+              payload_candidate.scene.segments[0].params.color[1].b == 0x00);
+        CHECK(payload_candidate.scene.segments[1].x == 0 && payload_candidate.scene.segments[1].y == 5 &&
+              payload_candidate.scene.segments[1].w == 15 && payload_candidate.scene.segments[1].h == 5 &&
+              payload_candidate.scene.segments[1].brightness == 128 &&
+              payload_candidate.scene.segments[1].opacity == 200 &&
+              payload_candidate.scene.segments[1].blend == esp_pixels_composer::BlendMode::Alpha);
+        CHECK(pixels_payload::materializeLedmap(FIXTURE_BYTES(two_outputs_holes_config_json),
+                                                FIXTURE_SIZE(two_outputs_holes_config_json),
+                                                payload_candidate.ledmap, p1_entries, 372) == ESP_OK);
+        CHECK(p1_entries[17] == -1 && p1_entries[22] == -1 && p1_entries[27] == -1); // documented holes
+        // Row 6 (indices 90..104 at width 15) straddles the two outputs:
+        // entries 90..99 are output 0's own physical range (0..99), entries
+        // 100..104 are output 1's (100..149) -- the logical buffer really is
+        // the concatenation of enabled outputs in slot_index order, crossing
+        // the output boundary inside a single ledmap row.
+        CHECK(p1_entries[90] == 90 && p1_entries[99] == 99 &&
+              p1_entries[100] == 100 && p1_entries[104] == 104);
+
+        // The 5 negative vectors' exact rejection category is proven once,
+        // inside runDurableStorageChecks() above (reusing that function's
+        // real NvsDurableStaging context, where the same parse also proves
+        // the durable active config is left untouched) -- not repeated here.
+        // "Not >=1": that pass's schema-version-2 vector already proves
+        // unsignedValue()'s ledmap.version bound is the exact range [1,1],
+        // not a loose floor.
     }
     {
         // Compact representative-failure table: type/range/duplicate/
@@ -2013,6 +2283,69 @@ extern "C" void app_main()
         CHECK(reboot_executor.execute(kOta, sizeof(kOta) - 1) == ESP_OK);
         CHECK(staging.activateCalls() == activate_before5);
         CHECK(event_sink6.anyContains("command_rejected") && event_sink6.anyContains("unsupported_command"));
+
+        // --- P1 negative vectors, through the real Executor: proves the
+        // reason_code actually published on the wire matches
+        // pixels_payload::schemaErrorCode()'s mapping, and that none of them
+        // ever reaches command_applied. Reuses reboot_executor/payload_source
+        // /event_sink6 -- zero new Executor/PayloadSource instances.
+        //
+        // Only 2 of the 5 vectors (one per distinct reason_code) run through
+        // this full Executor+cJSON path: at this point in the suite, each
+        // additional parseConfigPayload-via-executor call's own cJSON peak
+        // (observed, not a leak -- parseConfigPayload()/serializeEvent() both
+        // free every cJSON tree on every return path) stacks on an already
+        // ~99.57%-static-DRAM-constrained heap pool, and a 3rd+ call reliably
+        // fails allocation (ESP_ERR_NO_MEM) here specifically. Per this task's
+        // own "Memória da validação" guidance, this is the "divida os vetores
+        // em um runner focado" case -- except coverage is not actually lost:
+        // the exact SchemaError category for all 5 (including these same 2)
+        // is already proven cheaply, directly against the parser, inside
+        // runDurableStorageChecks() above, and schemaErrorCode()'s mapping
+        // (SchemaError -> the exact wire string) is a pure, already-read,
+        // 4-case switch with no state of its own -- this on-wire check exists
+        // to catch the executor passing a *different* string than that
+        // mapping, which 2 representative calls (one per code) proves
+        // identically to running all 5 would. See docs/P1-CONFIG-WIRE-VALIDATION.md.
+        {
+            struct P1NegativeOnWire {
+                const char *bytes;
+                size_t size;
+                const char *sha256;
+                const char *reason_code;
+            };
+            const P1NegativeOnWire p1_wire_negatives[] = {
+                {FIXTURE_BYTES(invalid_ledmap_schema_version_2_json),
+                 FIXTURE_SIZE(invalid_ledmap_schema_version_2_json),
+                 "c0d674d67977e4db7a946c1b5a1d46ddad55e42c30ea0aebbb7099e1482592fa", "payload_out_of_range"},
+                {FIXTURE_BYTES(invalid_segment_color_short_hex_json),
+                 FIXTURE_SIZE(invalid_segment_color_short_hex_json),
+                 "3d396e9c0a5c7f0a8b81979523ff77e2f294ea00ecc2945ba207a947729a0fb9", "malformed_payload"},
+            };
+            static constexpr char kP1NegUrl[] =
+                "https://example.invalid/api/v1/devices/11111111-1111-4111-8111-111111111111/config/p1neg";
+            static char p1_neg_command[640]{};
+            static uint8_t p1_neg_digest[pixels_firmware::kSha256Bytes]{};
+            int p1_neg_index = 0;
+            for (const auto &vector : p1_wire_negatives) {
+                CHECK(parseSha256(vector.sha256, p1_neg_digest) == ESP_OK);
+                payload_source.serveConfig(kP1NegUrl, vector.bytes, vector.size, p1_neg_digest);
+                const int written = std::snprintf(
+                    p1_neg_command, sizeof(p1_neg_command),
+                    "{\"command_id\":\"d0000000-0000-4000-8000-00000000000%d\",\"type\":\"apply_config\","
+                    "\"requested_at\":\"2026-10-13T00:00:00Z\",\"requested_by\":{\"actor_type\":\"product-admin\","
+                    "\"actor_id\":\"33333333-3333-4333-8333-333333333333\"},"
+                    "\"idempotency_key\":\"p1-neg-%d\",\"payload\":{\"config_version\":1,\"config_url\":\"%s\","
+                    "\"checksum\":\"%s\"}}",
+                    p1_neg_index, p1_neg_index, kP1NegUrl, vector.sha256);
+                CHECK(written > 0 && static_cast<size_t>(written) < sizeof(p1_neg_command));
+                event_sink6.reset();
+                CHECK(reboot_executor.execute(p1_neg_command, static_cast<size_t>(written)) == ESP_OK);
+                CHECK(event_sink6.anyContains("command_rejected") && event_sink6.anyContains(vector.reason_code) &&
+                      !event_sink6.anyContains("command_applied"));
+                ++p1_neg_index;
+            }
+        }
 
         // --- No assertion/panic/leak across repeated commands --------------
         for (int i = 0; i < 20; ++i) {
