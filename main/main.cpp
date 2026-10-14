@@ -67,6 +67,13 @@ struct ApplicationConfig {
     /// whatever `network.*` happens to also hold.
     bool mqtt_provisioning_enabled = false;
     const char *mqtt_bootstrap_base_url = nullptr;
+    /// This unit's physical bootstrap identifier -- the
+    /// `/device-bootstrap/{hardware_id}/mqtt-credential` path parameter.
+    /// Lower-hex, 1-64 characters (pixels_mqtt::isValidHardwareId()); never
+    /// a UUID, and never the same string as `hardware_binding_id` above,
+    /// which is a UUID bound to the *current* hardware binding and changes
+    /// on a rebind while this physical identifier never does.
+    const char *mqtt_hardware_id = nullptr;
     const char *mqtt_bootstrap_token = nullptr;
     /// Exactly one trust_ref -> CA PEM entry, for this device's one
     /// configured environment. An unknown trust_ref in a server response
@@ -164,8 +171,9 @@ MqttProvisioningProfileState mqttProvisioningProfileState(const ApplicationConfi
 {
     if (!config.mqtt_provisioning_enabled) { return MqttProvisioningProfileState::Absent; }
     const bool complete = config.mqtt_bootstrap_base_url != nullptr &&
+        pixels_mqtt::isValidHardwareId(config.mqtt_hardware_id) &&
         config.mqtt_bootstrap_token != nullptr && config.mqtt_trust_ref != nullptr &&
-        config.mqtt_trust_ca_pem != nullptr;
+        config.mqtt_trust_ca_pem != nullptr && config.generation != 0;
     return complete ? MqttProvisioningProfileState::Complete : MqttProvisioningProfileState::Incomplete;
 }
 
@@ -352,15 +360,22 @@ extern "C" void app_main()
                                                timestamp_source, active_probe, config.device_id);
 
     // #47-B MQTT credential lifecycle, Section 7 (docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md):
-    // ready but deliberately not end-to-end this round. `session` below
-    // still connects with `config.network`'s literal, statically configured
-    // credentials exactly as before -- swapping its live identity based on
-    // `mqtt_coordinator`'s decisions is the NetworkSession-integration work
-    // explicitly deferred until real trust_ref/endpoint/token values exist
-    // to validate it against (see "Blocked on the platform" in that doc).
-    // This block only brings the store/coordinator up and keeps them
-    // ticking in the main loop below, fail-closed, so the day those values
-    // arrive the remaining wiring is the only thing left to do.
+    // foundation only, deliberately not wired to this session this round.
+    // `session` below still connects with `config.network`'s literal,
+    // statically configured credentials exactly as before. Driving a real
+    // credential swap through it needs a MqttSessionController (see
+    // pixels_mqtt_credentials.hpp) fed by a NetworkSession adapter, but
+    // NetworkSession::init() validates and creates the ESP-MQTT client
+    // eagerly, before Wi-Fi ever comes up -- so starting it with "no
+    // credential yet" is not an option, and starting it only after the
+    // bootstrap HTTPS call succeeds needs that same call to already have
+    // network connectivity. Resolving that ordering is a NetworkSession
+    // -level question, not a credential-lifecycle one, and is not attempted
+    // here; see "Blocked on the platform" in that doc. This block only
+    // brings the store/coordinator up against the real partition and real
+    // HTTPS client, proving `store.init()` against actual NVS, but never
+    // calls `poll()` on them: no real credential is ever requested or
+    // emitted by the product this round.
     static pixels_mqtt::MqttCredentialStore mqtt_store;
     static pixels_mqtt::EspMqttBootstrapClient mqtt_bootstrap_client;
     static const pixels_mqtt::TableTrustResolver::Entry mqtt_trust_entries[] = {
@@ -371,22 +386,24 @@ extern "C" void app_main()
     static pixels_mqtt::EspMonotonicClock mqtt_clock;
     pixels_mqtt::MqttCredentialCoordinator::Config mqtt_coordinator_config{};
     mqtt_coordinator_config.base_url = config.mqtt_bootstrap_base_url;
-    mqtt_coordinator_config.hardware_id = config.hardware_binding_id;
+    mqtt_coordinator_config.hardware_id = config.mqtt_hardware_id; // lower-hex; never hardware_binding_id (a UUID)
     mqtt_coordinator_config.bootstrap_token = config.mqtt_bootstrap_token;
     mqtt_coordinator_config.expected_device_id = config.device_id;
     mqtt_coordinator_config.expected_hardware_binding_id = config.hardware_binding_id;
+    mqtt_coordinator_config.expected_generation = config.generation;
     if (config.mqtt_bootstrap_timeout_ms != 0) {
         mqtt_coordinator_config.timeout_ms = config.mqtt_bootstrap_timeout_ms;
     }
     static pixels_mqtt::MqttCredentialCoordinator mqtt_coordinator(
         mqtt_store, mqtt_bootstrap_client, mqtt_trust_resolver, mqtt_clock, mqtt_coordinator_config);
-    bool mqtt_provisioning_ready = false;
     if (mqtt_state == MqttProvisioningProfileState::Complete) {
         const esp_err_t mqtt_init = mqtt_store.init();
-        mqtt_provisioning_ready = mqtt_init == ESP_OK;
-        if (!mqtt_provisioning_ready) {
-            ESP_LOGE(kTag, "MQTT credential store init failed: %s; provisioning stays idle this boot"
+        if (mqtt_init != ESP_OK) {
+            ESP_LOGE(kTag, "MQTT credential store init failed: %s; provisioning stays offline this boot"
                            " (laboratory MQTT wiring below is unaffected)", esp_err_to_name(mqtt_init));
+        } else {
+            ESP_LOGI(kTag, "MQTT credential store ready, but #47-B stays offline this boot: not yet wired"
+                           " to the live session (see docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md, Seção 7)");
         }
     }
 
@@ -400,7 +417,6 @@ extern "C" void app_main()
 
     bool sntp_started = false;
     bool previously_ready = false;
-    pixels_mqtt::CoordinatorAction mqtt_previous_action = pixels_mqtt::CoordinatorAction::Idle;
     uint32_t state_revision = 0;
     uint32_t published_state_revision = 0;
     uint32_t pending_state_revision = 0;
@@ -430,17 +446,10 @@ extern "C" void app_main()
             sntp_started = esp_netif_sntp_init(&time_config) == ESP_OK;
         }
         session.poll();
-        if (mqtt_provisioning_ready) {
-            // Keeps the bootstrap/backoff state machine live and observable
-            // against the real endpoint once a profile supplies one; see
-            // the comment above this block's construction for why its
-            // result does not yet drive `session`.
-            const pixels_mqtt::CoordinatorAction mqtt_action = mqtt_coordinator.poll();
-            if (mqtt_action != mqtt_previous_action) {
-                ESP_LOGI(kTag, "MQTT credential coordinator action: %d", static_cast<int>(mqtt_action));
-                mqtt_previous_action = mqtt_action;
-            }
-        }
+        // #47-B stays offline this boot (see this function's construction
+        // of mqtt_coordinator above): poll() is never called here, so no
+        // real bootstrap request is ever issued and no real credential is
+        // ever emitted by the product this round.
         const bool ready = session.status().subscribed;
         if (ready != previously_ready) {
             ESP_LOGI(kTag, "command subscription %s", ready ? "ready" : "offline");
