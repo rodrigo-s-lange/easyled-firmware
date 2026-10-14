@@ -405,6 +405,20 @@ extern "C" void app_main()
             ESP_LOGI(kTag, "MQTT credential store ready, but #47-B stays offline this boot: not yet wired"
                            " to the live session (see docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md, Seção 7)");
         }
+        // Provisioned mode must never start `session` with
+        // config.network's literal laboratory credentials -- that would be
+        // exactly the silent downgrade this whole profile system exists to
+        // prevent. MqttSessionController (pixels_mqtt_credentials.hpp) is
+        // built and tested, but wiring it to a real NetworkSession needs
+        // the Wi-Fi-before-MQTT-identity ordering question resolved first
+        // (see that header's own comment, and the doc's "próxima tarefa de
+        // arquitetura do firmware"). Until then this boot has nothing
+        // further to do on the networking side: restored pixels and local
+        // rendering already run independently of any of this (AGENTS.md),
+        // and no credential -- static or real -- is used for MQTT.
+        ESP_LOGI(kTag, "provisioned mode stays offline this boot: no MQTT session is started with any"
+                       " credential, static laboratory or real, until the session controller is wired");
+        return;
     }
 
     err = session.init(config.network);

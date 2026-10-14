@@ -850,14 +850,21 @@ esp_err_t MqttCredentialCoordinator::doBootstrap()
     switch (result.status_code) {
     case 200:
         break;
-    case 401:
-        store_.enterProvisioningFault();
+    case 401: {
+        // commitTransition() never mutates RAM before a write succeeds, so
+        // a failed enterProvisioningFault() call leaves whatever state
+        // (current/pending/counters) existed before this call exactly as
+        // it was -- there is nothing further to "preserve" here beyond
+        // propagating that failure instead of silently discarding it.
+        const esp_err_t fault_err = store_.enterProvisioningFault();
         scheduleNextAttempt(false, 0);
-        return ESP_FAIL;
-    case 403:
-        store_.enterProvisioningFault();
+        return fault_err == ESP_OK ? ESP_FAIL : fault_err;
+    }
+    case 403: {
+        const esp_err_t fault_err = store_.enterProvisioningFault();
         scheduleNextAttempt(false, 0);
-        return ESP_FAIL;
+        return fault_err == ESP_OK ? ESP_FAIL : fault_err;
+    }
     case 429:
         scheduleNextAttempt(result.has_retry_after, result.retry_after_s);
         return ESP_FAIL;
@@ -965,26 +972,41 @@ MqttSessionController::MqttSessionController(MqttCredentialCoordinator &coordina
 {
 }
 
+esp_err_t MqttSessionController::reportPendingResult()
+{
+    esp_err_t err;
+    if (pending_result_ == PendingResult::Connected) {
+        err = coordinator_.reportConnected();
+        if (err == ESP_OK) { ready_ = true; }
+    } else {
+        err = coordinator_.reportAmbiguous(); // Outcome/PendingResult have no PreAuthFailure value -- see Seção 5
+        if (err == ESP_OK) { ready_ = false; }
+    }
+    if (err != ESP_OK) { return err; } // pending_result_ stays set; the next tick() retries this same report
+    pending_result_ = PendingResult::None;
+    return ESP_OK;
+}
+
 esp_err_t MqttSessionController::tick()
 {
+    // A terminal outcome that could not yet be persisted takes priority
+    // over everything else: retry ONLY the durable report, never re-poll
+    // or restart the transport while one is owed.
+    if (pending_result_ != PendingResult::None) { return reportPendingResult(); }
+
     if (attempt_active_) {
         const MqttTransportSession::Outcome outcome = transport_.poll();
         if (outcome == MqttTransportSession::Outcome::StillTrying) { return ESP_OK; }
         attempt_active_ = false;
-        if (outcome == MqttTransportSession::Outcome::Connected) {
-            ready_ = true;
-            return coordinator_.reportConnected();
-        }
-        ready_ = false;
-        return coordinator_.reportAmbiguous(); // Outcome has no PreAuthFailure value -- see Seção 5
+        pending_result_ =
+            outcome == MqttTransportSession::Outcome::Connected ? PendingResult::Connected : PendingResult::Ambiguous;
+        return reportPendingResult();
     }
 
-    ready_ = false;
     const CoordinatorAction action = coordinator_.poll();
     if (action != CoordinatorAction::ConnectWithPending && action != CoordinatorAction::ConnectWithCurrentCourtesy) {
-        return ESP_OK; // Idle, or a RequestBootstrap already handled inside poll() itself
+        return ESP_OK; // Idle, or a RequestBootstrap already handled inside poll() itself -- ready_ untouched
     }
-    const bool using_pending = action == CoordinatorAction::ConnectWithPending;
     const StoredCredential &credential = coordinator_.credentialToTry();
     const char *ca_pem = nullptr;
     if (trust_.resolve(credential.trust_ref, &ca_pem) != ESP_OK) {
@@ -995,8 +1017,13 @@ esp_err_t MqttSessionController::tick()
         // a connection with no CA.
         return ESP_OK;
     }
+    const bool using_pending = action == CoordinatorAction::ConnectWithPending;
     const esp_err_t begin_err = store_.beginAttempt(using_pending);
     if (begin_err != ESP_OK) { return begin_err; }
+    // A new attempt is starting: whatever `restart()` below does, the
+    // previous session (if any) is no longer the one in use -- ready_ no
+    // longer describes "now" regardless of how this new attempt turns out.
+    ready_ = false;
 
     MqttSessionIdentity identity{};
     identity.broker_uri = credential.broker_uri;
@@ -1011,7 +1038,8 @@ esp_err_t MqttSessionController::tick()
         // never actually got to try. Conservative, per Seção 5: there is no
         // transport-proven pre-auth evidence anywhere in this seam, so this
         // is reported exactly the same way any other inconclusive outcome is.
-        return coordinator_.reportAmbiguous();
+        pending_result_ = PendingResult::Ambiguous;
+        return reportPendingResult();
     }
     attempt_active_ = true;
     return ESP_OK;

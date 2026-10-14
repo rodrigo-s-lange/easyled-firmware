@@ -299,8 +299,8 @@ localizar a causa raiz verdadeira), mas foi mantido como margem de segurança ra
 
 ## Pontos ainda bloqueados pela plataforma
 
-Inalterados desta rodada; até essas respostas chegarem, a implementação permanece injetável,
-testável e fail-closed:
+Estritamente dependências externas da equipe de plataforma; até essas respostas chegarem, a
+implementação permanece injetável, testável e fail-closed:
 
 1. Valores reais de `trust_ref` e respectivas CAs por ambiente.
 2. Base URL do endpoint de bootstrap implantado.
@@ -308,19 +308,81 @@ testável e fail-closed:
 4. Limite de taxa por ambiente (embora `Retry-After` já seja suficiente do lado do firmware).
 5. Confirmação/merge definitivo do contrato #47-B.
 
-Consequência direta no firmware: além dos itens acima, a ligação do `MqttSessionController` a um
-`NetworkSession` real também depende de resolver a ordenação Wi-Fi-antes-de-identidade-MQTT
-descrita na Seção 7 — uma decisão de design de `NetworkSession`, não deste ciclo de vida de
-credencial, e que não há como validar com segurança sem pelo menos um endpoint real para testar
-contra de qualquer forma.
+## Próxima tarefa de arquitetura do firmware (não bloqueada pela plataforma)
+
+A ordenação Wi-Fi-antes-de-identidade-MQTT descrita na Seção 7 é uma decisão de design interna de
+`NetworkSession`, não uma dependência externa — não precisa esperar nenhuma resposta da
+plataforma para ser resolvida, e pode (e deve) ser atacada independentemente dos 5 itens acima.
+Só depois dela resolvida é que a ligação do `MqttSessionController` a um `NetworkSession` real
+tem onde pousar; os valores reais de `trust_ref`/URL/token continuam sendo necessários antes de
+qualquer teste de ponta a ponta contra um ambiente real, mas a arquitetura em si não depende deles.
+
+## Rodada corretiva 2: correção final pequena sobre `a950abf`
+
+Quatro correções pontuais, sem reabrir parser, formato A/B, `hardware_id`, `generation`,
+contagem de rodadas ou classificação pré-auth (todos intocados desta vez):
+
+1. **`MqttSessionController` perdia o resultado durável em falha**: `tick()` limpava
+   `attempt_active_` antes de saber se `reportConnected()`/`reportAmbiguous()` conseguiram
+   persistir; em falha, o store ficava em `AttemptInFlight` e o controlador entrava em `Idle`
+   permanentemente (nunca mais reportava nada, nunca mais tentava de novo). Corrigido com um
+   estado explícito `PendingResult{None, Connected, Ambiguous}`: ao observar um resultado
+   terminal do transporte (ou uma falha imediata de `restart()`), o resultado é guardado em
+   `pending_result_` e `reportPendingResult()` é quem tenta persisti-lo; enquanto isso falhar,
+   `tick()` **só** tenta esse mesmo report de novo — nunca consulta `transport_.poll()` nem chama
+   `transport_.restart()` nesse meio tempo. `ready_` só vira `true` dentro de
+   `reportPendingResult()`, e só depois de `reportConnected()` retornar `ESP_OK`; fica
+   inalterado em qualquer tick ocioso (sem resultado pendente, sem tentativa ativa) depois disso.
+   `ready()` documentado com precisão: não é um pulso de um tick, é "o último resultado
+   persistido foi Connected", que só muda quando uma nova tentativa começa (a sessão antiga já
+   foi derrubada para tentar outra identidade, seja qual for o resultado dela) ou quando um
+   `Ambiguous` subsequente é persistido.
+
+   Testes novos pelo `MqttSessionController` (não só pelo coordenador direto): fault injection em
+   `reportConnected()` seguida de retry bem-sucedido, confirmando nenhuma chamada extra a
+   `restart()`/`poll()` durante o retry e `ready()` falso o tempo todo até persistir; o mesmo para
+   `reportAmbiguous()`; e `ready()` permanecendo `true` por 5 ticks ociosos consecutivos depois de
+   uma confirmação persistida.
+
+2. **Boot provisionado agora falha fechado de verdade**: com `mqtt_provisioning_enabled=true` e
+   perfil completo, `main.cpp` **não chama mais** `session.init(config.network)` nem
+   `session.start()` — antes, o código inicializava o store/coordenador de produção mas ainda
+   assim conectava a sessão real com as credenciais estáticas de `config.network`, exatamente o
+   downgrade silencioso que este perfil existe para impedir. Agora: o store ainda é
+   inicializado/validado contra a partição real (prova que a camada durável funciona), um log
+   claro declara que o modo provisionado permanece offline até a ligação do controlador, e a
+   função retorna sem iniciar nenhuma sessão MQTT — nem com credencial estática, nem com
+   nenhuma real (nenhuma existe ainda de qualquer forma). Pixels/renderização local, já
+   restaurados antes deste ponto em `app_main()`, continuam ativos (AGENTS.md: renderização
+   independe de rede). Modo laboratório (`mqtt_provisioning_enabled=false`) e perfil incompleto
+   permanecem exatamente como estavam.
+
+3. **`enterProvisioningFault()` com retorno descartado em `doBootstrap()`**: os casos `401`/`403`
+   chamavam `store_.enterProvisioningFault()` sem checar o resultado. Corrigido para capturar o
+   retorno e propagá-lo: `commitTransition()` já garante que uma falha nessa escrita nunca muta o
+   estado anterior (nada foi mutado antecipadamente), então "preservar o estado anterior" já era
+   automático; o que faltava era não descartar o erro. Teste de fault injection dedicado: `401`
+   com `DuringCommit` injetado deixa o estado em `Empty` (o anterior, intocado); retry sem falha
+   faz a transição para `ProvisioningFault` pousar de verdade.
+
+4. **Documentação**: a ordenação Wi-Fi-antes-de-identidade-MQTT saiu da lista de bloqueios da
+   plataforma e passou para "próxima tarefa de arquitetura do firmware" (é uma decisão interna de
+   `NetworkSession`, não uma dependência externa); a lista de bloqueios da plataforma ficou
+   restrita a `trust_ref`/CA reais, URL de bootstrap, entrega do token, rate limit e merge do
+   contrato; e esta seção declara explicitamente que o modo provisionado não usa nenhuma
+   credencial estática enquanto a ligação real não existir (item 2 acima).
+
+Validação desta rodada: build do produto limpo; `validation/` congelada **468/468 ALL_PASS**, sem
+nenhum caso novo adicionado nela; `validation_mqtt_credentials/` com os checks novos, **ALL_PASS**
+e `run_qemu.py` retornando exit code 0; banner do HEAD final exato, sem `-dirty`; `git diff
+--check` limpo. Um único commit corretivo sobre `a950abf`.
 
 ## Confirmação de ausência de segredos, push, merge, deploy e flash
 
 Nenhuma URL, bearer token, credencial MQTT ou material de CA real foi adicionado em nenhum commit
-desta rodada. Todo material de teste novo (fault injection, `hardware_id` sintético,
-`MqttSessionController`/`FakeTransportSession`) usa os mesmos valores sintéticos já estabelecidos
-(`kHardwareId = "a1b2c3d4e5f6"`, `kTrustRef`/`kCaPem` sintéticos, senhas prefixadas
+desta rodada nem na anterior. Todo material de teste novo (fault injection, `hardware_id`
+sintético, `MqttSessionController`/`FakeTransportSession`) usa os mesmos valores sintéticos já
+estabelecidos (`kHardwareId = "a1b2c3d4e5f6"`, `kTrustRef`/`kCaPem` sintéticos, senhas prefixadas
 `SYNTHETIC-`/`ab-`/`durable-fail-`/`rotated-secret-`). `git diff --check` limpo. Nenhum push,
 merge, PR, flash, acesso a broker real ou a `easyled-platform` foi realizado — todo trabalho
-permanece local nesta worktree, branch `feat/mqtt-credential-lifecycle-47b`, acrescentando commits
-corretivos aos três já existentes (`c60b26d`/`202a047`/`728009c`).
+permanece local nesta worktree, branch `feat/mqtt-credential-lifecycle-47b`.

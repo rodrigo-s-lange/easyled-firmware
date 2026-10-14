@@ -162,10 +162,11 @@ public:
         return ESP_OK;
     }
     void end() override { ++end_calls; }
-    Outcome poll() override { return outcome_to_report; }
+    Outcome poll() override { ++poll_calls; return outcome_to_report; }
 
     int restart_calls = 0;
     int end_calls = 0;
+    int poll_calls = 0;
     bool fail_restart = false;
     MqttSessionIdentity last_identity{};
     Outcome outcome_to_report = Outcome::StillTrying;
@@ -914,6 +915,21 @@ extern "C" void app_main()
         CHECK(coordinator.poll() == CoordinatorAction::Idle);
         CHECK(store.state() == CredentialState::ProvisioningFault);
 
+        // Durable-failure propagation for enterProvisioningFault() itself:
+        // a fault injected on that transition must leave the previous
+        // state (Empty here) exactly as it was -- commitTransition() never
+        // mutates RAM before a write succeeds -- never silently show
+        // ProvisioningFault without that commit having actually landed.
+        clock.now_us_ += 1000000LL * 3600;
+        CHECK(store.eraseAll() == ESP_OK);
+        client.status_code = 401;
+        store.setFaultInjectionForTest(StoreTestFault::DuringCommit);
+        CHECK(coordinator.poll() == CoordinatorAction::Idle); // doBootstrap() failed either way
+        CHECK(store.state() == CredentialState::Empty); // the fault transition itself did not land
+        clock.now_us_ += 1000000LL * 3600;
+        CHECK(coordinator.poll() == CoordinatorAction::Idle); // retried, no fault now, transition lands for real
+        CHECK(store.state() == CredentialState::ProvisioningFault);
+
         clock.now_us_ += 1000000LL * 3600;
         CHECK(store.eraseAll() == ESP_OK);
         client.status_code = 429;
@@ -1065,6 +1081,96 @@ extern "C" void app_main()
         clock.now_us_ += 1000000LL * 3600;
         CHECK(controller.tick() == ESP_OK); // beginAttempt() durable; restart() failed -> reported Ambiguous
         CHECK(transport.restart_calls == restarts_before + 1 && store.state() == CredentialState::AmbiguousActivation);
+        store.end();
+    }
+
+    // =========================================================================
+    // MqttSessionController: a terminal transport outcome must never be
+    // lost when the durable report itself fails. The result stays pending
+    // and is retried on the NEXT tick() -- never re-polling or restarting
+    // the transport meanwhile -- until it persists. ready() only ever
+    // follows a persisted report, and survives any number of unrelated
+    // idle ticks afterward.
+    // =========================================================================
+    CHECK(nvs_flash_erase_partition("easyled") == ESP_OK);
+    {
+        static MqttCredentialStore store;
+        CHECK(store.init() == ESP_OK);
+        static FakeBootstrapClient client;
+        static const TableTrustResolver::Entry kEntries[] = {{kTrustRef, kCaPem}};
+        static TableTrustResolver trust(kEntries, 1);
+        static FakeClock clock;
+        MqttCredentialCoordinator::Config config{};
+        config.base_url = "https://api.example.invalid";
+        config.hardware_id = kHardwareId;
+        config.bootstrap_token = "bootstrap-test-token";
+        config.expected_device_id = kDeviceId;
+        config.expected_hardware_binding_id = kHardwareBindingId;
+        config.expected_generation = kGeneration;
+        static MqttCredentialCoordinator coordinator(store, client, trust, clock, config);
+        static FakeTransportSession transport;
+        static MqttSessionController controller(coordinator, store, trust, transport);
+
+        char body[2048];
+        ResponseFields fields{};
+        const int written = buildResponse(body, sizeof(body), fields);
+        client.status_code = 200;
+        client.body = body;
+        client.body_size = static_cast<size_t>(written);
+
+        CHECK(controller.tick() == ESP_OK); // Empty -> bootstrap -> PendingUnused -> beginAttempt() -> restart()
+        CHECK(store.state() == CredentialState::AttemptInFlight && transport.restart_calls == 1);
+        CHECK(!controller.ready()); // Connected not yet persisted
+
+        // Several "still trying" ticks must not change ready() either.
+        CHECK(controller.tick() == ESP_OK);
+        CHECK(controller.tick() == ESP_OK);
+        CHECK(!controller.ready() && transport.restart_calls == 1);
+
+        // Terminal Connected outcome observed (one transport.poll() call,
+        // legitimately, to learn that), but the durable report fails to
+        // persist: the result must not be lost, and ready() must stay false.
+        store.setFaultInjectionForTest(StoreTestFault::DuringCommit);
+        transport.outcome_to_report = MqttTransportSession::Outcome::Connected;
+        CHECK(controller.tick() != ESP_OK); // reportConnected() failed to persist
+        CHECK(store.state() == CredentialState::AttemptInFlight); // RAM unchanged; nothing assumed
+        CHECK(!controller.ready());
+        const int restarts_after_first_attempt = transport.restart_calls;
+        const int polls_after_first_attempt = transport.poll_calls;
+
+        // Retry: no fault this time. The pending Connected report is what
+        // retries -- never another transport.poll() or transport.restart().
+        CHECK(controller.tick() == ESP_OK);
+        CHECK(store.state() == CredentialState::CurrentConfirmed && controller.ready());
+        CHECK(transport.restart_calls == restarts_after_first_attempt &&
+              transport.poll_calls == polls_after_first_attempt);
+
+        // ready() survives any number of subsequent idle ticks.
+        for (int i = 0; i < 5; ++i) {
+            clock.now_us_ += 1000000LL * 3600;
+            CHECK(controller.tick() == ESP_OK);
+            CHECK(controller.ready());
+        }
+
+        // Same persistence guarantee for an Ambiguous outcome. Rotate in a
+        // new credential so there is a `pending` to attempt.
+        StoredCredential rotated =
+            makeCredential("6f6f6f6f-6f6f-4f6f-8f6f-6f6f6f6f6f6f", "rotated-secret-dddddddddddd");
+        CHECK(store.storePending(rotated) == ESP_OK);
+        clock.now_us_ += 1000000LL * 3600;
+        CHECK(controller.tick() == ESP_OK); // beginAttempt() + restart() with the rotated identity
+        CHECK(store.state() == CredentialState::AttemptInFlight && !controller.ready()); // new attempt clears ready()
+        const int restarts_before_ambiguous = transport.restart_calls;
+
+        store.setFaultInjectionForTest(StoreTestFault::DuringCommit);
+        transport.outcome_to_report = MqttTransportSession::Outcome::Ambiguous;
+        CHECK(controller.tick() != ESP_OK); // reportAmbiguous() failed to persist
+        CHECK(store.state() == CredentialState::AttemptInFlight); // RAM unchanged
+        CHECK(transport.restart_calls == restarts_before_ambiguous); // no extra restart during the retry
+
+        CHECK(controller.tick() == ESP_OK); // retries the SAME pending Ambiguous report, no fault now
+        CHECK(store.state() == CredentialState::AmbiguousActivation && !controller.ready());
+        CHECK(transport.restart_calls == restarts_before_ambiguous);
         store.end();
     }
 

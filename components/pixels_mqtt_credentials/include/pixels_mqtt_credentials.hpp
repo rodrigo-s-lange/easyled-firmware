@@ -573,22 +573,46 @@ public:
                           MqttTransportSession &transport);
 
     /// Call once per control-loop tick. Never blocks.
-    /// @return ESP_OK, or the first durable-store write failure encountered
-    ///         -- the caller should simply call tick() again later; nothing
-    ///         is left half-applied either in the store or in `transport`.
+    /// @return ESP_OK, or the first durable-store write failure encountered.
+    ///         On a non-ESP_OK return, a terminal transport outcome (if one
+    ///         was just observed) is held pending: the caller should simply
+    ///         call tick() again later, which retries *only* the durable
+    ///         report (never re-polls or restarts `transport`) until it
+    ///         persists. Nothing is left half-applied either in the store
+    ///         or in `transport`.
     esp_err_t tick();
 
-    /// True once the credential this controller is currently using has an
-    /// accepted CONNACK for this tick.
+    /// Whether a connected session, as last durably confirmed, is current.
+    /// Not a one-tick pulse: once a `Connected` outcome is itself durably
+    /// reported, this stays true across any number of subsequent idle
+    /// tick() calls, until something actually changes it -- a new attempt
+    /// starting (the session just torn down to try a different identity,
+    /// whatever that attempt's own eventual outcome) or a later `Ambiguous`
+    /// outcome being durably reported. It only ever follows a *persisted*
+    /// report: see tick()'s retry behavior above.
     bool ready() const { return ready_; }
 
 private:
+    /// Persists `pending_result_` (set by the caller before invoking this)
+    /// via the matching coordinator report, updating `ready_` only once
+    /// that report itself succeeds. Never touches `transport_`. On failure
+    /// returns the error with `pending_result_` left set, so the next
+    /// tick() retries this exact report without re-polling or restarting
+    /// the transport.
+    esp_err_t reportPendingResult();
+
+    enum class PendingResult : uint8_t { None, Connected, Ambiguous };
+
     MqttCredentialCoordinator &coordinator_;
     MqttCredentialStore &store_;
     TrustResolver &trust_;
     MqttTransportSession &transport_;
     bool attempt_active_ = false;
     bool ready_ = false;
+    /// A terminal transport outcome (or an immediate restart() failure)
+    /// observed but not yet durably reported to the coordinator -- see
+    /// tick()'s retry behavior above. None means no report is owed.
+    PendingResult pending_result_ = PendingResult::None;
 };
 
 } // namespace pixels_mqtt
