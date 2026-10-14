@@ -1,299 +1,306 @@
-# #47-B — Fundação durável do ciclo de vida de credenciais MQTT (2026-10-13)
+# #47-B — Fundação durável do ciclo de vida de credenciais MQTT (2026-10-14)
 
 ## Resumo executivo
 
-1. **Baseline**: branch `main`, commit `20e4049cf480e81fddec11e1e7d50dcb81462632` — exatamente o
-   esperado, sem divergência. Build do produto e `validation/` confirmados limpos nesta mesma
-   base antes de qualquer edição. Worktree isolada em
-   `easyled-firmware-mqtt-credentials-47b/`, branch `feat/mqtt-credential-lifecycle-47b`.
-2. **O que foi construído**: a fundação durável completa do ciclo `pending → active → revoked` do
-   contrato #47-B — parser limitado do payload de bootstrap, resolvedor de confiança injetável,
-   armazenamento durável em NVS (CRC32 + readback), cliente HTTPS de bootstrap injetável,
-   máquina de recuperação determinística (coordenador), um seam mínimo no `NetworkSession` real,
-   e a fiação de configuração (gitignored, fail-closed) no `main.cpp` do produto. Tudo no novo
-   componente de aplicação `components/pixels_mqtt_credentials/` — nenhuma mudança em
-   `esp32libfun`, Composer, efeitos ou `easyled-platform`.
-3. **Validação**: novo target `validation_mqtt_credentials/`, **127/127 checks, ALL_PASS**,
-   confirmado em múltiplas execuções QEMU consecutivas sem falha. O runner congelado `validation/`
-   permanece **468/468 ALL_PASS**, sem nenhuma alteração de capacidade (772 B de DRAM estática
-   livre, idênticos antes/depois).
-4. **Integração real, não apenas fundação**: ainda não é ponta a ponta. O `main.cpp` do produto já
-   constrói e mantém viva a `MqttCredentialCoordinator` de produção quando um perfil completo é
-   fornecido, mas **não troca ainda** a identidade MQTT ao vivo do `NetworkSession` com base nela —
-   ver "Pontos bloqueados pela plataforma" abaixo.
-5. **Nenhum segredo adicionado**: nenhuma URL, token, credencial ou CA real foi embutida em
-   nenhum lugar; todo material de teste é sintético e vive exclusivamente no novo target de
-   validação. Ver "Confirmação de ausência de segredos".
+1. **Baseline desta rodada corretiva**: branch `feat/mqtt-credential-lifecycle-47b`, HEAD inicial
+   `728009c` (os três commits da rodada anterior, preservados). Working tree limpa antes de
+   editar. Nenhuma mudança em `easyled-platform`, `esp32libfun` ou nas bibliotecas de pixels.
+2. **O que esta rodada corrigiu**: a revisão do Codex sobre a rodada anterior encontrou 8
+   bloqueadores reais de correção/segurança/design, todos corrigidos nesta rodada única e coesa
+   (detalhe item a item em "Rodada corretiva" abaixo):
+   `hardware_id` nunca mais confundido com `hardware_binding_id`; `generation` agora é um
+   gate de autoridade exato no parser; o armazenamento passou de 3 blobs separados (não atômico)
+   para um registro A/B autocontido com fault injection determinística; falhas duráveis do store
+   agora se propagam como `esp_err_t` até o coordenador, que não avança bookkeeping quando elas
+   ocorrem; a classificação "pré-autenticação" do `NetworkSession` foi **removida** (era falsa:
+   `MQTT_ERROR_TYPE_TCP_TRANSPORT` também ocorre esperando CONNACK, depois do CONNECT já enviado);
+   a definição de "rodada" agora é pending-depois-cortesia completos, não tentativas individuais;
+   emissão de credencial real que o produto ignorava foi substituída por um controlador de sessão
+   testável que **não** é ligado à sessão real ainda (decisão explícita, justificada abaixo); e o
+   runner `run_qemu.py` agora reconhece o marcador exato deste target e retorna 0/1 corretamente.
+3. **Validação**: novo target `validation_mqtt_credentials/` — **258/258 checks, ALL_PASS**,
+   confirmado em **3 execuções QEMU consecutivas, todas com `run_qemu.py` retornando exit code 0**
+   (o próprio runner, corrigido nesta rodada, agora confirma isso — não apenas minha leitura do
+   transcript). O runner congelado `validation/` permanece **468/468 ALL_PASS**, exit 0, sem
+   nenhuma alteração de capacidade (772 B de DRAM estática livre, idênticos antes/depois). Build do
+   produto confirmado limpo.
+4. **Integração real, ainda não ponta a ponta — por decisão explícita, não por omissão**: o
+   `MqttSessionController` (novo, testável) prova a orquestração completa contra um transporte
+   MQTT fake, mas **não é instanciado no `main.cpp` do produto**. Motivo técnico concreto,
+   encontrado ao reanalisar `NetworkSession::init()` nesta rodada: ele valida e cria o cliente
+   ESP-MQTT **antes** de subir o Wi-Fi, exigindo uma identidade MQTT completa só para começar —
+   não há como "começar só com Wi-Fi, decidir a credencial depois" sem resolver essa ordenação em
+   `NetworkSession`, o que é uma questão de design daquele componente, não deste ciclo de vida de
+   credencial. Ver "Seção 7" e "Pontos bloqueados pela plataforma".
+5. **Nenhum segredo adicionado**: confirmado de novo nesta rodada — ver "Confirmação de ausência
+   de segredos".
 
 ## Procedência imutável
 
-Referência upstream (revisável, não uma integração de produção) de
-`rodrigo-s-lange/easyled-platform` @ `40e0af25a671299d71915e52b4239a005fb48296`:
+Inalterada desta rodada; revalidada por releitura antes de editar. Referência upstream
+(revisável, não uma integração de produção) de `rodrigo-s-lange/easyled-platform` @
+`40e0af25a671299d71915e52b4239a005fb48296`:
 
 - Contrato: `docs/contracts/easyled-control-contract.md`, seção "Device MQTT credential lifecycle
   (#47-B)", linhas 583-788.
 - Fixture: `docs/fixtures/mqtt-provisioning/device-response.v1.json`.
 - Instruções: `docs/fixtures/mqtt-provisioning/README.md`.
-- Operação OpenAPI: `issueDeviceMQTTCredential`.
-
-Importado byte a byte via `git show <SHA>:<path>` em um clone local read-only; `easyled-platform`
-nunca foi tocado (sem checkout, reset, merge ou edição).
+- OpenAPI: operação `issueDeviceMQTTCredential`; schemas `ClaimResponse`/`ClaimabilityResponse`
+  (padrão `hardware_id`); parâmetro de path `hardware_id` do próprio
+  `/device-bootstrap/{hardware_id}/mqtt-credential`.
 
 | Arquivo | Bytes | SHA-256 | Newline final |
 |---|---:|---|---|
 | `device-response.v1.json` | 1257 | `e92947aedc6669d44e0068103508b9c6b7a8db2a4256b987d26e02b4a29b9db2` | sim (`}\n`) |
 
-**Primeiro fixture deste repositório que é pretty-printed** (multi-linha, indentado) em vez de
-minificado — exigiu tolerância a espaço em branco à direita após o `end` do cJSON (ver "Bugs
-corrigidos" abaixo); todos os fixtures anteriores eram minificados com `end == json + size` exato.
-
 ## Camada da mudança
 
-Camada de aplicação/produto (AGENTS.md: `framework/core/` não foi tocado). Novo componente
-`components/pixels_mqtt_credentials/`, seguindo exatamente o padrão já estabelecido por
-`pixels_durable_storage` (mesma partição NVS `easyled`, mesmo discipline CRC32+commit+readback,
-mesmo padrão de parsing cJSON com helpers privados por componente). Integração mínima com
-`main.cpp` apenas onde necessário; `pixels_network`/`NetworkSession` recebeu um único seam
-pontual (seção 6). `esp32libfun`, Composer e efeitos: inalterados.
+Inalterada: camada de aplicação/produto. Mudanças desta rodada confinadas a
+`components/pixels_mqtt_credentials/` (a maior parte), `components/pixels_network/` (reversão do
+seam da rodada anterior) e `main/main.cpp`. Nenhuma mudança em `esp32libfun`, Composer, efeitos ou
+`easyled-platform`.
 
-## Seção 1 — Parser e fixture
+## Rodada corretiva: os 8 achados e o que foi feito
 
-`pixels_mqtt::parseDeviceCredentialResponse()` — limitado, sem heap descontrolado (cJSON sobre um
-buffer fixo), valida:
+### 1. `hardware_id` separado de `hardware_binding_id`
 
-- UUIDs de `device_id`/`hardware_binding_id`/`credential.id` e identidade recebida == identidade
-  esperada (injetada pelo chamador, nunca lida do próprio payload).
-- `generation != 0`; `credential.status == "pending"` exatamente; `credential.kind` ∈
-  `{initial_provisioning, rotation}`; `credential.activation ==
-  "first_successful_mqtt_authentication"` exatamente.
-- `mqtt.username == mqtt.client_id == device_id`; senha não vazia, ≤128 bytes (129 rejeitado);
-  `broker_uri` exclusivamente `wss://`, sem userinfo; `tls.verify_server == true` (literal);
-  `tls.trust_ref` resolvido via o `TrustResolver` injetado (seção 2); 4 tópicos não vazios,
-  limitados, sem `+`/`#`.
-- Campos consumidos duplicados, ausentes ou com tipo errado são rejeitados; campos desconhecidos
-  são ignorados (forward compatibility).
-- `expires_at`: RFC3339 UTC terminando em `Z`, aceitando 0 dígitos fracionários, 1-6 dígitos
-  fracionários e o exemplo real de 6 dígitos do fixture — **nunca usado para descartar uma
-  credencial** quando o relógio local não é confiável (apenas metadado, nunca avaliado).
+O path `POST /api/v1/device-bootstrap/{hardware_id}/mqtt-credential` usa o identificador físico
+da unidade (`^[0-9a-f]{1,64}$`, OpenAPI), nunca o UUID `hardware_binding_id` do corpo da resposta
+(que muda a cada rebind; o `hardware_id` nunca muda). A rodada anterior os confundia: o
+`main.cpp` passava `config.hardware_binding_id` (um UUID) como `hardware_id` do coordenador, e
+`EspMqttBootstrapClient::requestCredential()` validava esse campo com a função `uuid()` —
+exatamente invertido: um UUID real teria *passado* essa checagem, e um `hardware_id` lower-hex
+real (sem hifens) teria sido *rejeitado*.
 
-## Seção 2 — Resolvedor de confiança
+Corrigido:
+- Nova função exportada `pixels_mqtt::isValidHardwareId()` — lower-hex, 1 a 64 caracteres, o
+  padrão exato do OpenAPI. Testada exaustivamente (vazio, nulo, maiúsculas, caractere fora de
+  `[0-9a-f]`, 64 e 65 caracteres como limite).
+  `EspMqttBootstrapClient::requestCredential()` agora usa `isValidHardwareId()`, não `uuid()`.
+- Novo campo `ApplicationConfig::mqtt_hardware_id` em `main.cpp`, documentado como distinto de
+  `hardware_binding_id`; `mqttProvisioningProfileState()` valida seu formato antes de aceitar o
+  perfil como completo.
+- `main.cpp` passa `config.mqtt_hardware_id` (nunca `hardware_binding_id`) para
+  `mqtt_coordinator_config.hardware_id`.
+- `hardware_binding_id` continua sendo o UUID esperado no corpo da resposta; nunca derivado de
+  `hardware_id` nem o contrário.
+- Teste dedicado: a credencial do coordenador contra um `FakeBootstrapClient` confirma
+  `last_request.hardware_id == kHardwareId` e `!= kHardwareBindingId`.
 
-`TrustResolver` (interface) + `TableTrustResolver` (tabela estática injetada). `trust_ref`
-desconhecido falha fechado (`ESP_ERR_NOT_FOUND`) — nunca cai para outra CA, nunca desabilita
-verificação de hostname/certificado. O fixture usa `easyled-broker-ca-v1` com material sintético
-apenas no target de teste; em produção, sem uma tabela com entrada válida, o provisionamento se
-recusa (ver Seção 7). **Valores reais por ambiente ainda não foram entregues pela plataforma** —
-quando chegarem, a tabela real é só mais um `TableTrustResolver::Entry` injetado no perfil
-gitignored do `main.cpp`, sem mudança de código.
+### 2. `generation` como token de autoridade exato
 
-## Seção 3 — Armazenamento durável
+`parseDeviceCredentialResponse()` ganhou um parâmetro `expected_generation`. A verificação ocorre
+**antes** de `trust_ref` ser resolvido (que só acontece depois do parser retornar `ESP_OK`, em
+`doBootstrap()`) e antes de qualquer persistência ou conexão. `generation == 0` do lado da
+resposta já era rejeitado (`Malformed`, checagem pré-existente); agora, adicionalmente,
+`expected_generation == 0` (defensivo, nunca deveria ocorrer para uma binding ativa) e
+`generation != expected_generation` são rejeitados como `IdentityMismatch` — geração anterior
+*e* posterior igualmente, nunca uma comparação de ordem (OpenAPI `ClaimResponse.generation`: "an
+exact-match authority token... never an ordering comparison").
 
-`MqttCredentialStore`, partição `easyled` existente (sem alterar o layout), namespace
-`easyled_mqtt` (≤15 caracteres — ver "Bugs corrigidos"). CRC32 + commit + readback em cada escrita,
-mesma disciplina de `pixels_durable_storage`. Estados: `Empty`, `CurrentConfirmed`,
-`PendingUnused`, `AttemptInFlight`, `AmbiguousActivation`, `BootstrapRecovery`,
-`ProvisioningFault`.
+Testes: geração correta aceita; geração 0 da resposta rejeitada (`Malformed`); geração anterior
+(`kGeneration - 1`) e posterior (`kGeneration + 1`) ambas rejeitadas (`IdentityMismatch`);
+`expected_generation == 0` do lado do chamador também rejeitado. `main.cpp` passa
+`config.generation` para `mqtt_coordinator_config.expected_generation`, e
+`mqttProvisioningProfileState()` exige `config.generation != 0` para considerar o perfil completo.
 
-Regras de recuperação implementadas e testadas (reboots simulados via `end()`+`init()`,
-corrupção via injeção direta de bytes na NVS):
+### 3. Armazenamento genuinamente atômico (registro A/B)
 
-- Nova credencial persistida (`PendingUnused`) antes de qualquer uso.
-- `beginAttempt()` marca `AttemptInFlight` **antes** de entregar a credencial ao transporte.
-- Reboot durante `AttemptInFlight` → `AmbiguousActivation` (nunca repetido do mesmo jeito, nunca
-  assumido como falha).
-- CONNECT aceito → promove a credencial em uso para `CurrentConfirmed`, remove a antiga.
-- Falha antes da autenticação (`reportPreAuthFailure`) não promove nada; nenhuma credencial é
-  tocada.
-- Ambíguo (`reportAmbiguous`) nunca apaga a credencial em voo; conta rodadas sem sucesso.
-- Corrupção (CRC/magic/schema inválidos) falha fechado — `ESP_ERR_INVALID_RESPONSE` — nunca
-  fabrica uma credencial.
-- `eraseAll()`: descarta ambas as credenciais e contadores, volta para `Empty`, **sem** fechar o
-  handle NVS nem derrubar o estado de inicialização da partição — ver "Bugs corrigidos" sobre por
-  que isso existe como método próprio em vez de reusar
-  `end()`+`nvs_flash_erase_partition()`+`init()`.
+O esquema anterior gravava `hdr`/`current`/`pending` como **três blobs separados** em três
+commits distintos — uma queda de energia entre eles podia deixar o registro misturado (ex.:
+`state` novo com credenciais antigas). Substituído por exatamente o que foi pedido: dois slots
+NVS autocontidos (`slotA`/`slotB`), cada um com schema, `sequence` (u32 monotônico), estado, flag
+de tentativa, contador de rodadas, a credencial `current` completa, a `pending` completa e um
+CRC32 sobre tudo — uma única `nvs_set_blob()` + `nvs_commit()` + readback por transição, sempre
+no slot que **não** está ativo. RAM só é atualizada depois dessa única escrita verificada; uma
+falha em qualquer ponto dela deixa RAM e o slot ativo exatamente como estavam — não há restauração
+porque nada foi mutado antecipadamente. No boot, os dois slots são validados de forma
+independente (magic/schema/CRC, depois invariantes estado↔credencial) e o válido com maior
+`sequence` vence; se só um é válido, esse vence incondicionalmente; se nenhum é, falha fechado.
+**Nenhum ponteiro de "slot ativo" separado existe** — isso recriaria a mesma janela não atômica um
+nível acima.
 
-## Seção 4 — Cliente HTTPS de bootstrap
+Formato novo (`kSchema = 2`); como o formato antigo nunca foi lançado, não há migração.
 
-`MqttBootstrapClient` (interface) + `EspMqttBootstrapClient` (produção). Base URL, hardware ID,
-bearer token, CA e timeout são todos injetados — nenhuma URL/token/certificado embutido no
-binário. HTTPS obrigatório, hostname/certificado verificados (bundle ESP-IDF por padrão),
-redirecionamento e downgrade recusados, limite explícito de corpo, resposta só é entregue ao
-parser após download completo. `Authorization` e corpo nunca logados.
+Invariantes verificadas ao carregar (violação é tratada como corrupção, igual a falha de CRC):
+`Empty` exige nem current nem pending válidos; `CurrentConfirmed` exige current válido e pending
+**inválido**; `PendingUnused` exige pending válido; `AttemptInFlight`/`AmbiguousActivation`
+exigem válido o lado que a flag de tentativa aponta; `BootstrapRecovery`/`ProvisioningFault` não
+têm exigência estrita.
 
-Política por status (`MqttCredentialCoordinator::doBootstrap()`):
+**Fault injection determinística** (`StoreTestFault`, método de teste
+`setFaultInjectionForTest()`, nunca chamado em produção): `BeforeWrite` (a escrita nunca é
+tentada), `DuringWrite` (como se `nvs_set_blob()` falhasse), `DuringCommit` (grava e comita
+*lixo* real no slot candidato em vez de pular o commit — ver nota abaixo), `DuringReadback`
+(escrita e commit reais bem-sucedidos, mas a comparação de readback é forçada a reportar
+divergência mesmo assim). Testado: as quatro falhas, reboot depois de cada uma, recuperação
+sempre pelo slot anterior (exceto `DuringReadback`, cujo dado novo realmente está durável — um
+reboot real recupera corretamente o slot *novo*, provando que a verificação conservadora não
+causa perda permanente); nunca `PendingUnused` sem pending válida; nunca `CurrentConfirmed` sem
+current válida (`beginAttempt()`+`confirmConnected()` sob falha de commit, RAM fica em
+`AttemptInFlight`, reboot reconcilia para `AmbiguousActivation`, nunca mostra `CurrentConfirmed`
+com dado obsoleto).
 
-| Status | Ação |
-|---|---|
-| 200 | valida completo, persiste antes de usar (`storePending`) |
-| 401 | `ProvisioningFault`, backoff, credenciais armazenadas preservadas |
-| 403 | `ProvisioningFault`, backoff, para até novo claim/rebind externo |
-| 429 | respeita `Retry-After` + jitter ±20% |
-| 500 | backoff progressivo, tenta de novo |
-| 503 | backoff no teto (15 min) |
-| timeout/reset/sem resposta | resposta pode ter se perdido; tenta de novo após backoff |
-| 404/405 | bug de firmware/config; backoff, nunca loop apertado |
+*Nota de implementação encontrada durante a validação*: simular "falha no commit" apenas
+pulando `nvs_commit()` depois de um `nvs_set_blob()` real não bastava — a NVS pode manter uma
+escrita não comitada visível a um fechar+reabrir de handle no mesmo processo (o `end()`+`init()`
+que estes testes usam para simular reboot), mesmo que uma queda de energia real a tivesse
+perdido. Corrigido escrevendo e comitando *lixo* de verdade no slot candidato nesse caso, para que
+ele seja inequivocamente inválido em qualquer `load()` subsequente, independente desse detalhe de
+visibilidade.
 
-## Seção 5 — Máquina de recuperação (coordenador)
+`eraseAll()` (já existente da rodada anterior) continua: descarta ambas as credenciais e
+contadores, volta para `Empty`, sem fechar o handle NVS nem tocar o estado de inicialização da
+partição.
 
-`MqttCredentialCoordinator::poll()` é puramente determinístico contra interfaces fake (store real,
-cliente/relógio fake) — testado em `validation_mqtt_credentials/`:
+### 4. Falhas duráveis propagadas
 
-1. Sem credencial usável → `doBootstrap()`.
-2. Resposta válida → persiste como `PendingUnused`.
-3. Antes de conectar → marca `AttemptInFlight` duravelmente.
-4. CONNECT aceito → promove a `CurrentConfirmed`.
-5. Resultado ambíguo → `AmbiguousActivation`.
-6. Em ambiguidade, a credencial nova é tentada primeiro a cada rodada
-   (`pending_tried_this_round_`, transiente, nunca persistido — seguro resetar num reboot real).
-7. A antiga só é tentada depois, como cortesia, e só uma vez por rodada.
-8. Após 3 rodadas (configurável) sem autenticação de nenhuma das duas → `BootstrapRecovery`.
-9. Nunca tight-loop: todo caminho sem sucesso agenda `scheduleNextAttempt()` antes de retornar
-   `Idle`.
-10. Backoff: início 5 s, dobra progressivamente, teto 15 min, jitter ±20%; `Retry-After`
-    prevalece quando recebido. Relógio monotônico injetado (`MonotonicClock`) — nunca depende de
-    NTP para corretude.
+`MqttCredentialStore::reportAmbiguous()` ganhou um parâmetro `completesRound` (ver item 6) mas
+seu retorno já era `esp_err_t`. A mudança real foi no **coordenador**: `reportConnected()`,
+`reportPreAuthFailure()` e `reportAmbiguous()` agora retornam `esp_err_t` (eram `void`,
+engolindo o resultado do store). Quando a gravação durável falha, o coordenador **não** avança
+`roundsWithoutSuccess`, **não** limpa `pending_tried_this_round_` e **não** assume nenhuma
+transição de estado — apenas agenda o próximo backoff (para nunca tight-loop) e retorna o erro.
+`enterBootstrapRecovery()`/`enterProvisioningFault()` (chamados internamente pelo coordenador)
+também têm seu retorno verificado onde chamados.
 
-## Seção 6 — Integração com `NetworkSession` (seam mínimo)
+Teste dedicado ("durable-failure propagation"): fault injection (`DuringCommit`) em
+`reportAmbiguous()` e em `reportConnected()`, confirmando que a primeira chamada falha e nada
+avança (`roundsWithoutSuccess` continua 0, estado continua `AttemptInFlight`), e que a chamada
+seguinte (falha automaticamente limpa) progride normalmente.
 
-Analisado o código real do ESP-MQTT (`managed_components/espressif__mqtt/include/mqtt_client.h`)
-antes de qualquer mudança. `esp_mqtt_error_type_t` distingue `MQTT_ERROR_TYPE_TCP_TRANSPORT`
-(aliased por `MQTT_ERROR_TYPE_ESP_TLS`) de todo o resto. Único ponto provável como falha
-pré-autenticação: a TCP/TLS handshake falhou antes de qualquer CONNECT chegar ao broker. Tudo o
-mais (CONNACK perdido, `CONNECTION_REFUSED` — que carrega um código de rejeição do próprio broker
-e pode seguir uma autenticação bem-sucedida —, desconexão posterior) permanece ambíguo por
-desenho.
+### 5. Classificação pré-autenticação removida (era falsa)
 
-**Mudança real, a menor possível**: um novo contador atômico
-`Status::pre_auth_transport_errors`, incrementado apenas dentro do `case MQTT_EVENT_ERROR:` já
-existente, apenas quando `error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT`. Nenhuma
-reescrita do `NetworkSession`; `transport_errors` (contador já existente) continua incrementando
-exatamente como antes — `pre_auth_transport_errors` é um subconjunto adicional, nunca substitui
-nada. Senha nunca exposta em status/eventos/logs (inalterado). Confirmado sem regressão: o runner
-congelado `validation/` permanece 468/468 ALL_PASS, DRAM estática idêntica (772 B livres, antes e
-depois).
+A leitura do `mqtt_client.c` vendorizado (`managed_components/espressif__mqtt/`) confirmou o
+achado do Codex: `esp_mqtt_client_dispatch_transport_error()` (que define
+`MQTT_ERROR_TYPE_TCP_TRANSPORT`) é chamada de dentro de `transport_read()`'s caminho de erro
+genérico, usado tanto durante o connect inicial quanto durante `mqtt_message_receive()` —
+exatamente o caminho que espera o CONNACK, **depois** do CONNECT já ter sido enviado. O tipo do
+erro, sozinho, não prova nada sobre a ordem relativa à autenticação.
 
-Não implementado nesta rodada, de propósito: a troca da identidade/credencial ao vivo do
-`NetworkSession` com base no coordenador (chamar `end()` antes de mudar credenciais, manter
-buffers referenciados vivos durante a sessão). Essa é exatamente a peça que depende de valores
-reais de `trust_ref`/endpoint/credencial para ser validada com segurança — ver "Pontos bloqueados
-pela plataforma".
+Removido inteiramente: o contador `pre_auth_transport_errors` e sua lógica em
+`NetworkSession::Status`/`network_session.cpp` (introduzidos na rodada anterior) foram revertidos
+— `network_session.hpp`/`.cpp` voltaram ao comportamento anterior a esta feature,
+`transport_errors` continua incrementando exatamente como sempre. O `case MQTT_EVENT_ERROR:` tem
+apenas um comentário novo explicando por quê nenhuma classificação adicional é segura.
 
-## Seção 7 — Integração em `main.cpp`
+Postura adotada daqui para frente: qualquer falha entre `beginAttempt()` e um `MQTT_EVENT_CONNECTED`
+real é ambígua, sem exceção. Isso é reforçado por **construção de tipo**, não só por lógica: o novo
+`MqttTransportSession::Outcome` (seção 7) tem exatamente três valores —
+`StillTrying`/`Connected`/`Ambiguous` — e **nenhum valor de "pré-auth comprovado"**, então nenhuma
+implementação desse seam (real ou fake) consegue reportar essa categoria mesmo que tentasse. O
+teste dedicado explícito (`MqttSessionController`, "o ponto de revisão explícito") simula um erro
+de transporte imediatamente depois de `restart()` — equivalente a um `TCP_TRANSPORT` recebido
+esperando CONNACK — e confirma que o resultado é sempre `AmbiguousActivation`, nunca outra coisa.
+`MqttCredentialStore::reportPreAuthFailure()` continua existindo na API (para uma futura evidência
+genuinamente inequívoca, se um dia existir) mas **nada nesta base de código a chama hoje**.
 
-Modo laboratório atual **preservado exatamente**: com `mqtt_provisioning_enabled == false` (padrão,
-e todo perfil até a plataforma entregar valores reais), `network.username`/`password`/
-`broker_uri` continuam alimentando a conexão literalmente, igual a antes desta feature existir —
-nenhum endpoint de bootstrap é contatado.
+### 6. Definição de rodada corrigida
 
-Com `mqtt_provisioning_enabled == true`:
+Uma rodada é "pending primeiro, current como cortesia depois", **quando `current` existe**.
+`roundsWithoutSuccess` só avança quando a rodada inteira termina: se há `current` para tentar como
+cortesia, a tentativa contra `pending` **não** completa a rodada (só marca
+`pending_tried_this_round_`); a tentativa de cortesia contra `current` sempre completa. Sem
+`current`, uma única tentativa ambígua contra `pending` já completa a rodada. `BootstrapRecovery`
+só é solicitado depois de 3 rodadas **completas**, nunca 3 tentativas individuais (com `current`
+presente, isso são 6 tentativas; sem `current`, são 3).
 
-- **Perfil incompleto** (falta `mqtt_bootstrap_base_url`/`mqtt_bootstrap_token`/`mqtt_trust_ref`/
-  `mqtt_trust_ca_pem`): recusa iniciar rede inteiramente — nunca cai silenciosamente para as
-  credenciais de laboratório que `network.*` também possa conter. Espelha exatamente o tratamento
-  já existente de `HttpsProfileState::Incomplete`.
-- **Perfil completo**: constrói `MqttCredentialStore`/`EspMqttBootstrapClient`/
-  `TableTrustResolver`/`EspMonotonicClock`/`MqttCredentialCoordinator` de produção, chama
-  `store.init()`. Se falhar, loga e o provisionamento fica ocioso nesse boot (laboratório
-  inalterado). Se OK, `mqtt_coordinator.poll()` é chamado a cada iteração do loop principal,
-  mantendo o bootstrap/backoff vivo e observável via log — **mas sem ainda dirigir a sessão MQTT
-  real** (ver Seção 6). `session.init(config.network)` continua usando os campos estáticos de
-  `config.network`, sem mudança.
+Implementado via `MqttCredentialStore::reportAmbiguous(bool completesRound)` — o store só grava o
+que o coordenador decide atomicamente junto da transição; `MqttCredentialCoordinator::reportAmbiguous()`
+calcula `completesRound = !was_pending || !store_.hasCurrent()`.
 
-Como nenhum perfil real existe hoje (`network_credentials.hpp` é gitignored e nunca foi
-commitado), `mqtt_provisioning_enabled` é `false` em todo boot real até agora — o código novo
-nunca executa fora do target de validação.
+Dois testes dedicados: (a) com `current` presente (herdado da seção "cortesia" já existente),
+cada rodada agora exige 2 tentativas, confirmado round a round; (b) novo, "somente pending" (sem
+`current` nunca promovido), cada rodada é 1 tentativa só, confirmado round a round até
+`BootstrapRecovery` em exatamente 3 tentativas.
 
-## Seção 8 — Novo target de validação
+### 7. Controlador de sessão: construído e testado, não ligado à sessão real
 
-`validation_mqtt_credentials/` (target `easyled_mqtt_credentials_validation`), isolado do runner
-congelado `validation/` — nenhuma linha daquele arquivo foi tocada, nenhum fixture novo foi
-adicionado lá. HTTP e MQTT inteiramente fake; nenhum broker ou endpoint real.
+Implementado exatamente como preferido: `MqttTransportSession` (interface mínima —
+`restart(identity)`/`end()`/`poll() -> Outcome`, sem valor de pré-auth, ver item 5) +
+`MqttSessionController` (consome `CoordinatorAction`, chama `beginAttempt()` duravelmente *antes*
+de tocar o transporte, resolve `trust_ref` para a CA, monta `MqttSessionIdentity` a partir da
+`StoredCredential`, chama `restart()`, amostra `poll()` e reporta `Connected`/`Ambiguous` de volta
+ao coordenador de forma conservadora — nunca assume sucesso de uma chamada que falhou). Testado
+de ponta a ponta contra um `FakeTransportSession` (nunca uma sessão real): credencial escolhida
+corresponde à decisão do coordenador, rotação troca a identidade corretamente, ambiguidade não
+descarta a credencial nova, "nova primeiro, antiga só como cortesia" confirmado através do
+controlador, e falha de `restart()` em si é reportada como ambígua (nunca uma categoria especial).
 
-**127/127 checks, ALL_PASS**, confirmado em 4 execuções QEMU consecutivas sem falha (ver
-"Memória e desempenho"). Cobertura: fixture exato + SHA-256; parser caminho feliz; `expires_at`
-com 0, 1 e 6 dígitos fracionários; timestamps inválidos; campos ausentes/duplicados/tipo errado;
-senha 128 aceita / 129 rejeitada; `broker_uri` não-WSS rejeitado antes de persistir;
-`verify_server:false` rejeitado; `trust_ref` desconhecido rejeitado; username/client_id
-divergente rejeitado; tópicos com wildcard rejeitados; persist-before-use; reboot em cada
-transição, incluindo durante `AttemptInFlight`; CONNACK perdido; autenticação aceita mas
-confirmação local perdida; credencial nova tentada primeiro, antiga só como cortesia; três
-rodadas → `BootstrapRecovery`; 401/403/429/500/503/404/405; timeout/resposta perdida;
-`Retry-After`; corrupção NVS; nenhum segredo em logs/status; renderização independente do
-coordenador em backoff (não exercida ativamente por não haver pixels neste target, mas garantida
-por desenho — este componente nunca toca pixels/Composer).
+**Decisão explícita de não ligar ao `main.cpp` real nesta rodada**, pela razão técnica concreta
+encontrada ao reanalisar `NetworkSession::init()` (`components/pixels_network/network_session.cpp`):
+ele valida `broker_uri`/`client_id`/`username`/`password`/`command_topic` e cria o cliente
+ESP-MQTT **imediatamente**, antes de `start()` subir o Wi-Fi — não há como chamar `init()` só com
+Wi-Fi e "decidir a credencial MQTT depois", e não há como pedir um bootstrap HTTPS sem
+conectividade já estabelecida. Resolver essa ordenação exigiria ou (a) uma reescrita não-trivial
+de `NetworkSession` para separar Wi-Fi de identidade MQTT (explicitamente fora de escopo: a seção
+6 original já proibia "grande reescrita, apenas o menor seam necessário"), ou (b) um caminho de
+Wi-Fi-somente paralelo só para o bootstrap inicial (plumbing novo, não solicitado e arriscado de
+construir sem endpoint real para validar contra). Com o fallback explícito já previsto pela
+tarefa ("se concluir essa integração sem endpoint real não for possível... mantenha o componente
+offline"), a escolha foi: não chamar `poll()`/`tick()` no `main.cpp` do produto, não emitir
+nenhuma credencial real. `main.cpp` ainda constrói `MqttCredentialStore`/`MqttCredentialCoordinator`
+de produção e chama `store.init()` contra a partição real (prova que a camada durável funciona),
+mas nunca avança daí. O `MqttSessionController`/`FakeTransportSession` em si não dependem de
+`pixels_network` — o adaptador concreto sobre `NetworkSession` real é o próximo passo, depois que
+a questão de ordenação Wi-Fi/identidade for resolvida e os valores reais existirem.
 
-## Bugs corrigidos durante a validação
+Modo laboratório **inalterado**: com `mqtt_provisioning_enabled == false` (padrão e único valor em
+qualquer perfil real hoje, já que `network_credentials.hpp` nunca foi commitado),
+`network.username`/`password`/`broker_uri` continuam alimentando a conexão literalmente. Perfil
+incompleto (`mqtt_provisioning_enabled == true` mas faltando `mqtt_hardware_id` válido,
+`mqtt_bootstrap_base_url`, `mqtt_bootstrap_token`, `mqtt_trust_ref`, `mqtt_trust_ca_pem` ou
+`generation == 0`) recusa iniciar rede inteiramente, nunca cai para as credenciais de laboratório.
 
-Encontrados e corrigidos nesta mesma rodada, todos confirmados via re-execução QEMU após cada
-correção:
+### 8. `run_qemu.py` corrigido
 
-1. **Stack overflow → corrupção de heap**: `CONFIG_ESP_MAIN_TASK_STACK_SIZE` padrão (8192) não
-   bastava para a recursão do cJSON somada ao frame grande de `app_main`. Diagnosticado via
-   `addr2line` no backtrace do panic (`LoadProhibited` dentro do alocador) comparado ao endereço
-   base do heap do boot log. Corrigido para 24576 em `sdkconfig.defaults`.
-2. **Parser rejeitando o próprio fixture real**: o fixture é o primeiro pretty-printed do
-   repositório, terminando em `}\n`; a checagem pós-parse original exigia `end == json + size`
-   exato, que não tolera a nova linha final do cJSON. Corrigido com um helper
-   `onlyTrailingWhitespace()`.
-3. **CRC computado mas nunca verificado**: um aviso do compilador revelou que `crc32()` era
-   calculado mas nunca consultado. Adicionado `crc` ao final de `WireHeader`/`WireCredential`,
-   selado antes de escrever e verificado antes de aceitar no `load()`.
-4. **`ConnectWithCurrentCourtesy` inalcançável**: `credentialToTry()` só sabia responder para
-   `AttemptInFlight`; chamado entre `poll()` retornar a ação e `beginAttempt()` ainda não ter sido
-   chamado, caía sempre em `pending()`. Corrigido replicando a mesma lógica de decisão do
-   `poll()` para o estado "ainda não comprometido".
-5. **Namespace NVS com 16 caracteres**: `"easyled_mqttcred"` excede
-   `NVS_KEY_NAME_MAX_SIZE-1` (15). Retornava `ESP_ERR_NVS_KEY_TOO_LONG`, mascarado por outro erro
-   anterior (ver próximo item) até este ser corrigido primeiro. Renomeado para
-   `"easyled_mqtt"` (12 caracteres).
-6. **`nvs_flash_init_partition("easyled")` nunca chamado**: nenhum lugar do código inicializava a
-   partição antes de abri-la — `nvs_open_from_partition()` retornava
-   `ESP_ERR_NVS_NOT_INITIALIZED`. Corrigido chamando `nvs_flash_init_partition()` dentro do próprio
-   `MqttCredentialStore::init()`, mesmo padrão já usado por `pixels_durable_storage`.
-7. **Handle NVS aberto sobrevivendo a um `nvs_flash_erase_partition()`**: uma seção de teste
-   erasava a partição sem jamais ter chamado `store.end()` antes, apagando a partição sob um
-   handle ainda aberto — causa raiz de um crash intermitente por divisão por zero (`EXCCAUSE=0x6`)
-   dentro do próprio scanner de páginas da NVS (`nvs::PageManager::load`), resolvido via
-   `addr2line`. Corrigido adicionando o `end()` ausente.
-8. **Ciclo `end()`+`nvs_flash_erase_partition()`+`init()` repetido demais em sequência**: mesmo
-   com o handle corretamente fechado, repetir esse ciclo caro (reinicialização completa do driver
-   NVS da partição) 6 vezes em sequência dentro de um único boot QEMU continuava instável sob
-   timing. Resolvido criando `MqttCredentialStore::eraseAll()` — reseta os próprios registros no
-   lugar, sem nunca tocar o estado de inicialização da partição — reservando o ciclo caro
-   exclusivamente para os testes que de fato simulam um reboot real.
+O regex de sucesso herdado do `validation/` original procurava
+`NETWORK(?:_CONTRACT)?_VALIDATION` — nunca batia com o marcador real deste target,
+`MQTT_CREDENTIALS_VALIDATION`. Na prática, isso significava que `main()` sempre retornava 1,
+mesmo num `ALL_PASS` genuíno (eu estava lendo o transcript manualmente, nunca confiando no
+exit code). Corrigido para `r"MQTT_CREDENTIALS_VALIDATION checks=\d+ failures=0 RESULT=ALL_PASS"`;
+o padrão de falha (`Guru Meditation|assert failed|FAILED check|RESULT=FAIL|task_wdt`) já estava
+correto e não precisou mudar. Confirmado nesta rodada: 3 execuções consecutivas, todas com
+`run_qemu.py` retornando exit code 0.
 
-Todos os 8 itens foram bugs reais de implementação (parser, store, coordenador ou do próprio
-teste), nunca do contrato ou do fixture upstream.
+## Bug adicional encontrado e corrigido durante a validação desta rodada
+
+**Corrupção da seção "corrupção falha fechado" se propagando para as seções seguintes**: o teste
+que prova que o store falha fechado contra corrupção grava lixo nos dois slots de propósito (isso
+é o teste) e nunca limpa depois — correto para o que aquele teste prova, mas deixava a partição
+permanentemente inutilizável para todas as seções seguintes dentro da mesma execução, causando
+uma cascata de falhas e eventualmente um crash (`Guru Meditation: LoadProhibited`) numa seção bem
+mais adiante. Diagnosticado por eliminação sistemática: tentei primeiro aumentar o stack
+(hipótese errada, descartada por teste direto), depois instrumentação passo a passo isolando
+`parse`/`trust.resolve()`/`storePending()` individualmente (todos corretos), até capturar o
+retorno real de `store.init()` (`ESP_ERR_INVALID_RESPONSE`) e, por fim, imprimir diretamente de
+dentro de `load()` qual verificação rejeitava cada slot — revelando os 4 bytes de lixo do teste de
+corrupção anterior em ambos. Corrigido adicionando um `nvs_flash_erase_partition("easyled")` real
+imediatamente depois daquele teste (o único lugar nesta rodada onde o ciclo caro de
+erase+reinit de partição ainda é necessário, já que não existe um store inicializado ali para usar
+`eraseAll()`). Toda a instrumentação de depuração foi removida depois de confirmado o fix.
 
 ## Memória e desempenho
 
-| | `validation/` (congelado) | `validation_mqtt_credentials/` (novo) | Produto |
+| | `validation/` (congelado) | `validation_mqtt_credentials/` | Produto |
 |---|---|---|---|
-| Checks QEMU | 468/468 ALL_PASS (inalterado) | 127/127 ALL_PASS | n/a |
-| DRAM estática | 179964 B (99,57%, **772 B livres**, inalterado) | 39836 B (22,04%, 140900 B livres) | 81063 B (44,85%, antes 73439 B/40,63%) |
-| IRAM estática | 48047 B (36,66%, inalterado) | 46163 B (35,22%) | 90555 B (69,09%, inalterado) |
-| Flash code+data | inalterado | 147278 B | 997574 B (código+dados atuais; não medi o valor "antes" desta rodada para flash, só DRAM/IRAM) |
+| Checks QEMU | 468/468 ALL_PASS (inalterado) | 258/258 ALL_PASS | n/a |
+| Exit code `run_qemu.py` | 0 (inalterado) | 0 (corrigido nesta rodada — antes sempre 1, item 8) | n/a |
+| DRAM estática | 179964 B (99,57%, **772 B livres**, inalterado) | 82164 B (45,46%, 98572 B livres) | 82111 B (45,43%, antes 81063 B/44,85%) |
+| IRAM estática | 48047 B (36,66%, inalterado) | 46163 B (35,22%, inalterado) | 90555 B (69,09%, inalterado) |
+| Flash code | inalterado | 108430 B | 772014 B |
+| Flash data | inalterado | 44816 B | 220600 B |
 
-O aumento de DRAM do produto (+7624 B, de 73439 B/40,63% medido na rodada P1 anterior) vem dos
-novos objetos estáticos em `app_main()`
-(`MqttCredentialStore` com seu `record_[2048]` de scratch, `MqttCredentialCoordinator` com seu
-`response_buffer_[2048]`) — construídos sempre, mesmo em modo laboratório, porque `main.cpp` os
-declara incondicionalmente (só o `store.init()` é condicional ao perfil). Headroom do produto
-permanece confortável (99673 B livres). O runner congelado não tem margem nenhuma para crescer
-(772 B) e não foi tocado.
-
-A suíte nova do `validation_mqtt_credentials/` demandou, em uma execução QEMU completa e correta,
-algo entre 90 s e 300 s de tempo real de parede (não apenas tempo simulado) — significativamente
-mais que os runners anteriores deste repositório. Isso não é uma regressão desta feature por si
-só, mas uma característica do volume de operações NVS reais (cada transição de estado grava 3
-blobs com CRC + commit + readback) somado à emulação fiel de timing de flash do QEMU; runners
-futuros com este mesmo padrão de uso intensivo de NVS devem esperar o mesmo. Nenhuma correção foi
-tentada para isso além de reduzir ciclos de erase+reinit redundantes (item 8 acima).
+`CONFIG_ESP_MAIN_TASK_STACK_SIZE` do novo target foi elevado de 24576 para 40960 — a suíte de
+testes cresceu substancialmente (registro A/B maior que o esquema de 3 blobs anterior, mais
+seções) e a margem extra é barata dado o headroom confortável de DRAM (45%). O aumento de stack
+*não* era a causa do bug real encontrado nesta rodada (confirmado por teste direto antes de
+localizar a causa raiz verdadeira), mas foi mantido como margem de segurança razoável.
 
 ## Pontos ainda bloqueados pela plataforma
 
-Registrados para resposta à equipe de plataforma; até essas respostas chegarem, a implementação
-permanece injetável, testável e fail-closed:
+Inalterados desta rodada; até essas respostas chegarem, a implementação permanece injetável,
+testável e fail-closed:
 
 1. Valores reais de `trust_ref` e respectivas CAs por ambiente.
 2. Base URL do endpoint de bootstrap implantado.
@@ -301,18 +308,19 @@ permanece injetável, testável e fail-closed:
 4. Limite de taxa por ambiente (embora `Retry-After` já seja suficiente do lado do firmware).
 5. Confirmação/merge definitivo do contrato #47-B.
 
-Consequência direta no firmware: a troca da identidade MQTT ao vivo do `NetworkSession` com base
-no coordenador (Seção 6/7) permanece pronta em código mas não fiada ao caminho real — não há como
-validar esse último passo com segurança sem pelo menos um valor real de cada um dos itens acima.
+Consequência direta no firmware: além dos itens acima, a ligação do `MqttSessionController` a um
+`NetworkSession` real também depende de resolver a ordenação Wi-Fi-antes-de-identidade-MQTT
+descrita na Seção 7 — uma decisão de design de `NetworkSession`, não deste ciclo de vida de
+credencial, e que não há como validar com segurança sem pelo menos um endpoint real para testar
+contra de qualquer forma.
 
-## Confirmação de ausência de segredos
+## Confirmação de ausência de segredos, push, merge, deploy e flash
 
 Nenhuma URL, bearer token, credencial MQTT ou material de CA real foi adicionado em nenhum commit
-desta rodada. Toda senha/token/CA no novo target de validação é explicitamente sintética
-(`SYNTHETIC-NOT-A-CREDENTIAL-...`, `bootstrap-test-token`, `-----BEGIN CERTIFICATE-----
-\nSYNTHETIC-TEST-ONLY...`) e vive exclusivamente em `validation_mqtt_credentials/`. O diff dos
-arquivos de produção (`main/main.cpp`, `components/pixels_network/*`) só referencia *nomes* de
-campo (`mqtt_bootstrap_token`, por exemplo) — todos inicializados em `nullptr`, nunca atribuídos a
-um valor literal. `git diff --check` limpo (sem erro de whitespace). Diretórios `build*/` e
-`sdkconfig` gerados ficaram de fora do commit (gitignore do novo target corrigido para seguir o
-mesmo padrão já usado por `validation/`).
+desta rodada. Todo material de teste novo (fault injection, `hardware_id` sintético,
+`MqttSessionController`/`FakeTransportSession`) usa os mesmos valores sintéticos já estabelecidos
+(`kHardwareId = "a1b2c3d4e5f6"`, `kTrustRef`/`kCaPem` sintéticos, senhas prefixadas
+`SYNTHETIC-`/`ab-`/`durable-fail-`/`rotated-secret-`). `git diff --check` limpo. Nenhum push,
+merge, PR, flash, acesso a broker real ou a `easyled-platform` foi realizado — todo trabalho
+permanece local nesta worktree, branch `feat/mqtt-credential-lifecycle-47b`, acrescentando commits
+corretivos aos três já existentes (`c60b26d`/`202a047`/`728009c`).

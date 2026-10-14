@@ -1,4 +1,4 @@
-"""Run the small message-assembly target in QEMU, never opening a serial port."""
+"""Run the #47-B MQTT credential lifecycle validation target in QEMU, never opening a serial port."""
 import argparse
 import json
 from pathlib import Path
@@ -36,7 +36,7 @@ def main():
     transcript = output.decode("utf-8", errors="replace")
     (build / "qemu-validation.log").write_text(transcript, encoding="utf-8")
     print(transcript[-2000:])
-    success = re.search(r"NETWORK(?:_CONTRACT)?_VALIDATION checks=\d+ failures=0 RESULT=ALL_PASS",
+    success = re.search(r"MQTT_CREDENTIALS_VALIDATION checks=\d+ failures=0 RESULT=ALL_PASS",
                         transcript)
     fault = re.search(
         r"Guru Meditation|assert failed|FAILED check|RESULT=FAIL|task_wdt: Task watchdog",
