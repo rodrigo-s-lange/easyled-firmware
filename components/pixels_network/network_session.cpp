@@ -213,7 +213,7 @@ NetworkSession::Status NetworkSession::status() const
 {
     return {running_.load(), esp32libfun::wifi.isConnected(), subscribed_.load(),
             connections_.load(), rejected_.load(), overflow_.load(), errors_.load(),
-            acknowledged_.load(), pre_auth_transport_errors_.load()};
+            acknowledged_.load()};
 }
 
 void NetworkSession::onEvent(void *arg, esp_event_base_t, int32_t id, void *data)
@@ -263,16 +263,13 @@ void NetworkSession::event(int32_t id, esp_mqtt_event_t &event)
         break;
     case MQTT_EVENT_ERROR:
         ++errors_;
-        // TCP_TRANSPORT (aliased as ESP_TLS) is the only ESP-MQTT error type
-        // that proves the failure happened before authentication could ever
-        // be attempted; every other case (including CONNECTION_REFUSED,
-        // which carries a broker-level reject code that may itself follow a
-        // successful authentication) stays ambiguous by design -- see
-        // docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md.
-        if (event.error_handle != nullptr &&
-            event.error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-            ++pre_auth_transport_errors_;
-        }
+        // No ESP-MQTT error_type proves a failure happened strictly before
+        // authentication: mqtt_message_receive() (the CONNACK-wait path, run
+        // only after CONNECT has already been sent) dispatches the exact
+        // same MQTT_ERROR_TYPE_TCP_TRANSPORT on a read/write failure as the
+        // pre-CONNECT transport-connect path does. A credential-lifecycle
+        // caller must therefore treat every MQTT_EVENT_ERROR here as
+        // ambiguous -- see docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md, "Seção 5".
         break;
     case MQTT_EVENT_PUBLISHED:
     {

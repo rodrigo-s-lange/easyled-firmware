@@ -134,9 +134,21 @@ uint32_t crc32(const uint8_t *bytes, size_t size)
 
 } // namespace
 
+bool isValidHardwareId(const char *value)
+{
+    if (value == nullptr) { return false; }
+    const size_t len = std::strlen(value);
+    if (len == 0 || len > kMaxHardwareIdBytes) { return false; }
+    for (size_t i = 0; i < len; ++i) {
+        const char c = value[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { return false; }
+    }
+    return true;
+}
+
 esp_err_t parseDeviceCredentialResponse(const char *json, size_t size, const char *expected_device_id,
-                                        const char *expected_hardware_binding_id, DeviceCredentialResponse &out,
-                                        ParseError &error)
+                                        const char *expected_hardware_binding_id, uint32_t expected_generation,
+                                        DeviceCredentialResponse &out, ParseError &error)
 {
     out = DeviceCredentialResponse{};
     error = ParseError::Malformed;
@@ -168,8 +180,17 @@ esp_err_t parseDeviceCredentialResponse(const char *json, size_t size, const cha
     if (!ok) { cJSON_Delete(root); return ESP_ERR_INVALID_ARG; }
     generation = static_cast<uint32_t>(generation_item->valuedouble);
 
+    // Identity AND authority: device_id/hardware_binding_id prove this
+    // response is about this device's current binding; generation is an
+    // exact-match authority token on top of that (OpenAPI ClaimResponse:
+    // "never an ordering comparison") -- a response for any generation
+    // other than the caller's own current one is rejected the same way,
+    // whether it looks older or newer. Checked before trust_ref is ever
+    // resolved (that happens only after this parser returns ESP_OK) and
+    // before anything is persisted or connected with.
     if (std::strcmp(device_id, expected_device_id) != 0 ||
-        std::strcmp(hardware_binding_id, expected_hardware_binding_id) != 0) {
+        std::strcmp(hardware_binding_id, expected_hardware_binding_id) != 0 ||
+        expected_generation == 0 || generation != expected_generation) {
         cJSON_Delete(root);
         error = ParseError::IdentityMismatch;
         return ESP_ERR_INVALID_ARG;
@@ -319,7 +340,7 @@ esp_err_t EspMqttBootstrapClient::requestCredential(const BootstrapRequest &requ
 {
     result = BootstrapResult{};
     if (request.base_url == nullptr || std::strncmp(request.base_url, "https://", 8) != 0 ||
-        request.hardware_id == nullptr || !uuid(request.hardware_id) ||
+        !isValidHardwareId(request.hardware_id) ||
         request.bootstrap_token == nullptr || request.bootstrap_token[0] == '\0' ||
         request.timeout_ms == 0 || request.destination == nullptr || request.capacity == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -372,29 +393,27 @@ esp_err_t EspMqttBootstrapClient::requestCredential(const BootstrapRequest &requ
 }
 
 // --- Durable credential store -------------------------------------------------
+//
+// Atomicity model: two self-contained A/B slots ("slotA"/"slotB"), each one
+// complete record (schema + sequence + state + attempt flag + round counter
+// + both full credentials + CRC). Every transition writes ONE candidate
+// slot -- always the one not currently active -- with a single
+// nvs_set_blob() + nvs_commit() + readback, and only mirrors the new values
+// into RAM once that single write is itself verified. On load, both slots
+// are validated independently and the valid one with the higher sequence
+// number wins (ties cannot happen: sequence always increases by exactly one
+// per successful write). There is deliberately no separate "which slot is
+// active" pointer key -- writing that *after* the slot would just recreate
+// a second, smaller non-atomic window one level up.
 
 namespace {
 constexpr const char *kNamespace = "easyled_mqtt"; // <=15 chars: NVS_KEY_NAME_MAX_SIZE-1
-constexpr const char *kHeaderKey = "hdr";
-constexpr const char *kCurrentKey = "current";
-constexpr const char *kPendingKey = "pending";
-constexpr uint32_t kHeaderMagic = 0x43524448; // "HDRC" little-endian
-constexpr uint32_t kCredentialMagic = 0x44524543; // "CERD" little-endian
-constexpr uint8_t kSchema = 1;
+constexpr const char *kSlotKeys[2] = {"slotA", "slotB"};
+constexpr uint32_t kSlotMagic = 0x4d51534cu; // "MQSL"-ish, arbitrary distinct value
+constexpr uint8_t kSchema = 2; // format not yet released; no migration from schema 1 needed
 
 #pragma pack(push, 1)
-struct WireHeader {
-    uint32_t magic;
-    uint8_t schema;
-    uint8_t state;
-    uint8_t attempt_uses_pending;
-    uint8_t reserved;
-    uint32_t rounds_without_success;
-    uint32_t crc; // over every byte above, computed last
-};
 struct WireCredential {
-    uint32_t magic;
-    uint8_t schema;
     uint8_t valid;
     char credential_id[kUuidBytes + 1];
     char hardware_binding_id[kUuidBytes + 1];
@@ -409,6 +428,17 @@ struct WireCredential {
     char topic_telemetry[kMaxTopicBytes + 1];
     char topic_cmd[kMaxTopicBytes + 1];
     char expires_at[kMaxExpiresAtBytes + 1];
+};
+struct WireSlot {
+    uint32_t magic;
+    uint8_t schema;
+    uint8_t state;
+    uint8_t attempt_uses_pending;
+    uint8_t reserved;
+    uint32_t sequence;
+    uint32_t rounds_without_success;
+    WireCredential current;
+    WireCredential pending;
     uint32_t crc; // over every byte above, computed last
 };
 #pragma pack(pop)
@@ -429,8 +459,6 @@ bool crcValid(const Wire &wire)
 void credentialToWire(const StoredCredential &in, WireCredential &wire)
 {
     wire = WireCredential{};
-    wire.magic = kCredentialMagic;
-    wire.schema = kSchema;
     wire.valid = in.valid ? 1 : 0;
     std::memcpy(wire.credential_id, in.credential_id, sizeof(wire.credential_id));
     std::memcpy(wire.hardware_binding_id, in.hardware_binding_id, sizeof(wire.hardware_binding_id));
@@ -466,22 +494,28 @@ void wireToCredential(const WireCredential &wire, StoredCredential &out)
     std::memcpy(out.expires_at, wire.expires_at, sizeof(out.expires_at));
 }
 
-// Writes `bytes`, commits, and reads it back byte-for-byte before trusting
-// the write succeeded -- the same discipline as pixels_durable_storage,
-// beyond whatever integrity check NVS already does internally.
-esp_err_t writeBlobVerified(nvs_handle_t handle, const char *key, const void *bytes, size_t size, uint8_t *scratch,
-                           size_t scratch_capacity)
+// Whether a (state, attempt_uses_pending, current, pending) tuple is
+// internally consistent -- catches a structurally valid (CRC-correct) slot
+// that nonetheless claims an impossible combination, which is treated the
+// same as CRC corruption: this slot is unusable, fall back to the other one.
+bool invariantsOk(CredentialState state, bool attempt_uses_pending, const StoredCredential &current,
+                  const StoredCredential &pending)
 {
-    if (size > scratch_capacity) { return ESP_ERR_INVALID_SIZE; }
-    esp_err_t err = nvs_set_blob(handle, key, bytes, size);
-    if (err != ESP_OK) { return err; }
-    err = nvs_commit(handle);
-    if (err != ESP_OK) { return err; }
-    size_t verify_size = scratch_capacity;
-    err = nvs_get_blob(handle, key, scratch, &verify_size);
-    if (err != ESP_OK) { return err; }
-    if (verify_size != size || std::memcmp(scratch, bytes, size) != 0) { return ESP_ERR_INVALID_RESPONSE; }
-    return ESP_OK;
+    switch (state) {
+    case CredentialState::Empty:
+        return !current.valid && !pending.valid;
+    case CredentialState::CurrentConfirmed:
+        return current.valid && !pending.valid;
+    case CredentialState::PendingUnused:
+        return pending.valid;
+    case CredentialState::AttemptInFlight:
+    case CredentialState::AmbiguousActivation:
+        return attempt_uses_pending ? pending.valid : current.valid;
+    case CredentialState::BootstrapRecovery:
+    case CredentialState::ProvisioningFault:
+        return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -493,54 +527,54 @@ MqttCredentialStore::~MqttCredentialStore()
 
 esp_err_t MqttCredentialStore::load()
 {
-    WireHeader header{};
-    size_t header_size = sizeof(header);
-    esp_err_t err = nvs_get_blob(handle_, kHeaderKey, &header, &header_size);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
+    WireSlot slots[2]{};
+    bool present[2] = {false, false};
+    bool valid[2] = {false, false};
+
+    for (int i = 0; i < 2; ++i) {
+        size_t slot_size = sizeof(slots[i]);
+        const esp_err_t err = nvs_get_blob(handle_, kSlotKeys[i], &slots[i], &slot_size);
+        if (err == ESP_ERR_NVS_NOT_FOUND) { continue; }
+        present[i] = true;
+        if (err != ESP_OK) { continue; } // unusable (e.g. wrong stored size): same as corrupt
+        if (slot_size != sizeof(slots[i]) || slots[i].magic != kSlotMagic || slots[i].schema != kSchema ||
+            slots[i].state > static_cast<uint8_t>(CredentialState::ProvisioningFault) || !crcValid(slots[i])) {
+            continue;
+        }
+        StoredCredential probe_current{}, probe_pending{};
+        wireToCredential(slots[i].current, probe_current);
+        wireToCredential(slots[i].pending, probe_pending);
+        if (!invariantsOk(static_cast<CredentialState>(slots[i].state), slots[i].attempt_uses_pending != 0,
+                          probe_current, probe_pending)) {
+            continue;
+        }
+        valid[i] = true;
+    }
+
+    if (!valid[0] && !valid[1]) {
+        // A key that exists but never validated is corruption, not a fresh
+        // store: fail closed rather than silently falling back to Empty.
+        if (present[0] || present[1]) { return ESP_ERR_INVALID_RESPONSE; }
         state_ = CredentialState::Empty;
         current_ = StoredCredential{};
         pending_ = StoredCredential{};
         attempt_uses_pending_ = true;
         rounds_without_success_ = 0;
+        active_slot_ = -1;
+        next_sequence_ = 1;
         return ESP_OK;
     }
-    if (err != ESP_OK) { return err; }
-    if (header_size != sizeof(header) || header.magic != kHeaderMagic || header.schema != kSchema ||
-        header.state > static_cast<uint8_t>(CredentialState::ProvisioningFault) || !crcValid(header)) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    state_ = static_cast<CredentialState>(header.state);
-    attempt_uses_pending_ = header.attempt_uses_pending != 0;
-    rounds_without_success_ = header.rounds_without_success;
 
-    WireCredential wire{};
-    size_t wire_size = sizeof(wire);
-    err = nvs_get_blob(handle_, kCurrentKey, &wire, &wire_size);
-    if (err == ESP_OK) {
-        if (wire_size != sizeof(wire) || wire.magic != kCredentialMagic || wire.schema != kSchema ||
-            !crcValid(wire)) {
-            return ESP_ERR_INVALID_RESPONSE;
-        }
-        wireToCredential(wire, current_);
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        current_ = StoredCredential{};
-    } else {
-        return err;
-    }
-
-    wire_size = sizeof(wire);
-    err = nvs_get_blob(handle_, kPendingKey, &wire, &wire_size);
-    if (err == ESP_OK) {
-        if (wire_size != sizeof(wire) || wire.magic != kCredentialMagic || wire.schema != kSchema ||
-            !crcValid(wire)) {
-            return ESP_ERR_INVALID_RESPONSE;
-        }
-        wireToCredential(wire, pending_);
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        pending_ = StoredCredential{};
-    } else {
-        return err;
-    }
+    const int winner = (valid[0] && valid[1]) ? (slots[0].sequence >= slots[1].sequence ? 0 : 1)
+                                               : (valid[0] ? 0 : 1);
+    const WireSlot &slot = slots[winner];
+    state_ = static_cast<CredentialState>(slot.state);
+    attempt_uses_pending_ = slot.attempt_uses_pending != 0;
+    rounds_without_success_ = slot.rounds_without_success;
+    wireToCredential(slot.current, current_);
+    wireToCredential(slot.pending, pending_);
+    active_slot_ = winner;
+    next_sequence_ = slot.sequence + 1;
 
     // A reboot found mid-attempt cannot know whether the broker saw it
     // before power was lost -- the only safe reading is "ambiguous", never
@@ -549,27 +583,76 @@ esp_err_t MqttCredentialStore::load()
     return ESP_OK;
 }
 
-esp_err_t MqttCredentialStore::commitAndVerify()
+esp_err_t MqttCredentialStore::commitTransition(CredentialState new_state, bool new_attempt_uses_pending,
+                                                uint32_t new_rounds, const StoredCredential &new_current,
+                                                const StoredCredential &new_pending)
 {
-    WireHeader header{};
-    header.magic = kHeaderMagic;
-    header.schema = kSchema;
-    header.state = static_cast<uint8_t>(state_);
-    header.attempt_uses_pending = attempt_uses_pending_ ? 1 : 0;
-    header.rounds_without_success = rounds_without_success_;
-    sealWithCrc(header);
-    esp_err_t err = writeBlobVerified(handle_, kHeaderKey, &header, sizeof(header), record_, sizeof(record_));
-    if (err != ESP_OK) { return err; }
+    WireSlot slot{};
+    slot.magic = kSlotMagic;
+    slot.schema = kSchema;
+    slot.state = static_cast<uint8_t>(new_state);
+    slot.attempt_uses_pending = new_attempt_uses_pending ? 1 : 0;
+    slot.sequence = next_sequence_;
+    slot.rounds_without_success = new_rounds;
+    credentialToWire(new_current, slot.current);
+    credentialToWire(new_pending, slot.pending);
+    sealWithCrc(slot);
 
-    WireCredential wire{};
-    credentialToWire(current_, wire);
-    sealWithCrc(wire);
-    err = writeBlobVerified(handle_, kCurrentKey, &wire, sizeof(wire), record_, sizeof(record_));
-    if (err != ESP_OK) { return err; }
+    const int target = (active_slot_ == 0) ? 1 : 0;
 
-    credentialToWire(pending_, wire);
-    sealWithCrc(wire);
-    return writeBlobVerified(handle_, kPendingKey, &wire, sizeof(wire), record_, sizeof(record_));
+    // Fault injection (test-only; see StoreTestFault) happens strictly
+    // before any RAM mutation below, so every injected path proves RAM and
+    // the active slot are untouched by a failed write.
+    esp_err_t err;
+    if (fault_for_test_ == StoreTestFault::BeforeWrite) {
+        err = ESP_FAIL; // the write is never attempted at all
+    } else if (fault_for_test_ == StoreTestFault::DuringWrite) {
+        err = ESP_FAIL; // as if nvs_set_blob() itself failed partway through
+    } else {
+        err = nvs_set_blob(handle_, kSlotKeys[target], &slot, sizeof(slot));
+        if (err == ESP_OK) {
+            if (fault_for_test_ == StoreTestFault::DuringCommit) {
+                // Simulate a crash between the write and the commit. A
+                // bare nvs_set_blob() with no following nvs_commit() is not
+                // by itself enough to prove nothing survives: NVS may keep
+                // an uncommitted write visible to a same-process handle
+                // close+reopen (this store's end()+init(), used to model a
+                // reboot in tests) even though a real power cut would have
+                // lost it. Overwrite the candidate slot with garbage and
+                // commit THAT for real, so the slot is unambiguously
+                // invalid on any subsequent load() regardless of that
+                // visibility detail.
+                static constexpr uint8_t kFaultGarbage[4] = {0xde, 0xad, 0xbe, 0xef};
+                nvs_set_blob(handle_, kSlotKeys[target], kFaultGarbage, sizeof(kFaultGarbage));
+                nvs_commit(handle_);
+                err = ESP_FAIL;
+            } else {
+                err = nvs_commit(handle_);
+                if (err == ESP_OK) {
+                    size_t verify_size = sizeof(record_);
+                    err = nvs_get_blob(handle_, kSlotKeys[target], record_, &verify_size);
+                    if (err == ESP_OK) {
+                        const bool forced_mismatch = fault_for_test_ == StoreTestFault::DuringReadback;
+                        if (forced_mismatch || verify_size != sizeof(slot) ||
+                            std::memcmp(record_, &slot, sizeof(slot)) != 0) {
+                            err = ESP_ERR_INVALID_RESPONSE;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fault_for_test_ = StoreTestFault::None;
+    if (err != ESP_OK) { return err; } // RAM and the active slot are exactly as they were
+
+    active_slot_ = target;
+    next_sequence_ = slot.sequence + 1;
+    state_ = new_state;
+    attempt_uses_pending_ = new_attempt_uses_pending;
+    rounds_without_success_ = new_rounds;
+    current_ = new_current;
+    pending_ = new_pending;
+    return ESP_OK;
 }
 
 esp_err_t MqttCredentialStore::init()
@@ -603,37 +686,23 @@ void MqttCredentialStore::end()
 esp_err_t MqttCredentialStore::storePending(const StoredCredential &credential)
 {
     if (!initialized_ || !credential.valid) { return ESP_ERR_INVALID_STATE; }
-    pending_ = credential;
-    state_ = CredentialState::PendingUnused;
-    rounds_without_success_ = 0;
-    const esp_err_t err = commitAndVerify();
-    if (err != ESP_OK) { return err; }
-    return ESP_OK;
+    return commitTransition(CredentialState::PendingUnused, attempt_uses_pending_, 0, current_, credential);
 }
 
 esp_err_t MqttCredentialStore::beginAttempt(bool usingPending)
 {
     if (!initialized_) { return ESP_ERR_INVALID_STATE; }
     if (usingPending ? !pending_.valid : !current_.valid) { return ESP_ERR_INVALID_STATE; }
-    attempt_uses_pending_ = usingPending;
-    state_ = CredentialState::AttemptInFlight;
-    return commitAndVerify();
+    return commitTransition(CredentialState::AttemptInFlight, usingPending, rounds_without_success_, current_,
+                            pending_);
 }
 
 esp_err_t MqttCredentialStore::confirmConnected()
 {
     if (!initialized_) { return ESP_ERR_INVALID_STATE; }
-    if (attempt_uses_pending_) {
-        current_ = pending_;
-        pending_ = StoredCredential{};
-    }
-    // else: the courtesy retry on `current` succeeded; `current` stays, and
-    // any still-stored `pending` (now proven never to have worked within
-    // this round) is also cleared -- there is no third slot to keep it in.
-    pending_ = attempt_uses_pending_ ? pending_ : StoredCredential{};
-    state_ = CredentialState::CurrentConfirmed;
-    rounds_without_success_ = 0;
-    return commitAndVerify();
+    const StoredCredential new_current = attempt_uses_pending_ ? pending_ : current_;
+    return commitTransition(CredentialState::CurrentConfirmed, attempt_uses_pending_, 0, new_current,
+                            StoredCredential{});
 }
 
 esp_err_t MqttCredentialStore::reportPreAuthFailure()
@@ -641,41 +710,37 @@ esp_err_t MqttCredentialStore::reportPreAuthFailure()
     if (!initialized_) { return ESP_ERR_INVALID_STATE; }
     // Proven to have happened before authentication: neither credential is
     // touched. Only restore a sensible resting state from AttemptInFlight.
-    state_ = pending_.valid ? CredentialState::PendingUnused : CredentialState::CurrentConfirmed;
-    return commitAndVerify();
+    const CredentialState resting =
+        pending_.valid ? CredentialState::PendingUnused : CredentialState::CurrentConfirmed;
+    return commitTransition(resting, attempt_uses_pending_, rounds_without_success_, current_, pending_);
 }
 
-esp_err_t MqttCredentialStore::reportAmbiguous()
+esp_err_t MqttCredentialStore::reportAmbiguous(bool completesRound)
 {
     if (!initialized_) { return ESP_ERR_INVALID_STATE; }
-    state_ = CredentialState::AmbiguousActivation;
-    ++rounds_without_success_;
-    return commitAndVerify();
+    const uint32_t new_rounds = completesRound ? rounds_without_success_ + 1 : rounds_without_success_;
+    return commitTransition(CredentialState::AmbiguousActivation, attempt_uses_pending_, new_rounds, current_,
+                            pending_);
 }
 
 esp_err_t MqttCredentialStore::enterBootstrapRecovery()
 {
     if (!initialized_) { return ESP_ERR_INVALID_STATE; }
-    state_ = CredentialState::BootstrapRecovery;
-    return commitAndVerify();
+    return commitTransition(CredentialState::BootstrapRecovery, attempt_uses_pending_, rounds_without_success_,
+                            current_, pending_);
 }
 
 esp_err_t MqttCredentialStore::enterProvisioningFault()
 {
     if (!initialized_) { return ESP_ERR_INVALID_STATE; }
-    state_ = CredentialState::ProvisioningFault;
-    return commitAndVerify();
+    return commitTransition(CredentialState::ProvisioningFault, attempt_uses_pending_, rounds_without_success_,
+                            current_, pending_);
 }
 
 esp_err_t MqttCredentialStore::eraseAll()
 {
     if (!initialized_) { return ESP_ERR_INVALID_STATE; }
-    state_ = CredentialState::Empty;
-    current_ = StoredCredential{};
-    pending_ = StoredCredential{};
-    attempt_uses_pending_ = true;
-    rounds_without_success_ = 0;
-    return commitAndVerify();
+    return commitTransition(CredentialState::Empty, true, 0, StoredCredential{}, StoredCredential{});
 }
 
 // --- Monotonic clock -----------------------------------------------------------
@@ -812,7 +877,8 @@ esp_err_t MqttCredentialCoordinator::doBootstrap()
     DeviceCredentialResponse parsed{};
     ParseError parse_error = ParseError::None;
     esp_err_t err = parseDeviceCredentialResponse(response_buffer_, result.size, config_.expected_device_id,
-                                                  config_.expected_hardware_binding_id, parsed, parse_error);
+                                                  config_.expected_hardware_binding_id, config_.expected_generation,
+                                                  parsed, parse_error);
     if (err == ESP_OK) {
         const char *ca_pem = nullptr;
         err = trust_.resolve(parsed.trust_ref, &ca_pem); // unknown trust_ref: same as an invalid body
@@ -837,44 +903,118 @@ esp_err_t MqttCredentialCoordinator::doBootstrap()
     std::memcpy(credential.topic_telemetry, parsed.topic_telemetry, sizeof(credential.topic_telemetry));
     std::memcpy(credential.topic_cmd, parsed.topic_cmd, sizeof(credential.topic_cmd));
     std::memcpy(credential.expires_at, parsed.expires_at, sizeof(credential.expires_at));
-    return store_.storePending(credential);
+    const esp_err_t store_err = store_.storePending(credential);
+    if (store_err != ESP_OK) { scheduleNextAttempt(false, 0); }
+    return store_err;
 }
 
-void MqttCredentialCoordinator::reportConnected()
+esp_err_t MqttCredentialCoordinator::reportConnected()
 {
-    store_.confirmConnected();
+    const esp_err_t err = store_.confirmConnected();
+    if (err != ESP_OK) { return err; }
     pending_tried_this_round_ = false;
     backoff_ms_ = config_.initial_backoff_ms;
     next_action_at_us_ = clock_.nowUs();
+    return ESP_OK;
 }
 
-void MqttCredentialCoordinator::reportPreAuthFailure()
+esp_err_t MqttCredentialCoordinator::reportPreAuthFailure()
 {
     // Proven to have happened before authentication: not an ambiguous
     // outcome, so it does not consume a round attempt against either
     // credential's "tried this round" bookkeeping either.
-    store_.reportPreAuthFailure();
-    scheduleNextAttempt(false, 0);
+    const esp_err_t err = store_.reportPreAuthFailure();
+    scheduleNextAttempt(false, 0); // never a tight loop, regardless of the durable result
+    return err;
 }
 
-void MqttCredentialCoordinator::reportAmbiguous()
+esp_err_t MqttCredentialCoordinator::reportAmbiguous()
 {
+    // A round is "pending first, current as courtesy second" -- with only
+    // pending (no current to fall back on), a single ambiguous attempt
+    // against it already completes the round. roundsWithoutSuccess() must
+    // only advance on that completion, never on every individual attempt.
     const bool was_pending = store_.attemptUsesPending();
-    store_.reportAmbiguous();
-    if (was_pending) {
-        // Pending just had its ambiguous attempt; offer the current-as-
-        // courtesy action next, instead of retrying pending immediately.
-        pending_tried_this_round_ = true;
-    } else {
-        // The courtesy attempt on `current` also ended ambiguously: this
-        // round is now fully complete either way.
-        pending_tried_this_round_ = false;
+    const bool completes_round = !was_pending || !store_.hasCurrent();
+    const esp_err_t err = store_.reportAmbiguous(completes_round);
+    esp_err_t final_err = err;
+    if (err == ESP_OK) {
+        if (completes_round) {
+            pending_tried_this_round_ = false;
+            if (store_.roundsWithoutSuccess() >= config_.max_rounds_before_recovery) {
+                final_err = store_.enterBootstrapRecovery();
+            }
+        } else {
+            // Pending just had its ambiguous attempt; offer the
+            // current-as-courtesy action next, instead of retrying pending
+            // immediately within the same round.
+            pending_tried_this_round_ = true;
+        }
     }
-    if (store_.roundsWithoutSuccess() >= config_.max_rounds_before_recovery) {
-        store_.enterBootstrapRecovery();
-        pending_tried_this_round_ = false;
+    scheduleNextAttempt(false, 0); // never a tight loop, regardless of the durable result
+    return final_err;
+}
+
+// --- Session controller (orchestration only; see MqttTransportSession in
+// the header for why this is not wired to a real NetworkSession this
+// round) ----------------------------------------------------------------------
+
+MqttSessionController::MqttSessionController(MqttCredentialCoordinator &coordinator, MqttCredentialStore &store,
+                                             TrustResolver &trust, MqttTransportSession &transport)
+    : coordinator_(coordinator), store_(store), trust_(trust), transport_(transport)
+{
+}
+
+esp_err_t MqttSessionController::tick()
+{
+    if (attempt_active_) {
+        const MqttTransportSession::Outcome outcome = transport_.poll();
+        if (outcome == MqttTransportSession::Outcome::StillTrying) { return ESP_OK; }
+        attempt_active_ = false;
+        if (outcome == MqttTransportSession::Outcome::Connected) {
+            ready_ = true;
+            return coordinator_.reportConnected();
+        }
+        ready_ = false;
+        return coordinator_.reportAmbiguous(); // Outcome has no PreAuthFailure value -- see Seção 5
     }
-    scheduleNextAttempt(false, 0);
+
+    ready_ = false;
+    const CoordinatorAction action = coordinator_.poll();
+    if (action != CoordinatorAction::ConnectWithPending && action != CoordinatorAction::ConnectWithCurrentCourtesy) {
+        return ESP_OK; // Idle, or a RequestBootstrap already handled inside poll() itself
+    }
+    const bool using_pending = action == CoordinatorAction::ConnectWithPending;
+    const StoredCredential &credential = coordinator_.credentialToTry();
+    const char *ca_pem = nullptr;
+    if (trust_.resolve(credential.trust_ref, &ca_pem) != ESP_OK) {
+        // The coordinator already resolved trust before ever persisting
+        // this credential (doBootstrap()); reaching here would mean the
+        // trust table shrank underneath an already-persisted credential.
+        // Defensive, not expected: do nothing this tick rather than attempt
+        // a connection with no CA.
+        return ESP_OK;
+    }
+    const esp_err_t begin_err = store_.beginAttempt(using_pending);
+    if (begin_err != ESP_OK) { return begin_err; }
+
+    MqttSessionIdentity identity{};
+    identity.broker_uri = credential.broker_uri;
+    identity.client_id = credential.client_id;
+    identity.username = credential.username;
+    identity.password = credential.password;
+    identity.command_topic = credential.topic_cmd;
+    identity.server_ca_pem = ca_pem;
+    const esp_err_t restart_err = transport_.restart(identity);
+    if (restart_err != ESP_OK) {
+        // The attempt is already durably marked in flight; the transport
+        // never actually got to try. Conservative, per Seção 5: there is no
+        // transport-proven pre-auth evidence anywhere in this seam, so this
+        // is reported exactly the same way any other inconclusive outcome is.
+        return coordinator_.reportAmbiguous();
+    }
+    attempt_active_ = true;
+    return ESP_OK;
 }
 
 } // namespace pixels_mqtt

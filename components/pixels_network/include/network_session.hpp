@@ -47,13 +47,6 @@ public:
         uint32_t queue_overflows;
         uint32_t transport_errors;
         uint32_t publish_acks;
-        /// Subset of `transport_errors` the SDK itself proved happened at the
-        /// TCP/TLS layer, strictly before any MQTT authentication could
-        /// occur (`MQTT_ERROR_TYPE_TCP_TRANSPORT`, aliased by
-        /// `MQTT_ERROR_TYPE_ESP_TLS`). A credential-lifecycle caller may
-        /// treat exactly this subset as a provable pre-authentication
-        /// failure; every other transport error remains ambiguous.
-        uint32_t pre_auth_transport_errors;
     };
 
     /// Broker acknowledgement of one QoS1 enqueue, as last observed by this
@@ -173,7 +166,6 @@ private:
     std::atomic<bool> subscribed_{false};
     std::atomic<bool> reconnect_requested_{false};
     std::atomic<uint32_t> connections_{0}, rejected_{0}, overflow_{0}, errors_{0}, acknowledged_{0};
-    std::atomic<uint32_t> pre_auth_transport_errors_{0};
     std::atomic<uint32_t> connection_epoch_{1}; // bumped on every disconnect
     TrackedPublish tracked_[kMaxTrackedPublishes]{};
     int (*subscribe_override_)(const char *topic, int qos) = nullptr; // test-only; see setSubscribeOverrideForTest()
