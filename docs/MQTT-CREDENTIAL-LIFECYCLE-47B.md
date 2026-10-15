@@ -19,7 +19,7 @@
    testável que **não** é ligado à sessão real ainda (decisão explícita, justificada abaixo); e o
    runner `run_qemu.py` agora reconhece o marcador exato deste target e retorna 0/1 corretamente.
 3. **Validação**: novo target `validation_mqtt_credentials/` — **298/298 checks, ALL_PASS**
-   no HEAD final desta branch, confirmado pelo `run_qemu.py` com exit code 0
+   no commit de implementação `51817bf`, confirmado pelo `run_qemu.py` com exit code 0
    (o próprio runner, corrigido nesta rodada, agora confirma isso — não apenas minha leitura do
    transcript). O runner congelado `validation/` permanece **468/468 ALL_PASS**, exit 0, sem
    nenhuma alteração de capacidade (772 B de DRAM estática livre, idênticos antes/depois). Build do
@@ -284,7 +284,7 @@ erase+reinit de partição ainda é necessário, já que não existe um store in
 
 | | `validation/` (congelado) | `validation_mqtt_credentials/` | Produto |
 |---|---|---|---|
-| Checks QEMU | 468/468 ALL_PASS (inalterado) | 298/298 ALL_PASS no HEAD final | n/a |
+| Checks QEMU | 468/468 ALL_PASS (inalterado) | 298/298 ALL_PASS no `51817bf` | n/a |
 | Exit code `run_qemu.py` | 0 (inalterado) | 0 (corrigido nesta rodada — antes sempre 1, item 8) | n/a |
 | DRAM estática | 179964 B (99,57%, **772 B livres**, inalterado) | 90300 B (49,96%, **90436 B livres**) | 82111 B (45,43%, antes 81063 B/44,85%) |
 | IRAM estática | 48047 B (36,66%, inalterado) | 46163 B (35,22%, inalterado) | 90555 B (69,09%, inalterado) |
@@ -382,15 +382,17 @@ contagem de rodadas ou classificação pré-auth (todos intocados desta vez):
 
 Validação desta rodada: build do produto limpo; `validation/` congelada **468/468 ALL_PASS**, sem
 nenhum caso novo adicionado nela; `validation_mqtt_credentials/` com os checks novos, **ALL_PASS**
-e `run_qemu.py` retornando exit code 0; banner do HEAD final exato, sem `-dirty`; `git diff
+e `run_qemu.py` retornando exit code 0; banner de `51817bf` exato, sem `-dirty`; `git diff
 --check` limpo. A correção atômica do item 5 é um commit adicional sobre `b27f9fb`.
 
-## Confirmação de ausência de segredos, push, merge, deploy e flash
+## Fechamento e publicação
 
 Nenhuma URL, bearer token, credencial MQTT ou material de CA real foi adicionado em nenhum commit
 desta rodada nem na anterior. Todo material de teste novo (fault injection, `hardware_id`
 sintético, `MqttSessionController`/`FakeTransportSession`) usa os mesmos valores sintéticos já
 estabelecidos (`kHardwareId = "a1b2c3d4e5f6"`, `kTrustRef`/`kCaPem` sintéticos, senhas prefixadas
-`SYNTHETIC-`/`ab-`/`durable-fail-`/`rotated-secret-`). `git diff --check` limpo. Nenhum push,
-merge, PR, flash, acesso a broker real ou a `easyled-platform` foi realizado — todo trabalho
-permanece local nesta worktree, branch `feat/mqtt-credential-lifecycle-47b`.
+`SYNTHETIC-`/`ab-`/`durable-fail-`/`rotated-secret-`). `git diff --check` limpo. Durante a
+implementação não houve push, merge, PR, flash, acesso a broker real ou a `easyled-platform`.
+Após a revisão independente e os gates finais no commit `51817bf`, a branch foi integrada por
+fast-forward e publicada em `origin/main` em 15/10/2026. Nenhum deploy, flash ou serviço real foi
+acionado nesse fechamento.
