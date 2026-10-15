@@ -400,7 +400,7 @@ extern "C" void app_main()
         const esp_err_t mqtt_init = mqtt_store.init();
         if (mqtt_init != ESP_OK) {
             ESP_LOGE(kTag, "MQTT credential store init failed: %s; provisioning stays offline this boot"
-                           " (laboratory MQTT wiring below is unaffected)", esp_err_to_name(mqtt_init));
+                           " (no fallback to laboratory MQTT credentials)", esp_err_to_name(mqtt_init));
         } else {
             ESP_LOGI(kTag, "MQTT credential store ready, but #47-B stays offline this boot: not yet wired"
                            " to the live session (see docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md, Seção 7)");

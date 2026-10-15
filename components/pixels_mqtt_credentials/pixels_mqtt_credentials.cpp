@@ -715,12 +715,14 @@ esp_err_t MqttCredentialStore::reportPreAuthFailure()
     return commitTransition(resting, attempt_uses_pending_, rounds_without_success_, current_, pending_);
 }
 
-esp_err_t MqttCredentialStore::reportAmbiguous(bool completesRound)
+esp_err_t MqttCredentialStore::reportAmbiguous(bool completesRound, bool enterBootstrapRecovery)
 {
     if (!initialized_) { return ESP_ERR_INVALID_STATE; }
+    if (enterBootstrapRecovery && !completesRound) { return ESP_ERR_INVALID_ARG; }
     const uint32_t new_rounds = completesRound ? rounds_without_success_ + 1 : rounds_without_success_;
-    return commitTransition(CredentialState::AmbiguousActivation, attempt_uses_pending_, new_rounds, current_,
-                            pending_);
+    const CredentialState next_state =
+        enterBootstrapRecovery ? CredentialState::BootstrapRecovery : CredentialState::AmbiguousActivation;
+    return commitTransition(next_state, attempt_uses_pending_, new_rounds, current_, pending_);
 }
 
 esp_err_t MqttCredentialStore::enterBootstrapRecovery()
@@ -943,14 +945,14 @@ esp_err_t MqttCredentialCoordinator::reportAmbiguous()
     // only advance on that completion, never on every individual attempt.
     const bool was_pending = store_.attemptUsesPending();
     const bool completes_round = !was_pending || !store_.hasCurrent();
-    const esp_err_t err = store_.reportAmbiguous(completes_round);
-    esp_err_t final_err = err;
+    const uint32_t completed_rounds = store_.roundsWithoutSuccess();
+    const bool enter_recovery = completes_round &&
+        (config_.max_rounds_before_recovery == 0 ||
+         completed_rounds >= config_.max_rounds_before_recovery - 1);
+    const esp_err_t err = store_.reportAmbiguous(completes_round, enter_recovery);
     if (err == ESP_OK) {
         if (completes_round) {
             pending_tried_this_round_ = false;
-            if (store_.roundsWithoutSuccess() >= config_.max_rounds_before_recovery) {
-                final_err = store_.enterBootstrapRecovery();
-            }
         } else {
             // Pending just had its ambiguous attempt; offer the
             // current-as-courtesy action next, instead of retrying pending
@@ -959,7 +961,7 @@ esp_err_t MqttCredentialCoordinator::reportAmbiguous()
         }
     }
     scheduleNextAttempt(false, 0); // never a tight loop, regardless of the durable result
-    return final_err;
+    return err;
 }
 
 // --- Session controller (orchestration only; see MqttTransportSession in

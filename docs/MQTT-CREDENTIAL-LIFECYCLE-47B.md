@@ -18,8 +18,8 @@
    emissão de credencial real que o produto ignorava foi substituída por um controlador de sessão
    testável que **não** é ligado à sessão real ainda (decisão explícita, justificada abaixo); e o
    runner `run_qemu.py` agora reconhece o marcador exato deste target e retorna 0/1 corretamente.
-3. **Validação**: novo target `validation_mqtt_credentials/` — **258/258 checks, ALL_PASS**,
-   confirmado em **3 execuções QEMU consecutivas, todas com `run_qemu.py` retornando exit code 0**
+3. **Validação**: novo target `validation_mqtt_credentials/` — **298/298 checks, ALL_PASS**
+   no HEAD final desta branch, confirmado pelo `run_qemu.py` com exit code 0
    (o próprio runner, corrigido nesta rodada, agora confirma isso — não apenas minha leitura do
    transcript). O runner congelado `validation/` permanece **468/468 ALL_PASS**, exit 0, sem
    nenhuma alteração de capacidade (772 B de DRAM estática livre, idênticos antes/depois). Build do
@@ -284,9 +284,9 @@ erase+reinit de partição ainda é necessário, já que não existe um store in
 
 | | `validation/` (congelado) | `validation_mqtt_credentials/` | Produto |
 |---|---|---|---|
-| Checks QEMU | 468/468 ALL_PASS (inalterado) | 258/258 ALL_PASS | n/a |
+| Checks QEMU | 468/468 ALL_PASS (inalterado) | 298/298 ALL_PASS no HEAD final | n/a |
 | Exit code `run_qemu.py` | 0 (inalterado) | 0 (corrigido nesta rodada — antes sempre 1, item 8) | n/a |
-| DRAM estática | 179964 B (99,57%, **772 B livres**, inalterado) | 82164 B (45,46%, 98572 B livres) | 82111 B (45,43%, antes 81063 B/44,85%) |
+| DRAM estática | 179964 B (99,57%, **772 B livres**, inalterado) | 90300 B (49,96%, **90436 B livres**) | 82111 B (45,43%, antes 81063 B/44,85%) |
 | IRAM estática | 48047 B (36,66%, inalterado) | 46163 B (35,22%, inalterado) | 90555 B (69,09%, inalterado) |
 | Flash code | inalterado | 108430 B | 772014 B |
 | Flash data | inalterado | 44816 B | 220600 B |
@@ -319,7 +319,7 @@ qualquer teste de ponta a ponta contra um ambiente real, mas a arquitetura em si
 
 ## Rodada corretiva 2: correção final pequena sobre `a950abf`
 
-Quatro correções pontuais, sem reabrir parser, formato A/B, `hardware_id`, `generation`,
+Cinco correções pontuais, sem reabrir parser, formato A/B, `hardware_id`, `generation`,
 contagem de rodadas ou classificação pré-auth (todos intocados desta vez):
 
 1. **`MqttSessionController` perdia o resultado durável em falha**: `tick()` limpava
@@ -372,10 +372,18 @@ contagem de rodadas ou classificação pré-auth (todos intocados desta vez):
    contrato; e esta seção declara explicitamente que o modo provisionado não usa nenhuma
    credencial estática enquanto a ligação real não existir (item 2 acima).
 
+5. **Escalonamento para `BootstrapRecovery` em uma única transação**: a última tentativa ambígua
+   de uma rodada fazia primeiro um commit em `AmbiguousActivation` e, ao atingir o limite, um
+   segundo commit em `BootstrapRecovery`. Se apenas o segundo falhasse, repetir o mesmo resultado
+   terminal contabilizaria a rodada novamente. O store agora recebe a decisão de recuperação e
+   grava estado final e contador incrementado juntos no mesmo slot A/B. O teste injeta falha nessa
+   transição no limite: estado e contador permanecem exatamente em `AttemptInFlight`/2; um único
+   retry produz `BootstrapRecovery`/3, sem dupla contagem.
+
 Validação desta rodada: build do produto limpo; `validation/` congelada **468/468 ALL_PASS**, sem
 nenhum caso novo adicionado nela; `validation_mqtt_credentials/` com os checks novos, **ALL_PASS**
 e `run_qemu.py` retornando exit code 0; banner do HEAD final exato, sem `-dirty`; `git diff
---check` limpo. Um único commit corretivo sobre `a950abf`.
+--check` limpo. A correção atômica do item 5 é um commit adicional sobre `b27f9fb`.
 
 ## Confirmação de ausência de segredos, push, merge, deploy e flash
 

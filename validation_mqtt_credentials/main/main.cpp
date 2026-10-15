@@ -758,7 +758,22 @@ extern "C" void app_main()
             CHECK(coordinator.poll() == CoordinatorAction::ConnectWithCurrentCourtesy); // old, only as courtesy
             CHECK(std::strcmp(coordinator.credentialToTry().credential_id, kCredentialId) == 0);
             CHECK(store.beginAttempt(false) == ESP_OK);
-            CHECK(coordinator.reportAmbiguous() == ESP_OK);
+            if (round == 3) {
+                // Reaching the recovery threshold used to require two NVS
+                // commits: AmbiguousActivation and then BootstrapRecovery.
+                // A failure in the second commit made retrying the same
+                // transport result count the round twice. The threshold is
+                // now one atomic transition: failure preserves the exact
+                // AttemptInFlight state/counter, and one retry lands both
+                // the increment and BootstrapRecovery together.
+                store.setFaultInjectionForTest(StoreTestFault::DuringCommit);
+                CHECK(coordinator.reportAmbiguous() != ESP_OK);
+                CHECK(store.state() == CredentialState::AttemptInFlight &&
+                      store.roundsWithoutSuccess() == 2);
+                CHECK(coordinator.reportAmbiguous() == ESP_OK);
+            } else {
+                CHECK(coordinator.reportAmbiguous() == ESP_OK);
+            }
             if (round < 3) {
                 CHECK(store.roundsWithoutSuccess() == static_cast<uint32_t>(round)); // round now completed
                 CHECK(store.state() == CredentialState::AmbiguousActivation);

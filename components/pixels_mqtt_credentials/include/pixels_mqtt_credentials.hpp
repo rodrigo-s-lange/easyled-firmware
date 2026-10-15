@@ -355,9 +355,14 @@ public:
     ///        -- only then does `roundsWithoutSuccess()` advance. The
     ///        caller (the coordinator) decides this; the store only records
     ///        it atomically alongside the state transition.
+    /// @param enterBootstrapRecovery True iff this completed round reaches
+    ///        the coordinator's recovery limit. This implies
+    ///        `completesRound`; the state and incremented round counter are
+    ///        then committed directly as `BootstrapRecovery`, in the same
+    ///        single-slot transaction.
     /// @return ESP_OK after a verified single-slot commit, or a storage
     ///         error -- RAM is unchanged on any non-ESP_OK return.
-    esp_err_t reportAmbiguous(bool completesRound);
+    esp_err_t reportAmbiguous(bool completesRound, bool enterBootstrapRecovery = false);
 
     /// Neither credential confirmed after the coordinator's own bounded
     /// round limit: give up on both and require a fresh bootstrap request.
