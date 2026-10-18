@@ -1,0 +1,5 @@
+# Fixture JSON under any fixtures/ directory is compared byte-exact (size
+# and/or SHA-256) against a documented upstream value. A Windows checkout
+# with core.autocrlf=true would otherwise reflow these files' embedded line
+# breaks to CRLF, silently changing their byte count and digest.
+**/fixtures/*.json text eol=lf
