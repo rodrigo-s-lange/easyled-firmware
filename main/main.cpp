@@ -4,6 +4,7 @@
 #include "pixels_control_runtime.hpp"
 #include "pixels_durable_storage.hpp"
 #include "pixels_mqtt_credentials.hpp"
+#include "pixels_mqtt_session_adapter.hpp"
 #include "esp_pixels.hpp"
 #include "esp_pixels_fx.hpp"
 #include "esp_pixels_composer.hpp"
@@ -12,6 +13,7 @@
 #include <cctype>
 #include <climits>
 #include <cstring>
+#include <ctime>
 
 #include "esp_heap_caps.h"
 #include "esp_netif_sntp.h"
@@ -352,37 +354,35 @@ extern "C" void app_main()
     static pixels_control::RoutedPayloadSource payload_source(
         provisioned ? &https_source : nullptr, embedded_source);
 
-    static pixels_control::MqttEventSink event_sink(session, config.event_topic);
-    static pixels_control::MqttTelemetrySink telemetry_sink(
-        session, config.state_topic, config.event_topic);
+    // Provisioned mode's event/state topics come from the selected MQTT
+    // credential and rotate with it (Section 6); laboratory mode keeps using
+    // config.event_topic/.state_topic unchanged. The sinks below capture
+    // whichever pointer applies ONCE, at construction, and never get rebuilt:
+    // in provisioned mode that pointer is this struct's own stable array, so
+    // rotateProvisionedTopics() overwriting it in place is all a later swap
+    // ever needs.
+    static pixels_mqtt_session::ProvisionedTopics provisioned_topics{}; // unused in laboratory mode
+    const bool mqtt_provisioned = mqtt_state == MqttProvisioningProfileState::Complete;
+    const char *event_topic = mqtt_provisioned ? provisioned_topics.event : config.event_topic;
+    const char *state_topic = mqtt_provisioned ? provisioned_topics.state : config.state_topic;
+    static pixels_control::MqttEventSink event_sink(session, event_topic);
+    static pixels_control::MqttTelemetrySink telemetry_sink(session, state_topic, event_topic);
     static pixels_control::UtcTimestampSource timestamp_source;
     static pixels_executor::Executor executor(journal, staging, payload_source, event_sink,
                                                timestamp_source, active_probe, config.device_id);
 
-    // #47-B MQTT credential lifecycle, Section 7 (docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md):
-    // foundation only, deliberately not wired to this session this round.
-    // `session` below still connects with `config.network`'s literal,
-    // statically configured credentials exactly as before. Driving a real
-    // credential swap through it needs a MqttSessionController (see
-    // pixels_mqtt_credentials.hpp) fed by a NetworkSession adapter, but
-    // NetworkSession::init() validates and creates the ESP-MQTT client
-    // eagerly, before Wi-Fi ever comes up -- so starting it with "no
-    // credential yet" is not an option, and starting it only after the
-    // bootstrap HTTPS call succeeds needs that same call to already have
-    // network connectivity. Resolving that ordering is a NetworkSession
-    // -level question, not a credential-lifecycle one, and is not attempted
-    // here; see "Blocked on the platform" in that doc. This block only
-    // brings the store/coordinator up against the real partition and real
-    // HTTPS client, proving `store.init()` against actual NVS, but never
-    // calls `poll()` on them: no real credential is ever requested or
-    // emitted by the product this round.
+    // #47-B MQTT credential lifecycle (docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md,
+    // docs/MQTT-SESSION-INTEGRATION-TASK.md): the store/coordinator are
+    // always constructed so the durable layer is exercised against the real
+    // partition even in laboratory mode (mqtt_state != Complete simply never
+    // drives them further below).
     static pixels_mqtt::MqttCredentialStore mqtt_store;
     static pixels_mqtt::EspMqttBootstrapClient mqtt_bootstrap_client;
     static const pixels_mqtt::TableTrustResolver::Entry mqtt_trust_entries[] = {
         {config.mqtt_trust_ref, config.mqtt_trust_ca_pem},
     };
     static pixels_mqtt::TableTrustResolver mqtt_trust_resolver(
-        mqtt_trust_entries, mqtt_state == MqttProvisioningProfileState::Complete ? 1 : 0);
+        mqtt_trust_entries, mqtt_provisioned ? 1 : 0);
     static pixels_mqtt::EspMonotonicClock mqtt_clock;
     pixels_mqtt::MqttCredentialCoordinator::Config mqtt_coordinator_config{};
     mqtt_coordinator_config.base_url = config.mqtt_bootstrap_base_url;
@@ -396,37 +396,45 @@ extern "C" void app_main()
     }
     static pixels_mqtt::MqttCredentialCoordinator mqtt_coordinator(
         mqtt_store, mqtt_bootstrap_client, mqtt_trust_resolver, mqtt_clock, mqtt_coordinator_config);
-    if (mqtt_state == MqttProvisioningProfileState::Complete) {
+    // Real transport adapter + session controller: constructed
+    // unconditionally (same pattern as https_source/http_client above),
+    // driven below only through active_mqtt_controller, which stays null in
+    // laboratory mode.
+    static pixels_mqtt_session::NetworkSessionMqttTransport mqtt_transport(session, mqtt_clock);
+    static pixels_mqtt::MqttSessionController mqtt_controller(
+        mqtt_coordinator, mqtt_store, mqtt_trust_resolver, mqtt_transport);
+    pixels_mqtt::MqttSessionController *active_mqtt_controller = nullptr;
+
+    if (mqtt_provisioned) {
         const esp_err_t mqtt_init = mqtt_store.init();
         if (mqtt_init != ESP_OK) {
             ESP_LOGE(kTag, "MQTT credential store init failed: %s; provisioning stays offline this boot"
                            " (no fallback to laboratory MQTT credentials)", esp_err_to_name(mqtt_init));
-        } else {
-            ESP_LOGI(kTag, "MQTT credential store ready, but #47-B stays offline this boot: not yet wired"
-                           " to the live session (see docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md, Seção 7)");
+            return;
         }
-        // Provisioned mode must never start `session` with
-        // config.network's literal laboratory credentials -- that would be
-        // exactly the silent downgrade this whole profile system exists to
-        // prevent. MqttSessionController (pixels_mqtt_credentials.hpp) is
-        // built and tested, but wiring it to a real NetworkSession needs
-        // the Wi-Fi-before-MQTT-identity ordering question resolved first
-        // (see that header's own comment, and the doc's "próxima tarefa de
-        // arquitetura do firmware"). Until then this boot has nothing
-        // further to do on the networking side: restored pixels and local
-        // rendering already run independently of any of this (AGENTS.md),
-        // and no credential -- static or real -- is used for MQTT.
-        ESP_LOGI(kTag, "provisioned mode stays offline this boot: no MQTT session is started with any"
-                       " credential, static laboratory or real, until the session controller is wired");
-        return;
-    }
-
-    err = session.init(config.network);
-    if (err == ESP_OK) { err = session.start(); }
-    if (err != ESP_OK) {
-        ESP_LOGE(kTag, "network startup failed: %s", esp_err_to_name(err));
-        session.end();
-        return;
+        // Wi-Fi starts with no MQTT identity at all -- the credential is
+        // selected later, once Wi-Fi and trusted time exist (Section 4).
+        // Provisioned mode must never start `session` with config.network's
+        // literal laboratory credentials, which would be exactly the silent
+        // downgrade this profile system exists to prevent.
+        err = session.initWifi({config.network.ssid, config.network.wifi_password});
+        if (err == ESP_OK) { err = session.start(); }
+        if (err != ESP_OK) {
+            ESP_LOGE(kTag, "network startup failed: %s", esp_err_to_name(err));
+            session.end();
+            return;
+        }
+        active_mqtt_controller = &mqtt_controller;
+        ESP_LOGI(kTag, "provisioned mode: Wi-Fi starting with no MQTT identity yet; the session"
+                       " controller selects and connects a durable credential once trusted time exists");
+    } else {
+        err = session.init(config.network);
+        if (err == ESP_OK) { err = session.start(); }
+        if (err != ESP_OK) {
+            ESP_LOGE(kTag, "network startup failed: %s", esp_err_to_name(err));
+            session.end();
+            return;
+        }
     }
 
     bool sntp_started = false;
@@ -459,11 +467,33 @@ extern "C" void app_main()
             esp_sntp_config_t time_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
             sntp_started = esp_netif_sntp_init(&time_config) == ESP_OK;
         }
-        session.poll();
-        // #47-B stays offline this boot (see this function's construction
-        // of mqtt_coordinator above): poll() is never called here, so no
-        // real bootstrap request is ever issued and no real credential is
-        // ever emitted by the product this round.
+        session.poll(); // the one and only owner of NetworkSession::poll()
+        if (active_mqtt_controller != nullptr) {
+            // Never mark AttemptInFlight while Wi-Fi is down or the wall
+            // clock is not yet usable for TLS -- the same gate NetworkSession
+            // itself uses before ever starting MQTT (see its poll()).
+            if (state.wifi_connected &&
+                std::time(nullptr) >= pixels_network::NetworkSession::kMinPlausibleUnixTime) {
+                const bool was_ready = active_mqtt_controller->ready();
+                const esp_err_t controller_err = active_mqtt_controller->tick();
+                if (controller_err != ESP_OK) {
+                    // Durable-store write failure: logged without secrets,
+                    // retried next iteration through the existing backoff
+                    // already inside tick()/the coordinator -- never a mode
+                    // switch to laboratory credentials.
+                    ESP_LOGW(kTag, "MQTT session controller durable write failed: %s",
+                             esp_err_to_name(controller_err));
+                }
+                if (!was_ready && active_mqtt_controller->ready()) {
+                    // The identity just became live: rotate the whole topic
+                    // set together with it, atomically from this single
+                    // control task, so there is no interval in which a
+                    // command from one identity could trigger an event on
+                    // another identity's topic.
+                    pixels_mqtt_session::rotateProvisionedTopics(mqtt_store.current(), provisioned_topics);
+                }
+            }
+        }
         const bool ready = session.status().subscribed;
         if (ready != previously_ready) {
             ESP_LOGI(kTag, "command subscription %s", ready ? "ready" : "offline");

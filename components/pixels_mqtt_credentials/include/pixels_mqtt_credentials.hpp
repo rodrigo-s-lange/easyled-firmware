@@ -578,6 +578,21 @@ public:
                           MqttTransportSession &transport);
 
     /// Call once per control-loop tick. Never blocks.
+    ///
+    /// Beyond driving one bootstrap/connect attempt at a time, tick() also
+    /// closes two lifecycle gaps a purely attempt-at-a-time state machine
+    /// leaves open: a cold boot that loads only `CurrentConfirmed` (no
+    /// `pending`) makes one durably marked reconnect attempt with `current`
+    /// instead of sitting idle forever waiting for a rotation that was never
+    /// requested; and once ready() is true, tick() keeps sampling `transport`
+    /// instead of going idle, so a bounded post-confirmation reconnect/
+    /// CONNACK deadline with no fresh CONNACK still durably reports Ambiguous
+    /// and falls back into the existing ambiguous/current retry path -- a
+    /// brief loss that reconnects on its own within the deadline is never
+    /// reported at all, matching NetworkSession's own reconnect behavior.
+    /// Neither gap reopens the #47-B state machine itself: both paths still
+    /// go through beginAttempt()/reportConnected()/reportAmbiguous() exactly
+    /// like every other attempt.
     /// @return ESP_OK, or the first durable-store write failure encountered.
     ///         On a non-ESP_OK return, a terminal transport outcome (if one
     ///         was just observed) is held pending: the caller should simply
@@ -605,6 +620,14 @@ private:
     /// tick() retries this exact report without re-polling or restarting
     /// the transport.
     esp_err_t reportPendingResult();
+
+    /// Durably marks `credential` as the attempt in flight, resolves its
+    /// trust_ref, and restarts `transport` with it. Shared by every attempt
+    /// start: the coordinator-driven path and the cold-boot
+    /// CurrentConfirmed reconnect in tick().
+    /// @param usingPending True for `pending`, false for `current`.
+    /// @return ESP_OK, or the first durable-store write failure encountered.
+    esp_err_t attemptWith(const StoredCredential &credential, bool usingPending);
 
     enum class PendingResult : uint8_t { None, Connected, Ambiguous };
 

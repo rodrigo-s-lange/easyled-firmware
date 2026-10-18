@@ -989,38 +989,18 @@ esp_err_t MqttSessionController::reportPendingResult()
     return ESP_OK;
 }
 
-esp_err_t MqttSessionController::tick()
+esp_err_t MqttSessionController::attemptWith(const StoredCredential &credential, bool usingPending)
 {
-    // A terminal outcome that could not yet be persisted takes priority
-    // over everything else: retry ONLY the durable report, never re-poll
-    // or restart the transport while one is owed.
-    if (pending_result_ != PendingResult::None) { return reportPendingResult(); }
-
-    if (attempt_active_) {
-        const MqttTransportSession::Outcome outcome = transport_.poll();
-        if (outcome == MqttTransportSession::Outcome::StillTrying) { return ESP_OK; }
-        attempt_active_ = false;
-        pending_result_ =
-            outcome == MqttTransportSession::Outcome::Connected ? PendingResult::Connected : PendingResult::Ambiguous;
-        return reportPendingResult();
-    }
-
-    const CoordinatorAction action = coordinator_.poll();
-    if (action != CoordinatorAction::ConnectWithPending && action != CoordinatorAction::ConnectWithCurrentCourtesy) {
-        return ESP_OK; // Idle, or a RequestBootstrap already handled inside poll() itself -- ready_ untouched
-    }
-    const StoredCredential &credential = coordinator_.credentialToTry();
     const char *ca_pem = nullptr;
     if (trust_.resolve(credential.trust_ref, &ca_pem) != ESP_OK) {
         // The coordinator already resolved trust before ever persisting
         // this credential (doBootstrap()); reaching here would mean the
-        // trust table shrank underneath an already-persisted credential.
-        // Defensive, not expected: do nothing this tick rather than attempt
-        // a connection with no CA.
+        // trust table shrank underneath an already-persisted/already-
+        // confirmed credential. Defensive, not expected: do nothing this
+        // tick rather than attempt a connection with no CA.
         return ESP_OK;
     }
-    const bool using_pending = action == CoordinatorAction::ConnectWithPending;
-    const esp_err_t begin_err = store_.beginAttempt(using_pending);
+    const esp_err_t begin_err = store_.beginAttempt(usingPending);
     if (begin_err != ESP_OK) { return begin_err; }
     // A new attempt is starting: whatever `restart()` below does, the
     // previous session (if any) is no longer the one in use -- ready_ no
@@ -1044,6 +1024,68 @@ esp_err_t MqttSessionController::tick()
         return reportPendingResult();
     }
     attempt_active_ = true;
+    return ESP_OK;
+}
+
+esp_err_t MqttSessionController::tick()
+{
+    // A terminal outcome that could not yet be persisted takes priority
+    // over everything else: retry ONLY the durable report, never re-poll
+    // or restart the transport while one is owed.
+    if (pending_result_ != PendingResult::None) { return reportPendingResult(); }
+
+    if (attempt_active_) {
+        const MqttTransportSession::Outcome outcome = transport_.poll();
+        if (outcome == MqttTransportSession::Outcome::StillTrying) { return ESP_OK; }
+        attempt_active_ = false;
+        pending_result_ =
+            outcome == MqttTransportSession::Outcome::Connected ? PendingResult::Connected : PendingResult::Ambiguous;
+        return reportPendingResult();
+    }
+
+    // The coordinator is consulted BEFORE any "just monitor the live
+    // session" shortcut: a rotation can durably persist a new `pending`
+    // credential at any time, including while `ready_` is still true from
+    // the previous identity, and that must still preempt monitoring and
+    // restart the transport with the new identity on this very tick --
+    // never wait for the old session to first go bad on its own.
+    const CoordinatorAction action = coordinator_.poll();
+    if (action == CoordinatorAction::ConnectWithPending || action == CoordinatorAction::ConnectWithCurrentCourtesy) {
+        return attemptWith(coordinator_.credentialToTry(), action == CoordinatorAction::ConnectWithPending);
+    }
+
+    if (ready_) {
+        // The coordinator has nothing new to connect with (Idle, or a
+        // RequestBootstrap already handled inside poll() itself): a durably
+        // confirmed session stays monitored, never idle. Ordinary brief
+        // loss is NetworkSession's own reconnect to absorb, silently
+        // (transport_.poll() keeps returning StillTrying through it and
+        // through any automatic reconnect CONNACK, never re-reporting that
+        // as a new credential promotion -- see the real adapter). Only a
+        // bounded post-confirmation reconnect/CONNACK deadline with no
+        // fresh CONNACK reaches here as Ambiguous, and that must still fall
+        // back into the existing conservative ambiguous/current retry path
+        // rather than monitor a dead session forever.
+        const MqttTransportSession::Outcome outcome = transport_.poll();
+        if (outcome != MqttTransportSession::Outcome::Ambiguous) { return ESP_OK; }
+        const esp_err_t begin_err = store_.beginAttempt(false); // the only credential a monitored session can be
+        if (begin_err != ESP_OK) { return begin_err; } // ready_ untouched; retried next tick()
+        pending_result_ = PendingResult::Ambiguous;
+        return reportPendingResult(); // clears ready_ once this report itself persists
+    }
+
+    // Not ready_, and the coordinator has nothing to decide about CREDENTIAL
+    // SELECTION from CurrentConfirmed with no pending -- but that credential
+    // still needs its own first reconnect attempt after a reboot -- never
+    // bootstrap merely because the device rebooted (Seção 5). Once this
+    // succeeds, ready_ monitoring above takes over on every later tick();
+    // once it durably reports Ambiguous instead, state leaves
+    // CurrentConfirmed and this branch no longer matches, so there is no
+    // risk of retrying it in a tight loop with no backoff.
+    if (action == CoordinatorAction::Idle && store_.state() == CredentialState::CurrentConfirmed &&
+        store_.hasCurrent() && !store_.hasPending()) {
+        return attemptWith(store_.current(), false);
+    }
     return ESP_OK;
 }
 
