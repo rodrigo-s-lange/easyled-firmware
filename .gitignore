@@ -3,12 +3,15 @@
 /validation/build*/
 /validation_mqtt_credentials/build*/
 /validation_mqtt_session/build*/
+/validation_bootid/build*/
 /managed_components/
 /validation/managed_components/
 /validation_mqtt_credentials/managed_components/
 /validation_mqtt_session/managed_components/
+/validation_bootid/managed_components/
 /sdkconfig
 /validation/sdkconfig
 /validation_mqtt_credentials/sdkconfig
 /validation_mqtt_session/sdkconfig
+/validation_bootid/sdkconfig
 *.log
