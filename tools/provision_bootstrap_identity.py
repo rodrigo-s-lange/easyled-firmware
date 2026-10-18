@@ -108,14 +108,43 @@ def self_test() -> None:
     digest = hashlib.sha256(_SELF_TEST_TEXT.encode("ascii")).hexdigest()
     if digest != _SELF_TEST_SHA256:
         raise ProvisioningError("self-test: SHA-256-over-text mismatch against the closed public vector")
-    print("self-test OK: encode/decode/SHA-256 match the closed public vector and the firmware's own tests")
+    if dump_has_written_data([]):
+        raise ProvisioningError("self-test: an empty NVS dump was classified as containing data")
+    synthetic_other_namespace = [{
+        "namespace": "pixels_state", "key": "active", "state": "Written", "is_empty": False,
+    }]
+    if not dump_has_written_data(synthetic_other_namespace):
+        raise ProvisioningError("self-test: existing data in another namespace was not detected")
+    synthetic_identity = [{
+        "namespace": NAMESPACE, "key": RECORD_KEY, "state": "Written", "is_empty": False,
+    }]
+    if not dump_has_written_data(synthetic_identity):
+        raise ProvisioningError("self-test: an existing bootstrap identity was not detected")
+    print("self-test OK: encode/decode/SHA-256 and shared-partition guards match the closed contract")
 
 
-def existing_record_present(dump_path: Path) -> bool:
-    """Runs the official nvs_tool.py against a device partition dump
-    (captured separately, e.g. via esptool read_flash) and reports whether
-    this record's namespace/key already holds a value -- the overwrite
-    check this tool cannot otherwise perform without parsing NVS itself."""
+def dump_has_written_data(parsed: object) -> bool:
+    """Return True for any written value in any namespace.
+
+    The generated image is a complete replacement for the shared `easyled`
+    partition. It is therefore safe only when the source partition contains
+    no application data at all, not merely when easyled_boot/identity is
+    absent.
+    """
+    if not isinstance(parsed, list):
+        raise ProvisioningError(f"unexpected nvs_tool.py JSON shape (not a list): {type(parsed).__name__}")
+    return any(isinstance(entry, dict) and entry.get("state") == "Written" and
+               not entry.get("is_empty", False) for entry in parsed)
+
+
+def existing_partition_has_data(dump_path: Path) -> bool:
+    """Inspect a full `easyled` dump and reject any written application data."""
+    if not dump_path.is_file():
+        raise ProvisioningError(f"existing partition dump not found: {dump_path}")
+    if dump_path.stat().st_size != EASYLED_PARTITION_SIZE:
+        raise ProvisioningError(
+            f"existing partition dump must be exactly 0x{EASYLED_PARTITION_SIZE:x} bytes"
+        )
     idf_path = os.environ.get("IDF_PATH")
     if not idf_path:
         raise ProvisioningError("IDF_PATH is not set; cannot locate nvs_tool.py to check the existing dump")
@@ -130,17 +159,9 @@ def existing_record_present(dump_path: Path) -> bool:
         parsed = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise ProvisioningError(f"could not parse nvs_tool.py output: {exc}") from exc
-    # "minimal" dumps a flat list of {"namespace", "key", "state", "is_empty",
-    # ...} entry objects in this IDF version (verified directly against a
-    # real generated image, not assumed). Any non-empty, written entry for
-    # this exact namespace/key means a record already exists.
-    if not isinstance(parsed, list):
-        raise ProvisioningError(f"unexpected nvs_tool.py JSON shape (not a list): {type(parsed).__name__}")
-    for entry in parsed:
-        if (isinstance(entry, dict) and entry.get("namespace") == NAMESPACE and entry.get("key") == RECORD_KEY and
-                entry.get("state") == "Written" and not entry.get("is_empty", False)):
-            return True
-    return False
+    # "minimal" returns written namespace/key values. Any one of them means
+    # flashing a standalone replacement image would destroy existing data.
+    return dump_has_written_data(parsed)
 
 
 def main() -> int:
@@ -151,21 +172,16 @@ def main() -> int:
                         help="Read the secret text from this environment variable instead of prompting."
                              " The variable itself is never logged by this tool; clear your shell history/"
                              " unset it afterward if your shell persists environment history.")
-    parser.add_argument("--secret", metavar="TEXT",
-                        help="Pass the secret text directly. Discouraged: visible in shell history and the"
-                             " process list on most systems. Prefer the default no-echo prompt or --secret-env.")
     parser.add_argument("--existing-dump", type=Path,
                         help="Path to a partition dump of this device's live `easyled` region (e.g. via"
                              " `esptool.py read_flash 0x190000 0x20000 dump.bin`), checked with the official"
-                             " nvs_tool.py to refuse overwriting an identity that is already provisioned.")
+                             " nvs_tool.py. The dump must contain no written application data because the"
+                             " generated image replaces the entire shared partition.")
     parser.add_argument("--confirm-fresh-partition", action="store_true",
                         help="Required when --existing-dump is omitted: an explicit acknowledgment that you"
                              " have independently confirmed the target `easyled` partition has never held a"
                              " bootstrap identity record (e.g. a factory-fresh or just-erased unit). This tool"
                              " cannot verify that claim without --existing-dump.")
-    parser.add_argument("--size", type=lambda s: int(s, 0), default=EASYLED_PARTITION_SIZE,
-                        help=f"NVS image size in bytes, must be a multiple of 4096"
-                             f" (default: 0x{EASYLED_PARTITION_SIZE:x}, the `easyled` partition's own size)")
     parser.add_argument("--self-test", action="store_true",
                         help="Run only the closed-vector self-test and exit; no hardware_id/secret/output needed.")
     args = parser.parse_args()
@@ -187,15 +203,16 @@ def main() -> int:
         print(f"error: {args.output} already exists; choose a new path, this tool never overwrites"
               " a previously generated image", file=sys.stderr)
         return 1
-    if args.size % 4096 != 0:
-        print("error: --size must be a multiple of 4096", file=sys.stderr)
-        return 1
-
     if args.existing_dump is not None:
-        if existing_record_present(args.existing_dump):
-            print(f"error: hardware_id {args.hardware_id} already has a bootstrap identity record on the"
-                  " dumped partition; this tool never overwrites an existing identity. Erase the `easyled`"
-                  " partition first if you intend to re-provision the SAME physical unit after an erase.",
+        try:
+            partition_has_data = existing_partition_has_data(args.existing_dump)
+        except ProvisioningError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if partition_has_data:
+            print("error: the dumped shared `easyled` partition contains written application data;"
+                  " refusing to generate a replacement image that would erase it. This factory tool"
+                  " accepts only a wholly blank/erased partition.",
                   file=sys.stderr)
             return 1
     elif not args.confirm_fresh_partition:
@@ -204,9 +221,7 @@ def main() -> int:
               " factory-fresh or was just erased", file=sys.stderr)
         return 1
 
-    if args.secret is not None:
-        secret_text = args.secret
-    elif args.secret_env:
+    if args.secret_env:
         secret_text = os.environ.get(args.secret_env)
         if secret_text is None:
             print(f"error: environment variable {args.secret_env} is not set", file=sys.stderr)
@@ -242,7 +257,8 @@ def main() -> int:
             return 1
         generator = Path(idf_path) / "components" / "nvs_flash" / "nvs_partition_generator" / "nvs_partition_gen.py"
         result = subprocess.run(
-            [sys.executable, str(generator), "generate", str(csv_path), str(args.output), str(args.size)],
+            [sys.executable, str(generator), "generate", str(csv_path), str(args.output),
+             hex(EASYLED_PARTITION_SIZE)],
             capture_output=True, text=True, check=False,
         )
         # Best-effort: overwrite the temp record file before TemporaryDirectory

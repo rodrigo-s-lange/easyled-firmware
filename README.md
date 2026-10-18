@@ -666,7 +666,7 @@ because of its thin DRAM margin:
   idf.py -B build -D IDF_TARGET=esp32 build
   python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build --timeout 90
   ```
-  Expected marker: `BOOTID_VALIDATION checks=158 failures=0 RESULT=ALL_PASS`.
+  Expected marker: `BOOTID_VALIDATION checks=164 failures=0 RESULT=ALL_PASS`.
 
 No real broker, backend, trust reference, or secret is used by any of the
 three targets above.

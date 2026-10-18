@@ -218,8 +218,9 @@ extern "C" void app_main()
         store.end();
     }
 
-    // Fault injection: each stage leaves an Empty store Empty (never a
-    // partial record), and a clean retry afterward succeeds.
+    // Fault injection before an SDK write leaves the store Empty and allows
+    // a clean retry. Once an SDK write is attempted, the runtime fails closed
+    // as Faulted until reboot/load resolves the durable result.
     for (int fault = static_cast<int>(StoreTestFault::BeforeWrite);
          fault <= static_cast<int>(StoreTestFault::DuringReadback); ++fault) {
         CHECK(nvs_flash_erase_partition("easyled") == ESP_OK);
@@ -228,9 +229,24 @@ extern "C" void app_main()
         CHECK(store.state() == SecretState::Empty);
         store.setFaultInjectionForTest(static_cast<StoreTestFault>(fault));
         CHECK(store.provision(kVectorBytes) != ESP_OK);
-        CHECK(store.state() == SecretState::Empty); // RAM unchanged; no partial record assumed
-        CHECK(store.provision(kVectorBytes) == ESP_OK); // fault cleared automatically; clean retry succeeds
-        CHECK(store.state() == SecretState::Valid);
+        const auto injected = static_cast<StoreTestFault>(fault);
+        if (injected == StoreTestFault::BeforeWrite || injected == StoreTestFault::DuringWrite) {
+            CHECK(store.state() == SecretState::Empty);
+            CHECK(store.provision(kVectorBytes) == ESP_OK);
+            CHECK(store.state() == SecretState::Valid);
+        } else {
+            CHECK(store.state() == SecretState::Faulted);
+            CHECK(store.provision(kVectorBytes) == ESP_ERR_INVALID_STATE); // uncertain result cannot be overwritten
+        }
+        store.end();
+
+        // Reboot/load is the authority after an uncertain durable write.
+        CHECK(store.init(kHardwareIdA) == ESP_OK);
+        if (injected == StoreTestFault::DuringCommit) {
+            CHECK(store.state() == SecretState::Faulted); // committed synthetic garbage
+        } else {
+            CHECK(store.state() == SecretState::Valid); // no write, clean retry, or committed valid record
+        }
         store.end();
     }
 

@@ -153,6 +153,7 @@ BootstrapIdentityStore::~BootstrapIdentityStore()
 
 esp_err_t BootstrapIdentityStore::load()
 {
+    std::memset(secret_, 0, sizeof(secret_));
     WireRecord wire{};
     size_t size = sizeof(wire);
     const esp_err_t err = nvs_get_blob(handle_, kRecordKey, &wire, &size);
@@ -201,6 +202,9 @@ void BootstrapIdentityStore::end()
         handle_ = 0;
     }
     initialized_ = false;
+    state_ = SecretState::Empty;
+    std::memset(hardware_id_, 0, sizeof(hardware_id_));
+    std::memset(secret_, 0, sizeof(secret_));
 }
 
 SecretState BootstrapIdentityStore::state() const
@@ -233,11 +237,13 @@ esp_err_t BootstrapIdentityStore::provision(const uint8_t secret[kSecretBytes])
     sealWithCrc(wire);
 
     esp_err_t err;
+    bool sdk_write_attempted = false;
     if (fault_for_test_ == StoreTestFault::BeforeWrite) {
         err = ESP_FAIL;
     } else if (fault_for_test_ == StoreTestFault::DuringWrite) {
         err = ESP_FAIL;
     } else {
+        sdk_write_attempted = true;
         err = nvs_set_blob(handle_, kRecordKey, &wire, sizeof(wire));
         if (err == ESP_OK) {
             if (fault_for_test_ == StoreTestFault::DuringCommit) {
@@ -269,7 +275,15 @@ esp_err_t BootstrapIdentityStore::provision(const uint8_t secret[kSecretBytes])
         }
     }
     fault_for_test_ = StoreTestFault::None;
-    if (err != ESP_OK) { return err; } // store left exactly as it was
+    if (err != ESP_OK) {
+        // Once an SDK write was attempted, flash may contain no record, a
+        // committed valid record, or an invalid/partial record. Do not leave
+        // RAM at Empty, because that would allow a second provision() call to
+        // overwrite an uncertain first result without a reboot/load or erase.
+        if (sdk_write_attempted) { state_ = SecretState::Faulted; }
+        std::memset(secret_, 0, sizeof(secret_));
+        return err;
+    }
 
     std::memcpy(secret_, secret, kSecretBytes);
     state_ = SecretState::Valid;

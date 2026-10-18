@@ -81,9 +81,11 @@ enum class StoreTestFault : uint8_t {
 ///
 /// Durability model: one self-contained record (schema + hardware_id +
 /// 32-byte secret + CRC32), written with a single `nvs_set_blob()` +
-/// `nvs_commit()` + readback-verify; RAM mirrors the record only once that
-/// write is itself confirmed, so a failure anywhere in it leaves both RAM
-/// and the durable record exactly as they were. On load, an empty namespace
+/// `nvs_commit()` + readback-verify; RAM exposes the secret only once that
+/// write is confirmed. A failure before an SDK write leaves the state Empty;
+/// once a write has been attempted, any failure changes the in-memory state
+/// to Faulted until reboot/load determines whether flash contains Empty,
+/// Valid or Faulted data. On load, an empty namespace
 /// is `Empty`; a present-but-invalid (wrong size, bad magic/schema, CRC
 /// mismatch) or eFuse-mismatched record is `Faulted`, never silently
 /// reinterpreted as `Empty` -- the caller must not provision over a record
@@ -124,8 +126,10 @@ public:
     /// @param secret Exactly kSecretBytes bytes.
     /// @return ESP_OK after a verified commit+readback,
     ///         ESP_ERR_INVALID_STATE when state() != Empty, or a storage
-    ///         error -- the store is left exactly as it was on any
-    ///         non-ESP_OK return.
+    ///         error. A failure after an SDK write was attempted leaves the
+    ///         runtime state Faulted so a retry cannot silently overwrite an
+    ///         uncertain durable result; reboot/load or explicit erase is
+    ///         required to resolve it.
     esp_err_t provision(const uint8_t secret[kSecretBytes]);
 
     /// Test-only: see StoreTestFault. Cleared back to None automatically

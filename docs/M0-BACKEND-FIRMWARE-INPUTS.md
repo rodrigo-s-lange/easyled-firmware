@@ -70,8 +70,11 @@ irreversible manufacturing security work, not part of this round.
   from this bootstrap secret.
 - The plaintext secret is provisioned through the per-device NVS image/tool
   above, over the physical manufacturing/bench connection, into its own
-  namespace (`easyled_boot`) in the existing `easyled` NVS partition. The
-  firmware reads it into bounded RAM at boot and never logs it.
+  namespace (`easyled_boot`) in the existing `easyled` NVS partition. Because
+  the tool creates a complete partition image, it runs only against a wholly
+  blank/erased `easyled` partition and refuses a dump containing any written
+  namespace. The firmware reads the secret into bounded RAM at boot and never
+  logs it.
 - The real secret is never compiled into source, committed, exposed through
   diagnostics, or returned from an API -- audited by code inspection and
   enforced structurally (the tool never prints it; the firmware's own log

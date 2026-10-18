@@ -103,26 +103,29 @@ same physical unit is always onto a freshly erased, `Empty` store (Section 5).
 
 ## 4. Provisioning procedure (placeholder values only)
 
-Prerequisite: the target's `easyled` partition must be known-fresh (factory
-image, or just erased) before running this. The tool refuses to overwrite an
-identity it can detect; see `--existing-dump` below for how to let it detect
-one at all.
+Prerequisite: the target's entire shared `easyled` partition must be
+known-fresh (factory image, or just erased) before running this. The generated
+file is a complete 128 KiB replacement partition image, not a key-level patch.
+The tool therefore refuses a dump containing **any** written application value
+in any namespace, including pixel state, journals, telemetry, MQTT credentials
+or a prior identity. See `--existing-dump` below.
 
 ```powershell
 # One-time: confirm the firmware's own self-test matches the tool's.
 python tools/provision_bootstrap_identity.py --self-test
 
 # Recommended: dump the target's existing `easyled` region first (non-destructive)
-# so the tool can refuse a real overwrite instead of trusting an operator claim.
+# so the tool can prove the whole shared partition is blank instead of trusting
+# an operator claim.
 python -m esptool --port COMx read-flash 0x190000 0x20000 easyled-before.bin
 
 python tools/provision_bootstrap_identity.py `
     --hardware-id 142b2fdcfa5c `
     --output identity-142b2fdcfa5c.bin `
     --existing-dump easyled-before.bin
-# Prompts for the secret text with input hidden (no echo). --secret-env
-# NAME or --secret TEXT are also accepted -- see --help for the tradeoffs
-# of each (the latter is visible in shell history/process list).
+# Prompts for the secret text with input hidden (no echo). --secret-env NAME
+# is available for controlled automation. There is deliberately no command-line
+# secret option because process lists and shell history would expose it.
 
 # Printed only: hardware_id, destination path, schema, "OK" -- never the secret.
 
@@ -132,6 +135,10 @@ python -m esptool --port COMx write-flash 0x190000 identity-142b2fdcfa5c.bin
 Without a usable `--existing-dump`, the tool requires an explicit
 `--confirm-fresh-partition` flag instead — a deliberate acknowledgment that
 the operator, not the tool, is vouching for the partition being blank.
+
+The image size and flash offset are fixed to the checked-in partition table
+(`0x20000` bytes at `0x190000`); the CLI does not accept operator overrides
+that could cross a partition boundary.
 
 The tool never contacts a network, never flashes hardware itself (printing
 the exact `esptool` command instead), and is not reachable through any MQTT
@@ -184,13 +191,16 @@ trip reproduces the text exactly, and `tools/provision_bootstrap_identity.py
 | `esptool erase-flash`, an explicit erase of the `easyled` partition, or writing an incompatible partition table | Lost — `BootstrapIdentityStore::init()` loads `Empty`; the unit needs physical re-provisioning |
 | Re-provisioning the **same** physical unit after such an erase | Allowed, from a custodied copy of the same secret: `provision()` only ever refuses when `state() != Empty`, so a freshly erased (hence `Empty`) store accepts a new `provision()` call for that same `hardware_id` without any new backend claim being required |
 | Attempting to provision a **different** identity (swap) onto a unit that still holds a valid record | Refused — out of scope this round; `provision()` requires `Empty`, and the CLI's `--existing-dump` check independently refuses before ever generating an image |
-| Power loss during `provision()` itself | The store is left exactly as it was before the call (write + commit + verified readback, same durability model as the #47-B credential store); a record is never partially visible. Power loss **during image generation on the host** leaves no partition touched at all — nothing has been flashed yet |
+| Failure before the firmware store starts an SDK write | State remains `Empty`; a clean retry is allowed |
+| Failure after an SDK write starts | Runtime changes to `Faulted` and refuses another write. After reboot, loading the CRC-protected record resolves it as `Empty`, `Valid` or `Faulted`; it never authorizes MQTT with uncertain bytes |
+| Power loss while generating the host image | No flash was touched; generation may be repeated |
+| Power loss while flashing the complete `easyled` image | The partition may be incomplete and boot fails closed as `Empty`/`Faulted`. Because this CLI is restricted to an already blank/erased partition, no pre-existing application data may be sacrificed. Erase the partition and repeat physical provisioning |
 | Backup (`--existing-dump`'s read-back image) reused to "restore" a secret onto a **different** physical unit | Not a supported flow and not what this mechanism is for: the firmware's own `init()` cross-checks the record's `hardware_id` against the live eFuse value and reports `Faulted` for any mismatch, so a cloned image never silently activates on the wrong unit |
 
 ## 8. Automated evidence
 
 - `validation_bootid/` (new, focused target; frozen `validation/` untouched):
-  **158/158 checks, `ALL_PASS`**, confirmed by `run_qemu.py` exit code 0.
+  **164/164 checks, `ALL_PASS`**, confirmed by `run_qemu.py` exit code 0.
   Covers: `macToHardwareId()` against synthetic MAC bytes including this
   unit's own; the full closed vector (bytes/text/SHA-256/header, including
   proof a NUL never enters the hash or header); `decodeSecretText()`
