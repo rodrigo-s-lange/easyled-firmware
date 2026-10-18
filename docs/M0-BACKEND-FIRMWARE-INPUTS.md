@@ -34,7 +34,7 @@ The `easyled` NVS partition is durable but is not encrypted in the current
 build. Secure boot and flash encryption are also disabled. The current image
 must not be described as field-secure secret storage.
 
-### Agreed implementation direction
+### Recommended implementation direction
 
 - Generate one independent high-entropy bootstrap secret per physical unit.
   Recommended representation: 32 random bytes encoded as unpadded base64url
