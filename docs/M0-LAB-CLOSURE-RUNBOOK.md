@@ -89,6 +89,13 @@ bloqueado e será necessário implementar primeiro os clientes de claimability,
 claim e credencial HTTPS. Essa é uma frente de produto maior e não deve ser
 improvisada durante o ensaio.
 
+**Decisão da plataforma em 2026-10-18:** a exceção assistida acima foi aceita
+como procedimento técnico do M0. Não será necessário ampliar agora o firmware
+com clientes de claimability ou de emissão HTTPS. Isso ainda não é uma
+liberação operacional: a plataforma documentará e ensaiará a exceção, e a
+execução real dependerá da autorização de Rodrigo e da confirmação do
+ambiente. Até essa liberação, não gravar o segredo operacional nem iniciar G2.
+
 - [ ] Confirmação de que `hardware_id=142b2fdcfa5c` foi cadastrado na linha de
   fabricação/binding correto.
 - [ ] `device_id`, `hardware_binding_id` e `generation` definitivos para esta
