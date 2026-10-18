@@ -21,7 +21,32 @@ class NetworkSession {
 public:
     static constexpr size_t kMaxMessageBytes = 1024;
     static constexpr UBaseType_t kQueueLength = 2;
+    /// MQTT/TLS certificate-date validation needs a plausible wall clock.
+    /// This session will not start MQTT, and a caller should not call into
+    /// any MQTT-identity controller/tick either, before `std::time(nullptr)`
+    /// reaches this value (2024-01-01T00:00:00Z) -- see poll()'s own gate and
+    /// docs/MQTT-SESSION-INTEGRATION-TASK.md, "o mesmo portão de relógio".
+    static constexpr int64_t kMinPlausibleUnixTime = 1704067200;
 
+    /// Wi-Fi-only identity: ssid/password alone, no MQTT broker/credential.
+    struct WifiConfig {
+        const char *ssid = nullptr;
+        const char *wifi_password = nullptr;
+    };
+
+    /// MQTT-only identity: one broker/credential/command-topic set. Strings
+    /// must remain valid until the next configureMqtt()/restartMqtt()/endMqtt()
+    /// or end().
+    struct MqttConfig {
+        const char *broker_uri = nullptr; // wss:// only; no userinfo in URI.
+        const char *client_id = nullptr;
+        const char *username = nullptr;
+        const char *password = nullptr;
+        const char *command_topic = nullptr; // Exact topic, never a wildcard.
+        const char *server_ca_pem = nullptr; // Null uses the ESP-IDF certificate bundle.
+    };
+
+    /// Combined Wi-Fi + MQTT identity, for init()'s compatibility wrapper.
     struct Config {
         const char *ssid = nullptr;
         const char *wifi_password = nullptr;
@@ -47,6 +72,14 @@ public:
         uint32_t queue_overflows;
         uint32_t transport_errors;
         uint32_t publish_acks;
+        /// Bumped on every MQTT disconnect and every deliberate MQTT
+        /// teardown (restartMqtt()/endMqtt()/stop()/end()), including one
+        /// that delivers no DISCONNECTED callback at all (for example a
+        /// deliberate client destruction). A caller that snapshots this
+        /// value right after restartMqtt()/configureMqtt() returns can
+        /// detect "something about this connection already changed since my
+        /// attempt started" without needing any further per-attempt state.
+        uint32_t connection_epoch;
     };
 
     /// Broker acknowledgement of one QoS1 enqueue, as last observed by this
@@ -66,10 +99,48 @@ public:
     NetworkSession &operator=(const NetworkSession &) = delete;
 
     /// Prepares the MQTT client without starting Wi-Fi or the MQTT task.
+    /// Compatibility wrapper for laboratory mode and existing callers/tests:
+    /// equivalent to initWifi() followed by configureMqtt() with this same
+    /// Config's respective fields, with the same all-or-nothing validation.
     /// @param config Configuration whose strings must remain valid until end().
     /// @return ESP_OK, ESP_ERR_INVALID_ARG/STATE, or an SDK allocation/setup error.
     esp_err_t init(const Config &config);
-    /// Starts Wi-Fi; MQTT starts from poll() once IP and a valid TLS clock exist.
+    /// Prepares Wi-Fi and the bounded incoming-message queue only. No MQTT
+    /// client exists yet -- configureMqtt()/restartMqtt() may be called
+    /// later, at any point before or after start(), to add or change the
+    /// MQTT identity without ever repeating this call.
+    /// @param config Configuration whose strings must remain valid until end().
+    /// @return ESP_OK, ESP_ERR_INVALID_ARG/STATE, or ESP_ERR_NO_MEM.
+    esp_err_t initWifi(const WifiConfig &config);
+    /// Creates the MQTT client for a session that has no MQTT identity yet
+    /// (initWifi() only, or after endMqtt()). Does not start Wi-Fi and does
+    /// not touch any existing Wi-Fi connection. Use restartMqtt() instead
+    /// once an MQTT client already exists.
+    /// @param config Configuration whose strings must remain valid until the
+    ///        next configureMqtt()/restartMqtt()/endMqtt() or end().
+    /// @return ESP_OK, ESP_ERR_INVALID_ARG/STATE (Wi-Fi not yet initialized,
+    ///         or an MQTT client already exists), or an SDK setup error.
+    esp_err_t configureMqtt(const MqttConfig &config);
+    /// Ends whatever MQTT identity is live (safe if none yet) and creates a
+    /// new one, without disconnecting Wi-Fi, without touching SNTP/trusted
+    /// time, and without affecting durable pixel state or rendering. Clears
+    /// queued/incomplete inbound commands from the previous identity and
+    /// invalidates every previously tracked publish to PublishAck::Unknown
+    /// (see Status::connection_epoch); a callback already in flight from the
+    /// destroyed client cannot mark the new identity connected or subscribed
+    /// -- see event()'s own stale-client guard.
+    /// @param config Configuration whose strings must remain valid until the
+    ///        next configureMqtt()/restartMqtt()/endMqtt() or end().
+    /// @return ESP_OK, ESP_ERR_INVALID_ARG/STATE (Wi-Fi not yet initialized),
+    ///         or an SDK stop/destroy/setup error.
+    esp_err_t restartMqtt(const MqttConfig &config);
+    /// Ends the current MQTT identity, if any, leaving Wi-Fi, IP, trusted
+    /// wall clock, durable pixel state and rendering untouched. Idempotent.
+    /// @return ESP_OK, or an SDK stop/destroy error.
+    esp_err_t endMqtt();
+    /// Starts Wi-Fi; MQTT starts from poll() once IP, a valid TLS clock and a
+    /// configured MQTT client (from init()/configureMqtt()/restartMqtt())
+    /// all exist. Valid to call before any MQTT identity exists.
     /// @return ESP_OK or the Wi-Fi initialization error; no scene is modified.
     esp_err_t start();
     /// Performs one connection-maintenance step, never waiting for network I/O.
@@ -116,7 +187,12 @@ public:
     /// never start()), then calls this directly with synthesized events to
     /// drive CONNECTED/SUBSCRIBED/DISCONNECTED/PUBLISHED/ERROR sequences
     /// without any real Wi-Fi, broker or FreeRTOS task. Production code never
-    /// calls this directly; it arrives only through the registered callback.
+    /// calls this directly; it arrives only through the registered callback,
+    /// which (unlike this method) also drops any event whose own
+    /// `event.client` no longer matches the live client -- a late callback
+    /// queued from a client that restartMqtt()/endMqtt()/end() has since
+    /// destroyed. That filter lives in the callback glue, not here, so this
+    /// test seam is unaffected by it.
     /// On MQTT_EVENT_CONNECTED this still calls the real
     /// esp_mqtt_client_subscribe() unless setSubscribeOverrideForTest() has
     /// replaced it -- that SDK call requires an actually-established
@@ -139,6 +215,20 @@ public:
 private:
     static void onEvent(void *arg, esp_event_base_t base, int32_t id, void *data);
 
+    static bool validWifiConfig(const WifiConfig &config);
+    static bool validMqttConfig(const MqttConfig &config);
+    /// Builds the esp_mqtt_client_config_t, calls esp_mqtt_client_init() and
+    /// registers onEvent(). On any failure client_ is destroyed and left
+    /// null. Does not touch config_, trackers or the incoming queue -- every
+    /// caller (init(), configureMqtt()) does that itself afterward.
+    esp_err_t createMqttClient(const MqttConfig &config);
+    /// Shared MQTT-only teardown used by both endMqtt() and restartMqtt():
+    /// stops (if started), destroys the client, bumps connection_epoch_ so
+    /// every previously tracked publish becomes Unknown, and clears
+    /// subscription/queue state from the old identity. Requires client_ !=
+    /// nullptr; leaves client_ null on return.
+    esp_err_t teardownMqtt();
+
     static constexpr size_t kMaxTrackedPublishes = 8;
     struct TrackedPublish {
         // One atomic word prevents the MQTT callback from acknowledging a
@@ -155,6 +245,7 @@ private:
     static uint32_t trackedState(int msg_id, uint32_t epoch, bool acknowledged);
 
     Config config_{};
+    bool wifi_ready_ = false; // true once initWifi()/init() has prepared Wi-Fi + the queue.
     esp_mqtt_client_handle_t client_ = nullptr;
     bool mqtt_started_ = false; // Application task only.
     int64_t next_wifi_retry_us_ = 0;
@@ -166,7 +257,7 @@ private:
     std::atomic<bool> subscribed_{false};
     std::atomic<bool> reconnect_requested_{false};
     std::atomic<uint32_t> connections_{0}, rejected_{0}, overflow_{0}, errors_{0}, acknowledged_{0};
-    std::atomic<uint32_t> connection_epoch_{1}; // bumped on every disconnect
+    std::atomic<uint32_t> connection_epoch_{1}; // bumped on every disconnect/deliberate MQTT teardown; see Status::connection_epoch
     TrackedPublish tracked_[kMaxTrackedPublishes]{};
     int (*subscribe_override_)(const char *topic, int qos) = nullptr; // test-only; see setSubscribeOverrideForTest()
     QueueHandle_t messages_ = nullptr;

@@ -317,6 +317,99 @@ Só depois dela resolvida é que a ligação do `MqttSessionController` a um `Ne
 tem onde pousar; os valores reais de `trust_ref`/URL/token continuam sendo necessários antes de
 qualquer teste de ponta a ponta contra um ambiente real, mas a arquitetura em si não depende deles.
 
+**Resolvida em 2026-10-18** — ver "Integração da sessão real" abaixo, abaixo do
+`Fechamento e publicação` desta rodada original. Esta seção permanece como registro histórico
+do bloqueio identificado nesta rodada; não foi editada retroativamente.
+
+## Integração da sessão real (docs/MQTT-SESSION-INTEGRATION-TASK.md, 2026-10-18)
+
+Tarefa separada, executada em worktree/branch próprios (`feat/mqtt-session-provisioning-integration`),
+branching do commit de documentação desta própria tarefa (`b8b6571`, posterior a `51817bf`/`cfc50d0`
+abaixo). Resolve exatamente o bloqueio da Seção 7/`Próxima tarefa` acima: `NetworkSession` agora separa
+Wi-Fi de identidade MQTT, e o `MqttSessionController` está ligado a uma sessão real através de um novo
+adaptador dedicado.
+
+**Camada**: aplicação/produto, como sempre. Mudanças confinadas a `components/pixels_network/`
+(a API dividida), um componente novo e pequeno `components/pixels_mqtt_session_adapter/`
+(o adaptador — depende de `pixels_network` e `pixels_mqtt_credentials`, mas nenhum dos dois depende
+dele nem um do outro), `components/pixels_mqtt_credentials/pixels_mqtt_credentials.cpp` (apenas
+`MqttSessionController::tick()`/novo `attemptWith()` — o parser, o formato A/B, `hardware_id`,
+`generation`, a contagem de rodadas e a classificação pré-auth continuam **intocados**) e `main.cpp`.
+Nenhuma mudança em `esp32libfun`, Composer, efeitos ou `easyled-platform`.
+
+**API dividida de `NetworkSession`**: `initWifi()`/`configureMqtt()`/`restartMqtt()`/`endMqtt()` novos;
+`init(Config)` continua existindo, inalterado byte a byte, como wrapper de compatibilidade para o modo
+laboratório e para a própria suíte de testes de `NetworkSession` (seam `event()`, inalterado). Um novo
+campo `Status::connection_epoch` expõe o contador de época já existente internamente (antes só usado
+por `publishStatus()`), que é o único contador adicional necessário para que o adaptador atribua
+eventos de conexão/erro à tentativa atual. `restartMqtt()` nunca toca Wi-Fi/SNTP/estado durável; invalida
+toda publicação rastreada da identidade anterior para `Unknown` mesmo sem um `DISCONNECTED` real (destruição
+deliberada do cliente ESP-MQTT nunca entrega esse evento); limpa fragmentos/assinatura pendentes. A
+destruição do cliente ESP-MQTT 1.1.0 (confirmado lendo `managed_components/espressif__mqtt/mqtt_client.c`
+vendorizado) descarta o outbox QoS1 do cliente antigo e é síncrona (`esp_mqtt_client_stop()` bloqueia até
+a tarefa MQTT confirmar parada) — mas `onEvent()` ainda compara `event.client` contra o handle vivo antes
+de despachar para `event()`, em vez de depender só desse detalhe vendorizado, para que a garantia
+"nenhum callback tardio do cliente destruído confirma a nova sessão" seja explícita e independente da
+versão do SDK.
+
+**Adaptador** (`NetworkSessionMqttTransport`, em `pixels_mqtt_session_adapter`): copia toda string do
+`MqttSessionIdentity` recebido em `restart()` para buffers próprios antes de chamar
+`NetworkSession::restartMqtt()` — a credencial/pendente do store nunca é emprestada pela sessão real.
+Recebe um `pixels_mqtt::MonotonicClock` injetado (a mesma interface do coordenador) especificamente para
+que os caminhos de timeout (conexão inicial, 20 s) e de deadline de reconexão pós-confirmação (60 s)
+sejam determinísticos em teste, sem espera real — decisão tomada ao notar que chamar `esp_timer_get_time()`
+direto tornaria exatamente os dois comportamentos mais centrais desta tarefa (timeout e deadline) não
+testáveis sem um QEMU esperando minutos reais.
+
+**`MqttSessionController` ganhou exatamente dois comportamentos novos**, nenhum deles reabrindo o store/
+coordenador: (1) em `CurrentConfirmed` sem `pending`, quando o coordenador não tem nada a decidir sobre
+seleção de credencial, o controlador mesmo assim faz uma tentativa de reconexão com `current`, marcada
+duravelmente via `beginAttempt(false)` como qualquer outra tentativa — nunca requisita bootstrap só por
+causa do reboot; (2) uma vez `ready()`, `tick()` continua amostrando o adaptador em vez de ficar ocioso, de
+modo que uma perda breve é absorvida silenciosamente (sem reportar o CONNACK de reconexão automática como
+nova promoção) e só um deadline limitado sem CONNACK novo reporta `Ambiguous` de verdade, caindo no caminho
+existente de retry ambíguo/`current` e, no limite de rodadas já existente, em `BootstrapRecovery`. Um
+detalhe de ordenação corrigido durante a implementação (não um bug de produção, nunca chegou a ser
+commitado): o coordenador precisa ser consultado **antes** do atalho "só monitorar", porque uma rotação
+pode persistir um `pending` novo a qualquer momento, inclusive enquanto `ready()` já é verdadeiro — testado
+explicitamente em `validation_mqtt_session/` (uma rotação durante `ready()` deve preemptar o monitoramento
+no mesmo `tick()`, nunca esperar a sessão antiga falhar primeiro).
+
+**CONNACK vs. SUBACK**: inalterado em espírito, agora de ponta a ponta real. O adaptador reporta
+`Connected` no primeiro `MQTT_EVENT_CONNECTED` real da tentativa atual, antes de qualquer SUBACK — isso
+promove a credencial duravelmente. A assinatura QoS1 do `cmd` (`NetworkSession::status().subscribed`)
+continua sendo o portão separado, mais forte, para comandos/telemetria, exatamente como no modo
+laboratório desde sempre.
+
+**Tópicos roteados pela credencial**: `pixels_mqtt_session::ProvisionedTopics` é um snapshot pequeno, de
+endereço estável; `MqttEventSink`/`MqttTelemetrySink` capturam um ponteiro para dentro dele uma vez, na
+construção, e `rotateProvisionedTopics()` sobrescreve os 4 campos em uma chamada só, exatamente quando
+`ready()` fica verdadeiro — nunca há intervalo em que um comando de uma identidade publique em tópico de
+outra, e os sinks/o executor de comandos nunca são reconstruídos. Modo laboratório nunca chama essa função;
+continua usando os tópicos literais de `ApplicationConfig`.
+
+**Validação**: novo target `validation_mqtt_session/` — **98/98 checks, ALL_PASS**, confirmado pelo
+`run_qemu.py` com exit code 0. Prova a API dividida de `NetworkSession` via seu próprio seam `event()`
+(sem Wi-Fi real), o adaptador real contra uma `NetworkSession` real (timeout, erro/desconexão pré-CONNACK,
+rejeição de evidência obsoleta, posse das strings de identidade), a rotação de tópicos, e a cadeia completa
+controlador+adaptador+sessão para reconexão a frio, perda breve e o caminho com deadline limitado até
+`BootstrapRecovery`. `validation_mqtt_credentials/` permanece **298/298 ALL_PASS** sem nenhum caso novo
+(a correção de ordenação do controlador citada acima foi verificada contra esta suíte já existente antes
+de qualquer código novo em `validation_mqtt_session/`). `validation/` congelada permanece **468/468
+ALL_PASS**, 772 B de DRAM livre, inalterado. Build do produto limpo.
+
+**Bug de ambiente encontrado e corrigido, não relacionado ao código desta tarefa**: o fixture
+`validation_mqtt_credentials/fixtures/device-response.v1.json` (1257 B, pretty-printed, com 32 quebras de
+linha) estava com 1289 B no working tree desta máquina Windows — `core.autocrlf=true` global convertendo
+LF→CRLF no checkout, sem nenhum `.gitattributes` no repositório para impedir isso num fixture cujo
+tamanho/SHA-256 exatos são verificados. Corrigido com `.gitattributes` (`**/fixtures/*.json text eol=lf`)
+na raiz do repositório, mais a restauração do arquivo ao conteúdo exato do blob do Git. Nenhuma mudança de
+configuração do Git local ou global foi feita.
+
+**Nenhum segredo, endpoint real, broker real ou outro repositório foi tocado** nesta tarefa. Ver
+README.md, seção "Provisioned MQTT session integration", para a descrição completa voltada ao
+desenvolvedor, e `docs/MQTT-SESSION-INTEGRATION-TASK.md` para a especificação original.
+
 ## Rodada corretiva 2: correção final pequena sobre `a950abf`
 
 Cinco correções pontuais, sem reabrir parser, formato A/B, `hardware_id`, `generation`,

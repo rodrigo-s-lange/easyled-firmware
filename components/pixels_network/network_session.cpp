@@ -19,21 +19,22 @@ bool topic(const char *s)
 }
 } // namespace
 
-esp_err_t NetworkSession::init(const Config &config)
+bool NetworkSession::validWifiConfig(const WifiConfig &config)
 {
-    if (client_ != nullptr) { return ESP_ERR_INVALID_STATE; }
-    if (!text(config.ssid, 32) || !text(config.broker_uri, 255) ||
-        std::strncmp(config.broker_uri, "wss://", 6) != 0 ||
-        config.broker_uri[6] == '\0' || std::strchr(config.broker_uri, '@') != nullptr ||
-        !text(config.client_id, 64) || !text(config.username, 64) ||
-        !text(config.password, 256) || !topic(config.command_topic) ||
-        (config.wifi_password != nullptr && strnlen(config.wifi_password, 65) > 64)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    next_tracked_slot_ = 0;
-    connection_epoch_ = 1;
-    acknowledged_ = 0;
-    for (auto &slot : tracked_) { slot.state = 0; }
+    return text(config.ssid, 32) &&
+        (config.wifi_password == nullptr || strnlen(config.wifi_password, 65) <= 64);
+}
+
+bool NetworkSession::validMqttConfig(const MqttConfig &config)
+{
+    return text(config.broker_uri, 255) && std::strncmp(config.broker_uri, "wss://", 6) == 0 &&
+        config.broker_uri[6] != '\0' && std::strchr(config.broker_uri, '@') == nullptr &&
+        text(config.client_id, 64) && text(config.username, 64) && text(config.password, 256) &&
+        topic(config.command_topic);
+}
+
+esp_err_t NetworkSession::createMqttClient(const MqttConfig &config)
+{
     esp_mqtt_client_config_t cfg{};
     cfg.broker.address.uri = config.broker_uri;
     if (config.server_ca_pem != nullptr) {
@@ -60,6 +61,24 @@ esp_err_t NetworkSession::init(const Config &config)
         client_ = nullptr;
         return err;
     }
+    return ESP_OK;
+}
+
+esp_err_t NetworkSession::init(const Config &config)
+{
+    if (wifi_ready_ || client_ != nullptr) { return ESP_ERR_INVALID_STATE; }
+    const WifiConfig wifi_config{config.ssid, config.wifi_password};
+    const MqttConfig mqtt_config{config.broker_uri, config.client_id, config.username,
+                                 config.password, config.command_topic, config.server_ca_pem};
+    if (!validWifiConfig(wifi_config) || !validMqttConfig(mqtt_config)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    next_tracked_slot_ = 0;
+    connection_epoch_ = 1;
+    acknowledged_ = 0;
+    for (auto &slot : tracked_) { slot.state = 0; }
+    const esp_err_t err = createMqttClient(mqtt_config);
+    if (err != ESP_OK) { return err; }
     messages_ = xQueueCreateStatic(kQueueLength, sizeof(Message), queue_storage_, &queue_control_);
     if (messages_ == nullptr) {
         esp_mqtt_client_destroy(client_);
@@ -67,12 +86,92 @@ esp_err_t NetworkSession::init(const Config &config)
         return ESP_ERR_NO_MEM;
     }
     config_ = config;
+    wifi_ready_ = true;
     return ESP_OK;
+}
+
+esp_err_t NetworkSession::initWifi(const WifiConfig &config)
+{
+    if (wifi_ready_ || client_ != nullptr) { return ESP_ERR_INVALID_STATE; }
+    if (!validWifiConfig(config)) { return ESP_ERR_INVALID_ARG; }
+    messages_ = xQueueCreateStatic(kQueueLength, sizeof(Message), queue_storage_, &queue_control_);
+    if (messages_ == nullptr) { return ESP_ERR_NO_MEM; }
+    config_.ssid = config.ssid;
+    config_.wifi_password = config.wifi_password;
+    wifi_ready_ = true;
+    return ESP_OK;
+}
+
+esp_err_t NetworkSession::configureMqtt(const MqttConfig &config)
+{
+    if (!wifi_ready_ || client_ != nullptr) { return ESP_ERR_INVALID_STATE; }
+    if (!validMqttConfig(config)) { return ESP_ERR_INVALID_ARG; }
+    const esp_err_t err = createMqttClient(config);
+    if (err != ESP_OK) { return err; }
+    next_tracked_slot_ = 0;
+    ++connection_epoch_; // a new MQTT identity boundary, even for the first one
+    acknowledged_ = 0;
+    for (auto &slot : tracked_) { slot.state = 0; }
+    mqtt_started_ = false;
+    next_mqtt_retry_us_ = 0;
+    config_.broker_uri = config.broker_uri;
+    config_.client_id = config.client_id;
+    config_.username = config.username;
+    config_.password = config.password;
+    config_.command_topic = config.command_topic;
+    config_.server_ca_pem = config.server_ca_pem;
+    return ESP_OK;
+}
+
+esp_err_t NetworkSession::teardownMqtt()
+{
+    if (mqtt_started_) {
+        const esp_err_t err = esp_mqtt_client_stop(client_);
+        if (err != ESP_OK) { return err; }
+        mqtt_started_ = false;
+    }
+    // esp_mqtt_client_destroy() joins and frees the client's own event task
+    // (synchronous from this control task, which never calls it from inside
+    // an MQTT callback), and with it the client's own QoS1 outbox -- nothing
+    // from the old identity's outbox survives destruction or is redelivered
+    // under the new one. onEvent()'s event.client guard additionally rejects
+    // any callback already queued from this exact handle before destroy()
+    // completes, so it cannot be mistaken for the new identity either.
+    const esp_err_t destroyed = esp_mqtt_client_destroy(client_);
+    if (destroyed != ESP_OK) { return destroyed; }
+    client_ = nullptr;
+    subscribed_ = false;
+    subscribe_id_ = -1;
+    reconnect_requested_ = false;
+    incoming_.reset();
+    if (messages_ != nullptr) { xQueueReset(messages_); }
+    // A session boundary even though no DISCONNECTED callback is delivered
+    // for a deliberate destruction: every publish tracked under the old
+    // identity becomes Unknown to publishStatus() from here on.
+    ++connection_epoch_;
+    return ESP_OK;
+}
+
+esp_err_t NetworkSession::restartMqtt(const MqttConfig &config)
+{
+    if (!wifi_ready_) { return ESP_ERR_INVALID_STATE; }
+    if (!validMqttConfig(config)) { return ESP_ERR_INVALID_ARG; }
+    if (client_ != nullptr) {
+        const esp_err_t err = teardownMqtt();
+        if (err != ESP_OK) { return err; }
+    }
+    return configureMqtt(config);
+}
+
+esp_err_t NetworkSession::endMqtt()
+{
+    if (client_ == nullptr) { return ESP_OK; }
+    return teardownMqtt();
 }
 
 esp_err_t NetworkSession::start()
 {
-    if (client_ == nullptr || running_.load()) { return ESP_ERR_INVALID_STATE; }
+    if (!wifi_ready_ || running_.load()) { return ESP_ERR_INVALID_STATE; }
     const esp_err_t err = esp32libfun::wifi.begin(config_.ssid, config_.wifi_password);
     if (err != ESP_OK) { return err; }
     running_ = true;
@@ -99,9 +198,10 @@ esp_err_t NetworkSession::poll()
     }
     wifi_retry_ms_ = 1000;
     next_wifi_retry_us_ = now + 1000000;
+    if (client_ == nullptr) { return ESP_OK; } // Wi-Fi-only session: no MQTT identity configured yet.
     // TLS must validate certificate dates. SNTP/bootstrap clock ownership stays
     // with the application; there is no insecure fallback on missing time.
-    if (std::time(nullptr) < 1704067200) { return ESP_OK; } // 2024-01-01.
+    if (std::time(nullptr) < kMinPlausibleUnixTime) { return ESP_OK; } // 2024-01-01.
     if (now < next_mqtt_retry_us_) { return ESP_OK; }
     if (!mqtt_started_) {
         next_mqtt_retry_us_ = now + 3000000;
@@ -138,16 +238,21 @@ esp_err_t NetworkSession::stop()
 
 esp_err_t NetworkSession::end()
 {
-    if (client_ == nullptr) { return ESP_OK; }
+    if (client_ == nullptr && !wifi_ready_) { return ESP_OK; }
     const esp_err_t err = stop();
     if (err != ESP_OK) { return err; }
-    const esp_err_t destroyed = esp_mqtt_client_destroy(client_);
-    if (destroyed != ESP_OK) { return destroyed; }
-    client_ = nullptr;
-    vQueueDelete(messages_);
-    messages_ = nullptr;
+    if (client_ != nullptr) {
+        const esp_err_t destroyed = esp_mqtt_client_destroy(client_);
+        if (destroyed != ESP_OK) { return destroyed; }
+        client_ = nullptr;
+    }
+    if (messages_ != nullptr) {
+        vQueueDelete(messages_);
+        messages_ = nullptr;
+    }
     config_ = Config{};
     subscribe_override_ = nullptr;
+    wifi_ready_ = false;
     for (auto &slot : tracked_) { slot.state = 0; }
     return ESP_OK;
 }
@@ -213,14 +318,26 @@ NetworkSession::Status NetworkSession::status() const
 {
     return {running_.load(), esp32libfun::wifi.isConnected(), subscribed_.load(),
             connections_.load(), rejected_.load(), overflow_.load(), errors_.load(),
-            acknowledged_.load()};
+            acknowledged_.load(), connection_epoch_.load()};
 }
 
 void NetworkSession::onEvent(void *arg, esp_event_base_t, int32_t id, void *data)
 {
-    if (arg != nullptr && data != nullptr) {
-        static_cast<NetworkSession *>(arg)->event(id, *static_cast<esp_mqtt_event_t *>(data));
-    }
+    if (arg == nullptr || data == nullptr) { return; }
+    auto *self = static_cast<NetworkSession *>(arg);
+    auto *mqtt_event = static_cast<esp_mqtt_event_t *>(data);
+    // esp_mqtt_client_stop() (managed_components/espressif__mqtt 1.1.0,
+    // mqtt_client.c) blocks on the MQTT task's own STOPPED_BIT before
+    // returning, and dispatches every event synchronously, from that same
+    // task, through a private per-client event loop deleted only after that
+    // join -- so in this vendored version no event can reach here once
+    // teardownMqtt()'s esp_mqtt_client_destroy() has returned. Comparing the
+    // SDK's own per-event `client` against the live handle (rather than
+    // relying on that vendored detail, or on a plain client_ != nullptr
+    // check that a superseded-but-not-yet-null client_ would pass) keeps
+    // this guarantee explicit and independent of it.
+    if (mqtt_event->client != self->client_) { return; }
+    self->event(id, *mqtt_event);
 }
 
 void NetworkSession::event(int32_t id, esp_mqtt_event_t &event)

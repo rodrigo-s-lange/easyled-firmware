@@ -1,0 +1,10 @@
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=40960
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=20
+# See validation_mqtt_credentials/sdkconfig.defaults for why this is raised:
+# a single WireSlot NVS commit is a multi-KiB blob spanning several flash
+# pages, and under QEMU's flash emulation timing that alone can exceed the
+# 300 ms default interrupt-watchdog timeout on CPU1.
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=5000
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions_network.csv"

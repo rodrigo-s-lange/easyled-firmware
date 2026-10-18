@@ -74,6 +74,25 @@ connection exclusively; do not run another Wi-Fi lifecycle owner alongside it.
 Stopping the session clears queued incoming messages, not the SDK's pending QoS1
 outbox. Use `end()` before changing device identity or credentials.
 
+`NetworkSession` also exposes a split API: `initWifi()`/`start()` bring up Wi-Fi
+and the bounded incoming queue alone, with no MQTT client at all; `configureMqtt()`
+adds a first MQTT identity later, at any point before or after `start()`;
+`restartMqtt()` ends whatever identity is live (safe if none) and applies a new
+one without ever disconnecting Wi-Fi, touching SNTP/trusted time, or affecting
+durable pixel state or rendering; `endMqtt()` ends the MQTT identity alone. The
+combined `init(Config)` remains a compatibility wrapper equivalent to
+`initWifi()` + `configureMqtt()` with the same all-or-nothing validation, used by
+laboratory mode and the existing `NetworkSession` test seam below unchanged. A
+`restartMqtt()`/`endMqtt()` boundary invalidates every previously tracked publish
+to `PublishAck::Unknown` (via `Status::connection_epoch`, exposed for exactly this
+purpose) and clears queued/incomplete inbound commands from the old identity, even
+though ESP-MQTT delivers no `DISCONNECTED` callback for a deliberate client
+destruction; a callback already queued from the destroyed client cannot mark the
+new identity connected or subscribed (`event()`'s own `event.client` guard, kept
+independent of the vendored SDK's actual synchronous-teardown behavior). Destroying
+a client this way also discards its own QoS1 outbox -- nothing from the old
+identity's outbox survives or is redelivered under the new one.
+
 ## Provisional firmware contract boundary
 
 `components/pixels_firmware_contract` implements the offline portion of
@@ -313,6 +332,82 @@ to start networking -- it never silently drops back to
 laboratory mode for a device that claimed to be provisioned. Rendering and
 durable-state restoration are unaffected; only networking is refused.
 
+## Provisioned MQTT session integration
+
+Provisioned boot (`mqtt_provisioning_enabled` with a complete profile) separates
+Wi-Fi from MQTT identity instead of using `NetworkSession::init(Config)`'s
+combined, literal-credential path:
+
+1. restore durable pixel state (unchanged, before any networking);
+2. initialize the durable credential store/coordinator, then
+   `NetworkSession::initWifi()` + `start()` -- Wi-Fi comes up with no MQTT
+   identity at all;
+3. the single control-loop iteration calls `NetworkSession::poll()` (its one
+   and only owner) every tick, starts SNTP after IP, and -- only once Wi-Fi is
+   connected and the wall clock passes the same plausible-clock gate
+   `NetworkSession::poll()` itself uses before ever starting MQTT
+   (`NetworkSession::kMinPlausibleUnixTime`) -- calls
+   `MqttSessionController::tick()`;
+4. `components/pixels_mqtt_session_adapter` (`NetworkSessionMqttTransport`)
+   bridges the controller to the real session: it copies every bounded
+   identity string from `MqttSessionIdentity` into its own buffers before
+   calling `NetworkSession::restartMqtt()`, so the live MQTT configuration
+   never borrows a `StoredCredential`/pending buffer that the credential store
+   can mutate or clear right after; the firmware-shipped trust-table CA
+   pointer is the one exception deliberately borrowed, since
+   `TableTrustResolver` entries are static and outlive every session.
+
+CONNACK and SUBACK remain two separate signals, same as always: the adapter
+reports `Connected` -- durably promoting the credential via the existing #47-B
+store -- on the first real `MQTT_EVENT_CONNECTED` for the current attempt, before
+any SUBACK; the product's own command/telemetry gate still waits for the normal
+QoS1 `cmd` SUBACK separately (`NetworkSession::status().subscribed`), exactly as
+laboratory mode always has. The adapter reports `Ambiguous` for an immediate
+setup/start failure, a disconnect/transport error before that CONNACK, or a
+bounded connect timeout; stale evidence from a superseded attempt cannot
+confirm a new one, since every `restart()` recaptures a fresh baseline from
+`NetworkSession::status()` (connection/error counters, `connection_epoch`) and
+every outcome is judged only against that attempt's own baseline.
+
+Two lifecycle gaps a plain "one attempt at a time" controller would leave open
+are closed in `MqttSessionController` itself (`pixels_mqtt_credentials`), not
+in the frozen #47-B state machine it drives: a cold boot that loads only
+`CurrentConfirmed` (no `pending`) makes one durably marked reconnect attempt
+with `current` instead of waiting forever for a rotation that was never
+requested; and once `ready()` is true, `tick()` keeps sampling the adapter
+instead of going idle, so ordinary brief loss is absorbed silently (through
+`NetworkSession`/ESP-MQTT's own reconnect, never re-reported as a new
+promotion), while a bounded post-confirmation reconnect deadline with no fresh
+CONNACK still durably reports `Ambiguous` and falls back into the existing
+ambiguous/current-retry path and, after the existing round limit, into
+`BootstrapRecovery` -- never a tight loop, and never losing the last confirmed
+`current` until a replacement actually confirms. A rotation (a new `pending`
+persisted while already `ready()`) always preempts monitoring on the very next
+`tick()`, restarting with the new identity immediately rather than waiting for
+the old one to fail first.
+
+In provisioned mode, `topic_cmd`/`topic_state`/`topic_event`/`topic_telemetry`
+come from the selected credential, never from `ApplicationConfig`'s literal
+laboratory topics. `pixels_mqtt_session::ProvisionedTopics` is a small,
+stable-address snapshot that `MqttEventSink`/`MqttTelemetrySink` read a pointer
+into once, at construction; `rotateProvisionedTopics()` overwrites its four
+fields in one synchronous call, from the single control task, exactly when
+`ready()` newly becomes true -- the whole topic set rotates together with the
+identity, with no interval in which a command from one identity could trigger
+an event on another's topic, and without ever reconstructing the sinks or the
+command executor. Laboratory mode is unaffected: it keeps using
+`ApplicationConfig::event_topic`/`state_topic` exactly as before, and this
+snapshot/rotation path never runs for it.
+
+Still blocked on the platform, unchanged from the #47-B round: real
+`trust_ref`/CA values per environment, the deployed bootstrap base URL, the
+real bootstrap-token delivery mechanism, and per-environment rate limits. Still
+open as firmware/product work, now that the Wi-Fi-before-identity ordering
+itself is resolved: a real broker/backend end-to-end run (this integration's
+own QEMU coverage uses only deterministic fakes/synthetic MQTT events -- no
+real broker, TLS peer, or backend was ever contacted), and heap/stack headroom
+measurement for the provisioned path under real TLS load.
+
 ## Checkout, build and local profile
 
 Clone with the pinned dependencies:
@@ -479,8 +574,8 @@ python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build
 
 The script merges only a local emulated flash file, captures the result in
 `validation/build/qemu-validation.log`, and terminates QEMU
-after 45 seconds by default. Pass `--timeout 60` on slower hosts. The expected
-marker is `NETWORK_CONTRACT_VALIDATION checks=386 failures=0 RESULT=ALL_PASS`.
+after 45 seconds by default. Pass `--timeout 90` on slower hosts. The expected
+marker is `NETWORK_CONTRACT_VALIDATION checks=468 failures=0 RESULT=ALL_PASS`.
 
 On Windows, this QEMU distribution also needs `libiconv-2.dll` on `PATH`. In the
 local environment, prepend `C:\Program Files\Git\mingw64\bin` to the current
@@ -490,20 +585,59 @@ The validation target uses an ESP-IDF 8192 B main-task stack. Large candidates,
 fixture strings, journal records and fake storage remain in owning/static
 storage; QEMU runs the repeated-command loop without stack overflow or panic.
 
-Build verified with ESP-IDF 6.0.2: combined image 1110092 B, static DRAM 73439 B
-(40.63%) and IRAM 90555 B (69.09%). The 1.5 MiB app partition retains the
+Build verified with ESP-IDF 6.0.2: combined image 1132052 B, static DRAM 83567 B
+(46.24%) and IRAM 90555 B (69.09%). The 1.5 MiB app partition retains the
 margin reported by the build's own partition check. These figures include live
 storage, executor, fixture resolver, the HTTPS payload source, the bounded
-MQTT publish-ack tracking table and Composer activation objects but exclude
-runtime Wi-Fi/TLS heap use.
-The focused image is 725809 B and ran on Espressif QEMU 9.2.2: all 386 checks
-passed, with no assertion, watchdog or panic. Its static DRAM is 177740 B
-(98.34%, 2996 B free, dominated by `.bss` test fixtures and real-NVS transaction
-buffers) and IRAM is 48047 B (36.66%). DRAM headroom is now thin enough that a
-meaningfully larger validation scenario will need to trim existing static
-fixtures rather than simply add more. The combined image also booted through
+MQTT publish-ack tracking table, Composer activation objects, the #47-B
+credential store/coordinator and the provisioned-mode session adapter/topic
+snapshot, but exclude runtime Wi-Fi/TLS heap use.
+The focused image is 741321 B and ran on Espressif QEMU 9.2.2: all 468 checks
+passed, with no assertion, watchdog or panic. Its static DRAM is 179964 B
+(99.57%, **772 B free**, dominated by `.bss` test fixtures and real-NVS
+transaction buffers) and IRAM is 48047 B (36.66%). DRAM headroom is this thin
+already and frozen deliberately: do not add checks here -- see the two
+dedicated MQTT targets below. The combined image also booted through
 real NVS initialization with the five-entry network partition table. No broker
 or live HTTPS endpoint was accessed.
+
+### MQTT credential lifecycle and session integration targets
+
+Two further QEMU targets validate the #47-B durable credential lifecycle and
+its real-session integration, kept out of the frozen target above precisely
+because of its thin DRAM margin:
+
+- `validation_mqtt_credentials/` -- the durable store/coordinator/session
+  controller against deterministic fakes only (no `NetworkSession`), per
+  `docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md`. Build and run the same way:
+  ```powershell
+  cd validation_mqtt_credentials
+  idf.py -B build -D IDF_TARGET=esp32 build
+  python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build --timeout 240
+  ```
+  Expected marker: `MQTT_CREDENTIALS_VALIDATION checks=298 failures=0 RESULT=ALL_PASS`.
+  This target's own NVS A/B commits are real and comparatively slow under QEMU's
+  flash emulation; budget several minutes, not the frozen target's ~90 seconds.
+  Focused image 270697 B; static DRAM 90300 B (49.96%, 90436 B free); IRAM
+  46171 B (35.23%, 84901 B free).
+- `validation_mqtt_session/` -- the real integration this document's
+  "Provisioned MQTT session integration" section describes:
+  `NetworkSession`'s Wi-Fi/MQTT split driven through its `event()` test seam,
+  the real `pixels_mqtt_session_adapter` against that real session (connect
+  timeout, pre-CONNACK disconnect/error, stale-attempt rejection, identity
+  ownership), `ProvisionedTopics` rotation, and the full
+  controller-plus-adapter-plus-session chain for cold-boot reconnect, brief
+  loss, and the bounded-deadline round-counted path to `BootstrapRecovery`.
+  Same build/run shape:
+  ```powershell
+  cd validation_mqtt_session
+  idf.py -B build -D IDF_TARGET=esp32 build
+  python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build --timeout 90
+  ```
+  Expected marker: `MQTT_SESSION_VALIDATION checks=98 failures=0 RESULT=ALL_PASS`.
+  Focused image 677828 B; static DRAM 53695 B (29.71%, 127041 B free); IRAM
+  63827 B (48.7%, 67245 B free) -- comfortable headroom for future checks.
+  No real broker, backend, trust reference, or secret is used by either target.
 
 ## Next integration step
 
@@ -524,6 +658,16 @@ issues #58/#59; this firmware's PUBACK is evidence of broker delivery only,
 never of backend persistence. Provisioning, heap/stack measurements under TLS
 load and broker-loss/render-continuity tests against a real broker remain
 product work.
+
+The Wi-Fi-before-MQTT-identity ordering that previously blocked wiring the
+#47-B session controller to a real `NetworkSession` (see
+`docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md`) is resolved -- see "Provisioned MQTT
+session integration" above. What remains before provisioned mode can run
+against a deployed environment is unchanged from that document's own list:
+real `trust_ref`/CA values, the deployed bootstrap base URL, the real
+bootstrap-token delivery mechanism, per-environment rate limits, and a real
+broker/backend end-to-end run (this integration's own QEMU coverage is
+deterministic fakes/synthetic MQTT events only).
 
 Official references: [ESP-IDF 6.0.2 MQTT component migration](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32/api-reference/protocols/mqtt.html),
 [ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme),
