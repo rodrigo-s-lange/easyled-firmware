@@ -323,9 +323,8 @@ extern "C" void app_main()
         return;
     }
     if (!validUuid(config.device_id) || !validUuid(config.hardware_binding_id) ||
-        config.generation == 0 || !validVersion(config.firmware_version) ||
-        !validTopic(config.event_topic) || !validTopic(config.state_topic)) {
-        ESP_LOGE(kTag, "local control identity/topic is invalid");
+        config.generation == 0 || !validVersion(config.firmware_version)) {
+        ESP_LOGE(kTag, "local control identity is invalid");
         return;
     }
 
@@ -345,6 +344,11 @@ extern "C" void app_main()
         ESP_LOGE(kTag, "MQTT credential provisioning is enabled but the profile is incomplete;"
                        " refusing to start networking (never silently falling back to whatever"
                        " laboratory MQTT credentials network.* also holds)");
+        return;
+    }
+    if (mqtt_state == MqttProvisioningProfileState::Absent &&
+        (!validTopic(config.event_topic) || !validTopic(config.state_topic))) {
+        ESP_LOGE(kTag, "laboratory MQTT topics are invalid");
         return;
     }
     static pixels_control::EspHttpPayloadClient http_client;
@@ -472,7 +476,7 @@ extern "C" void app_main()
             // Never mark AttemptInFlight while Wi-Fi is down or the wall
             // clock is not yet usable for TLS -- the same gate NetworkSession
             // itself uses before ever starting MQTT (see its poll()).
-            if (state.wifi_connected &&
+            if (session.status().wifi_connected &&
                 std::time(nullptr) >= pixels_network::NetworkSession::kMinPlausibleUnixTime) {
                 const bool was_ready = active_mqtt_controller->ready();
                 const esp_err_t controller_err = active_mqtt_controller->tick();

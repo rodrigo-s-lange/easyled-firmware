@@ -22,11 +22,14 @@ NetworkSessionMqttTransport::NetworkSessionMqttTransport(pixels_network::Network
 {
 }
 
-void NetworkSessionMqttTransport::copyBounded(char *destination, size_t capacity, const char *source)
+bool NetworkSessionMqttTransport::copyBounded(char *destination, size_t capacity, const char *source)
 {
-    const size_t len = source == nullptr ? 0 : strnlen(source, capacity);
-    std::memcpy(destination, source == nullptr ? "" : source, len);
+    if (destination == nullptr || capacity == 0 || source == nullptr) { return false; }
+    const size_t len = strnlen(source, capacity);
+    if (len == 0 || len >= capacity) { return false; }
+    std::memcpy(destination, source, len);
     destination[len] = '\0';
+    return true;
 }
 
 esp_err_t NetworkSessionMqttTransport::restart(const pixels_mqtt::MqttSessionIdentity &identity)
@@ -35,11 +38,13 @@ esp_err_t NetworkSessionMqttTransport::restart(const pixels_mqtt::MqttSessionIde
     // NetworkSession's MqttConfig only borrows these pointers, so they must
     // outlive it independently of whatever the caller's own StoredCredential/
     // pending buffer does next.
-    copyBounded(broker_uri_, sizeof(broker_uri_), identity.broker_uri);
-    copyBounded(client_id_, sizeof(client_id_), identity.client_id);
-    copyBounded(username_, sizeof(username_), identity.username);
-    copyBounded(password_, sizeof(password_), identity.password);
-    copyBounded(command_topic_, sizeof(command_topic_), identity.command_topic);
+    if (!copyBounded(broker_uri_, sizeof(broker_uri_), identity.broker_uri) ||
+        !copyBounded(client_id_, sizeof(client_id_), identity.client_id) ||
+        !copyBounded(username_, sizeof(username_), identity.username) ||
+        !copyBounded(password_, sizeof(password_), identity.password) ||
+        !copyBounded(command_topic_, sizeof(command_topic_), identity.command_topic)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     server_ca_pem_ = identity.server_ca_pem; // firmware-static trust-table entry; see header comment
 
     pixels_network::NetworkSession::MqttConfig config{};

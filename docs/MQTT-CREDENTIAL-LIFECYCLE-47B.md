@@ -388,7 +388,7 @@ construção, e `rotateProvisionedTopics()` sobrescreve os 4 campos em uma chama
 outra, e os sinks/o executor de comandos nunca são reconstruídos. Modo laboratório nunca chama essa função;
 continua usando os tópicos literais de `ApplicationConfig`.
 
-**Validação**: novo target `validation_mqtt_session/` — **96/96 checks, ALL_PASS**, confirmado pelo
+**Validação**: novo target `validation_mqtt_session/` — **98/98 checks, ALL_PASS**, confirmado pelo
 `run_qemu.py` com exit code 0. Prova a API dividida de `NetworkSession` via seu próprio seam `event()`
 (sem Wi-Fi real), o adaptador real contra uma `NetworkSession` real (timeout, erro/desconexão pré-CONNACK,
 rejeição de evidência obsoleta, posse das strings de identidade), a rotação de tópicos, e a cadeia completa

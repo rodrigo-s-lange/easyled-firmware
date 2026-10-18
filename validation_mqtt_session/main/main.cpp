@@ -178,6 +178,15 @@ extern "C" void app_main()
 
         // Wi-Fi-only init/start is valid without any MQTT credential/client.
         CHECK(session.initWifi(wifi_cfg) == ESP_OK);
+        NetworkSession::Config legacy_after_wifi{};
+        legacy_after_wifi.ssid = wifi_cfg.ssid;
+        legacy_after_wifi.wifi_password = wifi_cfg.wifi_password;
+        legacy_after_wifi.broker_uri = mqtt_cfg.broker_uri;
+        legacy_after_wifi.client_id = mqtt_cfg.client_id;
+        legacy_after_wifi.username = mqtt_cfg.username;
+        legacy_after_wifi.password = mqtt_cfg.password;
+        legacy_after_wifi.command_topic = mqtt_cfg.command_topic;
+        CHECK(session.init(legacy_after_wifi) == ESP_ERR_INVALID_STATE);
         CHECK(session.publish("x/y", "z", 1) < 0); // no client at all yet; never crashes
         CHECK(session.poll() == ESP_ERR_INVALID_STATE); // start() never called in this seam -- see header
 
@@ -263,6 +272,13 @@ extern "C" void app_main()
         identity.password = password;
         identity.command_topic = topic;
         identity.server_ca_pem = kCaPem;
+
+        char overlong_client_id[kUuidBytes + 2];
+        std::memset(overlong_client_id, 'a', sizeof(overlong_client_id) - 1);
+        overlong_client_id[sizeof(overlong_client_id) - 1] = '\0';
+        MqttSessionIdentity invalid_identity = identity;
+        invalid_identity.client_id = overlong_client_id;
+        CHECK(adapter.restart(invalid_identity) == ESP_ERR_INVALID_ARG);
 
         CHECK(adapter.restart(identity) == ESP_OK);
         CHECK(adapter.poll() == MqttTransportSession::Outcome::StillTrying);

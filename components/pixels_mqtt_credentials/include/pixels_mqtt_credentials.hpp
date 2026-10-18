@@ -577,7 +577,9 @@ public:
     MqttSessionController(MqttCredentialCoordinator &coordinator, MqttCredentialStore &store, TrustResolver &trust,
                           MqttTransportSession &transport);
 
-    /// Call once per control-loop tick. Never blocks.
+    /// Call once per control-loop tick. It never waits for an MQTT outcome;
+    /// when the coordinator needs a fresh credential, its injected bootstrap
+    /// client may perform one bounded HTTPS request before this call returns.
     ///
     /// Beyond driving one bootstrap/connect attempt at a time, tick() also
     /// closes two lifecycle gaps a purely attempt-at-a-time state machine

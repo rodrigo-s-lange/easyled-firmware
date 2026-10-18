@@ -634,7 +634,7 @@ because of its thin DRAM margin:
   idf.py -B build -D IDF_TARGET=esp32 build
   python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build --timeout 90
   ```
-  Expected marker: `MQTT_SESSION_VALIDATION checks=96 failures=0 RESULT=ALL_PASS`.
+  Expected marker: `MQTT_SESSION_VALIDATION checks=98 failures=0 RESULT=ALL_PASS`.
   Focused image 677828 B; static DRAM 53695 B (29.71%, 127041 B free); IRAM
   63827 B (48.7%, 67245 B free) -- comfortable headroom for future checks.
   No real broker, backend, trust reference, or secret is used by either target.

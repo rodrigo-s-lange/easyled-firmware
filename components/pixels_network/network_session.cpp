@@ -66,26 +66,17 @@ esp_err_t NetworkSession::createMqttClient(const MqttConfig &config)
 
 esp_err_t NetworkSession::init(const Config &config)
 {
-    if (client_ != nullptr) { return ESP_ERR_INVALID_STATE; }
-    if (!text(config.ssid, 32) || !text(config.broker_uri, 255) ||
-        std::strncmp(config.broker_uri, "wss://", 6) != 0 ||
-        config.broker_uri[6] == '\0' || std::strchr(config.broker_uri, '@') != nullptr ||
-        !text(config.client_id, 64) || !text(config.username, 64) ||
-        !text(config.password, 256) || !topic(config.command_topic) ||
-        (config.wifi_password != nullptr && strnlen(config.wifi_password, 65) > 64)) {
+    if (wifi_ready_ || client_ != nullptr) { return ESP_ERR_INVALID_STATE; }
+    const WifiConfig wifi_config{config.ssid, config.wifi_password};
+    const MqttConfig mqtt_config{config.broker_uri, config.client_id, config.username,
+                                 config.password, config.command_topic, config.server_ca_pem};
+    if (!validWifiConfig(wifi_config) || !validMqttConfig(mqtt_config)) {
         return ESP_ERR_INVALID_ARG;
     }
     next_tracked_slot_ = 0;
     connection_epoch_ = 1;
     acknowledged_ = 0;
     for (auto &slot : tracked_) { slot.state = 0; }
-    MqttConfig mqtt_config{};
-    mqtt_config.broker_uri = config.broker_uri;
-    mqtt_config.client_id = config.client_id;
-    mqtt_config.username = config.username;
-    mqtt_config.password = config.password;
-    mqtt_config.command_topic = config.command_topic;
-    mqtt_config.server_ca_pem = config.server_ca_pem;
     const esp_err_t err = createMqttClient(mqtt_config);
     if (err != ESP_OK) { return err; }
     messages_ = xQueueCreateStatic(kQueueLength, sizeof(Message), queue_storage_, &queue_control_);

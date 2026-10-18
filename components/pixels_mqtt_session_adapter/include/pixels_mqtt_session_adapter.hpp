@@ -79,7 +79,7 @@ public:
     Outcome poll() override;
 
 private:
-    static void copyBounded(char *destination, size_t capacity, const char *source);
+    static bool copyBounded(char *destination, size_t capacity, const char *source);
 
     pixels_network::NetworkSession &session_;
     pixels_mqtt::MonotonicClock &clock_;
