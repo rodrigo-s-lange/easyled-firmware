@@ -112,13 +112,13 @@ as credenciais MQTT de laboratório.
 O `easyled` é uma partição NVS compartilhada. O gerador de identidade produz
 uma imagem completa dessa partição e só aceita uma partição totalmente vazia.
 
-1. [ ] Fazer backup integral da flash e, separadamente, dos 128 KiB de
+1. [x] Fazer backup integral da flash e, separadamente, dos 128 KiB de
    `easyled` em `0x190000`.
-2. [ ] Guardar hashes SHA-256 dos backups sem publicar seu conteúdo.
-3. [ ] Inspecionar o dump. É esperado que a placa de laboratório já contenha
-   dados; nesse caso o gerador deve recusar corretamente.
-4. [ ] Com Rodrigo ciente de que o estado local da placa será descartado,
-   apagar **somente** a partição `easyled`, nunca `erase-flash`.
+2. [x] Guardar hashes SHA-256 dos backups sem publicar seu conteúdo.
+3. [x] Inspecionar o dump. Em 2026-10-18 ele continha exatamente 131072 bytes
+   `0xFF`, sem namespace ou valor gravado: a partição já está apagada.
+4. [x] Nenhum apagamento foi necessário. Se uma nova leitura mostrar dados
+   antes do provisionamento, parar e reavaliar; nunca usar `erase-flash`.
 5. [ ] Gerar a imagem com
    `tools/provision_bootstrap_identity.py`, usando entrada oculta ou variável
    temporária. Nunca passar o segredo na linha de comando.
@@ -129,6 +129,15 @@ uma imagem completa dessa partição e só aceita uma partição totalmente vazi
 
 **Gate:** percurso segredo textual → NVS binária → reboot → autorização
 base64url funciona sem expor o segredo.
+
+Evidência local preservada fora do repositório:
+
+| Arquivo | SHA-256 |
+|---|---|
+| `flash-full-before.bin` | `4e3eada343ee19c14179c6663dfcca4ddf9311fa803d5b9a413aac415da3d2e4` |
+| `easyled-before.bin` | `b5a41c3758763bbec72769fab4a2533bf2db0b6312d93d25a695f9e4b9e02260` |
+
+Diretório local: `C:\Users\Familia\.codex\artifacts\easyled-m0-lab-20261018`.
 
 ## G4 — primeiro boot provisionado e bootstrap HTTPS
 
