@@ -28,6 +28,13 @@ The four library repositories are pinned as Git submodules under
 by validation; cloning a newer library branch cannot silently change a released
 firmware build.
 
+The current connectivity boundary and the planned comparison with the existing
+field IIoT communication pattern are documented in
+[`docs/CONNECTIVITY-ARCHITECTURE.md`](docs/CONNECTIVITY-ARCHITECTURE.md). In
+particular, Wi-Fi already uses the thin `esp32libfun_wifi_sta` wrapper, while
+MQTT/WSS and HTTPS remain application components over ESP-IDF until that audit
+identifies the shared reusable transport layer.
+
 `components/pixels_network` owns the session and bounded message queue. It reuses
 the existing `esp32libfun_wifi_sta` HAL for initialization and connection state;
 the application supplies retry policy using the ESP-IDF Wi-Fi API. No framework
