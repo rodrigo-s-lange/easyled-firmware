@@ -364,6 +364,15 @@ combined, literal-credential path:
    pointer is the one exception deliberately borrowed, since
    `TableTrustResolver` entries are static and outlive every session.
 
+Step 2's `hardware_id` and bootstrap secret come from
+`components/pixels_bootstrap_identity`, not from `ApplicationConfig`:
+`hardware_id` is this device's own eFuse MAC (never a compiled-in constant,
+never derived from `hardware_binding_id`), and the secret is read from a
+durable per-device NVS record that only the offline bench/factory tool
+(`tools/provision_bootstrap_identity.py`) ever writes. See
+`docs/M0-BOOTSTRAP-IDENTITY-PROVISIONING.md` for the record layout, the
+provisioning procedure, and the reflash/erase/power-loss matrix.
+
 CONNACK and SUBACK remain two separate signals, same as always: the adapter
 reports `Connected` -- durably promoting the credential via the existing #47-B
 store -- on the first real `MQTT_EVENT_CONNECTED` for the current attempt, before
@@ -644,7 +653,23 @@ because of its thin DRAM margin:
   Expected marker: `MQTT_SESSION_VALIDATION checks=98 failures=0 RESULT=ALL_PASS`.
   Focused image 677828 B; static DRAM 53695 B (29.71%, 127041 B free); IRAM
   63827 B (48.7%, 67245 B free) -- comfortable headroom for future checks.
-  No real broker, backend, trust reference, or secret is used by either target.
+- `validation_bootid/` -- `pixels_bootstrap_identity`: `hardware_id`
+  derivation from synthetic MAC bytes, the closed base64url/SHA-256/header
+  vector (including proof a NUL never enters the hash or header), canonical-
+  decode rejection, the durable NVS secret record's empty/round-trip/refuse-
+  overwrite/fault-injection/corruption/eFuse-mismatch behavior, and a
+  cross-tool compatibility check against the exact bytes
+  `tools/provision_bootstrap_identity.py` generates. See
+  `docs/M0-BOOTSTRAP-IDENTITY-PROVISIONING.md`.
+  ```powershell
+  cd validation_bootid
+  idf.py -B build -D IDF_TARGET=esp32 build
+  python run_qemu.py --qemu "PATH_TO/qemu-system-xtensa.exe" --build build --timeout 90
+  ```
+  Expected marker: `BOOTID_VALIDATION checks=158 failures=0 RESULT=ALL_PASS`.
+
+No real broker, backend, trust reference, or secret is used by any of the
+three targets above.
 
 ## Next integration step
 
@@ -669,12 +694,17 @@ product work.
 The Wi-Fi-before-MQTT-identity ordering that previously blocked wiring the
 #47-B session controller to a real `NetworkSession` (see
 `docs/MQTT-CREDENTIAL-LIFECYCLE-47B.md`) is resolved -- see "Provisioned MQTT
-session integration" above. What remains before provisioned mode can run
-against a deployed environment is unchanged from that document's own list:
-real `trust_ref`/CA values, the deployed bootstrap base URL, the real
-bootstrap-token delivery mechanism, per-environment rate limits, and a real
-broker/backend end-to-end run (this integration's own QEMU coverage is
-deterministic fakes/synthetic MQTT events only).
+session integration" above. The firmware-side bootstrap-secret delivery
+mechanism is also resolved -- see
+`docs/M0-BOOTSTRAP-IDENTITY-PROVISIONING.md` -- but only as far as the
+physical bench/factory tool; the backend half (registering a unit's secret
+digest, publishing the deployed bootstrap base URL and the real
+`trust_ref`/CA mapping) remains platform work, same list as
+`docs/M0-BACKEND-FIRMWARE-INPUTS.md` already tracks. What remains before
+provisioned mode can run against a deployed environment: those platform
+values, per-environment rate limits, and a real broker/backend end-to-end run
+(this integration's own QEMU coverage is deterministic fakes/synthetic MQTT
+events only).
 
 Official references: [ESP-IDF 6.0.2 MQTT component migration](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32/api-reference/protocols/mqtt.html),
 [ESP-MQTT 1.1.0](https://components.espressif.com/components/espressif/mqtt/versions/1.1.0/readme),

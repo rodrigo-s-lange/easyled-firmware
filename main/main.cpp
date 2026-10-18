@@ -3,6 +3,7 @@
 #include "pixels_command_executor.hpp"
 #include "pixels_control_runtime.hpp"
 #include "pixels_durable_storage.hpp"
+#include "pixels_bootstrap_identity.hpp"
 #include "pixels_mqtt_credentials.hpp"
 #include "pixels_mqtt_session_adapter.hpp"
 #include "esp_pixels.hpp"
@@ -69,14 +70,6 @@ struct ApplicationConfig {
     /// whatever `network.*` happens to also hold.
     bool mqtt_provisioning_enabled = false;
     const char *mqtt_bootstrap_base_url = nullptr;
-    /// This unit's physical bootstrap identifier -- the
-    /// `/device-bootstrap/{hardware_id}/mqtt-credential` path parameter.
-    /// Lower-hex, 1-64 characters (pixels_mqtt::isValidHardwareId()); never
-    /// a UUID, and never the same string as `hardware_binding_id` above,
-    /// which is a UUID bound to the *current* hardware binding and changes
-    /// on a rebind while this physical identifier never does.
-    const char *mqtt_hardware_id = nullptr;
-    const char *mqtt_bootstrap_token = nullptr;
     /// Exactly one trust_ref -> CA PEM entry, for this device's one
     /// configured environment. An unknown trust_ref in a server response
     /// fails closed rather than falling back to this (or any other) CA --
@@ -169,13 +162,16 @@ enum class MqttProvisioningProfileState {
     Complete,   // ready to construct the production MqttCredentialCoordinator
 };
 
-MqttProvisioningProfileState mqttProvisioningProfileState(const ApplicationConfig &config)
+/// @param bootstrap_identity_ready True iff this boot derived a well-formed
+///        eFuse hardware_id AND loaded a Valid durable bootstrap secret for
+///        it (see BootstrapIdentityStore) -- the physical identity and
+///        secret are no longer sourced from ApplicationConfig at all.
+MqttProvisioningProfileState mqttProvisioningProfileState(const ApplicationConfig &config,
+                                                          bool bootstrap_identity_ready)
 {
     if (!config.mqtt_provisioning_enabled) { return MqttProvisioningProfileState::Absent; }
-    const bool complete = config.mqtt_bootstrap_base_url != nullptr &&
-        pixels_mqtt::isValidHardwareId(config.mqtt_hardware_id) &&
-        config.mqtt_bootstrap_token != nullptr && config.mqtt_trust_ref != nullptr &&
-        config.mqtt_trust_ca_pem != nullptr && config.generation != 0;
+    const bool complete = config.mqtt_bootstrap_base_url != nullptr && bootstrap_identity_ready &&
+        config.mqtt_trust_ref != nullptr && config.mqtt_trust_ca_pem != nullptr && config.generation != 0;
     return complete ? MqttProvisioningProfileState::Complete : MqttProvisioningProfileState::Incomplete;
 }
 
@@ -339,7 +335,42 @@ extern "C" void app_main()
                        " laboratory mode)");
         return;
     }
-    const MqttProvisioningProfileState mqtt_state = mqttProvisioningProfileState(config);
+    // Physical bootstrap identity (docs/M0-BOOTSTRAP-IDENTITY-PROVISIONING.md):
+    // hardware_id comes from this device's own eFuse MAC, never from
+    // ApplicationConfig or hardware_binding_id, and the bootstrap secret
+    // comes from the durable per-device store the bench/factory tool alone
+    // provisions. Attempted only when provisioning is even requested --
+    // same gating as the #47-B store's own init() below -- so an ordinary
+    // laboratory-mode boot neither touches this NVS namespace nor logs
+    // about a secret it was never going to need.
+    static char bootstrap_hardware_id[pixels_bootstrap_identity::kHardwareIdBytes + 1]{};
+    static char bootstrap_secret_text[pixels_bootstrap_identity::kSecretTextBytes + 1]{};
+    static pixels_bootstrap_identity::BootstrapIdentityStore bootstrap_identity_store;
+    bool bootstrap_identity_ready = false;
+    if (config.mqtt_provisioning_enabled) {
+        const esp_err_t hardware_id_err = pixels_bootstrap_identity::currentHardwareId(bootstrap_hardware_id);
+        if (hardware_id_err != ESP_OK) {
+            ESP_LOGE(kTag, "eFuse hardware_id read failed: %s", esp_err_to_name(hardware_id_err));
+        } else {
+            const esp_err_t identity_init = bootstrap_identity_store.init(bootstrap_hardware_id);
+            if (identity_init != ESP_OK) {
+                ESP_LOGE(kTag, "bootstrap identity store init failed: %s", esp_err_to_name(identity_init));
+            } else if (bootstrap_identity_store.state() != pixels_bootstrap_identity::SecretState::Valid) {
+                // Never log the secret; there is none to log in Empty/Faulted
+                // either way. hardware_id alone is not a secret.
+                ESP_LOGW(kTag, "bootstrap secret for hardware_id %s is %s; provisioned MQTT stays offline"
+                               " until this unit is physically provisioned",
+                         bootstrap_hardware_id,
+                         bootstrap_identity_store.state() == pixels_bootstrap_identity::SecretState::Empty
+                             ? "not yet provisioned" : "faulted/incompatible");
+            } else if (bootstrap_identity_store.secretText(bootstrap_secret_text) == ESP_OK) {
+                bootstrap_identity_ready = true;
+            }
+        }
+    }
+
+    const MqttProvisioningProfileState mqtt_state =
+        mqttProvisioningProfileState(config, bootstrap_identity_ready);
     if (mqtt_state == MqttProvisioningProfileState::Incomplete) {
         ESP_LOGE(kTag, "MQTT credential provisioning is enabled but the profile is incomplete;"
                        " refusing to start networking (never silently falling back to whatever"
@@ -390,8 +421,12 @@ extern "C" void app_main()
     static pixels_mqtt::EspMonotonicClock mqtt_clock;
     pixels_mqtt::MqttCredentialCoordinator::Config mqtt_coordinator_config{};
     mqtt_coordinator_config.base_url = config.mqtt_bootstrap_base_url;
-    mqtt_coordinator_config.hardware_id = config.mqtt_hardware_id; // lower-hex; never hardware_binding_id (a UUID)
-    mqtt_coordinator_config.bootstrap_token = config.mqtt_bootstrap_token;
+    // eFuse-derived, lower-hex; never hardware_binding_id (a UUID) and never
+    // sourced from ApplicationConfig -- see the bootstrap-identity block above.
+    mqtt_coordinator_config.hardware_id = bootstrap_hardware_id;
+    // The durable secret's canonical 43-character base64url text, stable
+    // for the process lifetime (bootstrap_secret_text is a static array).
+    mqtt_coordinator_config.bootstrap_token = bootstrap_secret_text;
     mqtt_coordinator_config.expected_device_id = config.device_id;
     mqtt_coordinator_config.expected_hardware_binding_id = config.hardware_binding_id;
     mqtt_coordinator_config.expected_generation = config.generation;
