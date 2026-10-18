@@ -55,6 +55,40 @@ flowchart LR
 Não iniciar apagamento ou provisionamento da NVS até este pacote estar
 completo. A plataforma deve entregar por canal apropriado:
 
+### Bloqueio de sequência identificado em 2026-10-18
+
+A sequência proposta pela plataforma contém duas operações que o firmware
+atual ainda não implementa:
+
+- abrir `claimability` e executar o claim pela rede;
+- obter e persistir o bearer HTTPS por
+  `POST /api/v1/device-bootstrap/{hardware_id}/https-credential`.
+
+Além disso, o boot provisionado falha fechado antes de iniciar a rede quando
+`device_id`, `hardware_binding_id` ou `generation` estão ausentes, e a resposta
+da emissão MQTT é aceita somente quando repete exatamente essa mesma tupla.
+Portanto, a placa não consegue criar pela rede os identificadores que ela já
+precisa possuir para começar o bootstrap.
+
+Para fechar o M0 de uma unidade sem ampliar o produto durante a janela de
+bancada, a coreografia proposta é:
+
+1. `m0-provision-board` cadastra a unidade, gera e guarda os dois segredos e
+   deixa a unidade claimable sem exigir que a placa esteja online;
+2. o proprietário conclui o claim;
+3. a plataforma entrega por canal protegido a tupla não secreta
+   `device_id`/`hardware_binding_id`/`generation`, o segredo bootstrap e,
+   somente para este ensaio M0, o bearer HTTPS;
+4. o laboratório grava o segredo bootstrap na NVS e monta o perfil local
+   ignorado pelo Git com a tupla, bearer, origens e material TLS;
+5. a placa inicia, obtém a credencial MQTT pelo endpoint real e continua o
+   fluxo de telemetria, `apply_config` e ACK terminal.
+
+Se os passos 1 e 2 não forem possíveis sem a placa online, G1 permanece
+bloqueado e será necessário implementar primeiro os clientes de claimability,
+claim e credencial HTTPS. Essa é uma frente de produto maior e não deve ser
+improvisada durante o ensaio.
+
 - [ ] Confirmação de que `hardware_id=142b2fdcfa5c` foi cadastrado na linha de
   fabricação/binding correto.
 - [ ] `device_id`, `hardware_binding_id` e `generation` definitivos para esta
@@ -80,14 +114,20 @@ completo. A plataforma deve entregar por canal apropriado:
 
 ### Mensagem curta para a equipe de backend
 
-> A unidade M0 está conectada no laboratório. Confirmamos COM6, MAC
-> `14:2b:2f:dc:fa:5c` e `hardware_id=142b2fdcfa5c`. Para abrir a janela real,
-> enviem: confirmação do cadastro/binding e geração; segredo operacional por
-> canal seguro com confirmação do hash dos 43 caracteres base64url; origem
-> HTTPS implantada do bootstrap; `trust_ref` e PEM de CA correspondente;
-> credencial HTTPS de configuração; e confirmação dos pipelines de
-> state/capability/ACK e criação-publicação-reconciliação de `apply_config`.
-> O firmware atual exige PEM não nulo para o `trust_ref` do WSS.
+> A resposta foi recebida, mas há uma divergência de ordem que impede o ensaio
+> literal. O firmware atual não possui cliente de claimability/claim nem do
+> endpoint `/https-credential`. Ele também exige `device_id`,
+> `hardware_binding_id` e `generation` antes de iniciar a rede e usa essa tupla
+> para validar a credencial MQTT. Confirmem, por favor: (1) o
+> `m0-provision-board` consegue cadastrar e deixar a unidade claimable sem a
+> placa online; (2) o proprietário consegue concluir o claim antes do primeiro
+> boot provisionado; (3) depois do claim vocês entregarão a tupla definitiva;
+> e (4) para este M0 o bearer HTTPS pode ser entregue por artefato protegido e
+> inserido no perfil local ignorado pelo Git. Se qualquer resposta for não,
+> precisamos pausar a bancada e implementar primeiro os fluxos de claim e
+> credencial HTTPS. Nenhum segredo deve ser enviado por chat. Continuamos
+> aguardando também a origem implantada, URI WSS, `trust_ref`, PEM e SHA-256,
+> além da confirmação operacional dos pipelines reais.
 
 ## G2 — montar o perfil provisionado local
 
